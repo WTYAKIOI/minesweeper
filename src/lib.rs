@@ -6,5 +6,5 @@ pub mod cli;
 
 pub use model::{PlayerView, Coord, RevealedCell, CellState, InferenceIR, Proof, Conclusion, CellProb, Region, RegionFeature};
 pub use engine::{DeterministicEngine, MonteCarloEngine, ProbabilityEngine, RegionAnalyzer};
-pub use llm::{Translator, LLMMode, LLMClient};
+pub use llm::{Translator, LLMMode, LLMClient, LLMConfig};
 pub use server::create_router;

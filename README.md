@@ -19,12 +19,18 @@ docker compose up
 打开 http://localhost:8080 即可使用，无需安装 Rust / Python / OpenCV。
 
 <details>
-<summary>启用 LLM（可选）</summary>
+<summary>启用 LLM（可选，两种方式）</summary>
+
+**方式 A — 界面配置（推荐）**：打开 http://localhost:8080 后，展开左侧「🤖 LLM 设置」面板，填入 API Key / Base URL / 模型名，点击「测试连接」验证后保存。配置存储在浏览器 localStorage，下次自动加载。
+
+**方式 B — 环境变量**：
 
 ```bash
 OPENAI_API_KEY=sk-xxx OPENAI_BASE_URL=https://api.openai.com/v1 OPENAI_MODEL=gpt-4o-mini docker compose up
 ```
 或在 `docker-compose.yml` 的 `app.environment` 中填写后重启。
+
+> 界面配置优先于环境变量。两者都未配置时自动回退到本地分析引擎。
 
 </details>
 
@@ -41,10 +47,13 @@ cargo run --release
 
 ```bash
 # LLM (OpenAI 兼容 API: OpenAI / DeepSeek / Kimi 等)
+# 方式 A: 环境变量
 export OPENAI_API_KEY=sk-xxx
 export OPENAI_BASE_URL=https://api.openai.com/v1   # 可省略
 export OPENAI_MODEL=gpt-4o-mini                    # 可省略
 cargo run --release
+
+# 方式 B: 界面配置 — 打开 http://localhost:8080 后在「LLM 设置」面板填写
 
 # OCR 截图识别 (Python 微服务)
 cd ocr && pip install -r requirements.txt && python app.py   # 端口 5001
@@ -82,13 +91,56 @@ minesweeper-agent import -i tests/sample_board.json
 
 | 端点 | 说明 |
 |------|------|
-| `POST /api/analyze` | 分析局面：`{ "board": [[1,-1,-1],...], "remaining_mines": 3, "mode": "answer\|teaching\|strategy", "use_llm": false }` |
+| `POST /api/analyze` | 分析局面：`{ "board": [[1,-1,-1],...], "remaining_mines": 3, "mode": "answer\|teaching\|strategy", "use_llm": false, "llm_config": {"api_key":"sk-...","base_url":"...","model":"..."} }` |
 | `POST /api/ocr` | 截图识别代理：`{ "image": "<base64>" }` → `{ "board": [[...]], "remaining_mines": n }` |
+| `POST /api/llm/test` | 测试 LLM 连接：`{ "llm_config": {"api_key":"...","base_url":"...","model":"..."} }` → `{ "success": true, "model": "gpt-4o-mini" }` |
+| `GET /api/llm/status` | 查询环境变量 LLM 配置状态（不泄露 key） |
 | `POST /api/debug` | OCR 调试：返回每格的颜色/形态分析细节，便于排查误识别 |
 | `POST /api/learn` | 用户反馈学习：`{ "image": "<base64>", "digit": n }` → 加入模板库 |
 | `GET /api/health` | 健康检查 |
 
 **棋盘编码**：`-1` = 未知，`-2` = 旗帜，`0-8` = 已翻开数字（`board[行][列]`）。
+
+## 🤖 LLM 大模型集成
+
+LLM 负责将 Rust 推理引擎的计算结果（IR）翻译为人类可读的策略语言，支持**答案 / 教学 / 策略**三种模式。
+
+### 配置方式
+
+| 方式 | 说明 | 优先级 |
+|------|------|--------|
+| **界面配置** | 左侧「LLM 设置」面板填写 API Key / Base URL / 模型，保存到 localStorage | 高 |
+| **环境变量** | `OPENAI_API_KEY` / `OPENAI_BASE_URL` / `OPENAI_MODEL` | 低 |
+| **均未配置** | 自动回退到本地分析引擎（纯 Rust 规则转译） | — |
+
+### 支持的 API 提供商（任何 OpenAI 兼容接口）
+
+| 提供商 | Base URL | 推荐模型 |
+|--------|----------|----------|
+| OpenAI | `https://api.openai.com/v1` | `gpt-4o-mini` |
+| DeepSeek | `https://api.deepseek.com/v1` | `deepseek-chat` |
+| Kimi / Moonshot | `https://api.moonshot.cn/v1` | `moonshot-v1-8k` |
+| Ollama 本地 | `http://localhost:11434/v1` | `qwen2.5:7b` |
+| 通义千问 | `https://dashscope.aliyuncs.com/compatible-mode/v1` | `qwen-plus` |
+
+界面面板提供一键预设按钮，点击自动填入 Base URL 和模型名。
+
+### Rust ↔ LLM 交互流程
+
+```
+PlayerView (棋盘) → Rust 推理引擎 → InferenceIR (JSON)
+                                          ↓
+                        Translator.build_system_prompt()  → system prompt
+                        Translator.build_user_message()   → user message (含 IR + 合法坐标)
+                                          ↓
+                        LLMClient.chat() → OpenAI 兼容 API
+                                          ↓
+                        LLM 响应 → validate_llm_output() 坐标幻觉检测
+                                          ↓
+                        前端展示分析文本
+```
+
+**数据防火墙**：传给 LLM 的信息绝不包含未翻开格子的真实雷藏。所有概率均为数学推断，非事后诸葛亮。LLM 输出经过坐标幻觉检测，引用不存在坐标时会被标记。
 
 ## 架构
 

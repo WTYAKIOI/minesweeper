@@ -368,6 +368,70 @@
         /* ============ 隐藏元素 ============ */
         #imageInput { display: none; }
         .hidden { display: none !important; }
+
+        /* ============ LLM 设置面板 ============ */
+        .llm-panel {
+            background: var(--chip-bg);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 14px;
+            margin-bottom: 12px;
+        }
+        .llm-panel.collapsed .llm-body { display: none; }
+        .llm-panel-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            cursor: pointer;
+            user-select: none;
+        }
+        .llm-panel-header span.title { font-size: 14px; font-weight: 700; }
+        .llm-body { margin-top: 12px; display: flex; flex-direction: column; gap: 10px; }
+        .llm-row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+        .llm-row label { min-width: 70px; font-size: 12px; }
+        .llm-row input[type="text"], .llm-row input[type="password"] {
+            background: var(--input-bg);
+            color: var(--text);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 6px 10px;
+            font-size: 13px;
+            font-family: inherit;
+            flex: 1;
+            min-width: 120px;
+        }
+        .llm-row input:focus { outline: 2px solid var(--primary); outline-offset: 1px; }
+        .llm-status {
+            font-size: 12px;
+            padding: 4px 10px;
+            border-radius: 4px;
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+        }
+        .llm-status.ok { color: #2ECC71; }
+        .llm-status.err { color: #E74C3C; }
+        .llm-status.wait { color: var(--text-sub); }
+        .llm-provider-presets {
+            display: flex;
+            gap: 6px;
+            flex-wrap: wrap;
+        }
+        .llm-provider-presets button {
+            padding: 4px 10px;
+            font-size: 11px;
+            font-weight: 500;
+            background: var(--secondary);
+        }
+        .llm-provider-presets button.active { background: var(--primary); }
+        .llm-hint { font-size: 11px; color: var(--text-sub); line-height: 1.6; }
+        .llm-hint code {
+            background: var(--card-bg);
+            border: 1px solid var(--border);
+            border-radius: 3px;
+            padding: 0 4px;
+            font-size: 11px;
+        }
     </style>
 </head>
 <body>
@@ -382,8 +446,48 @@
 
     <div class="container">
         <div class="main-grid">
+
             <!-- ============ 左：棋盘编辑器 ============ -->
             <div class="card">
+                <!-- LLM 设置 (可折叠) -->
+                <div class="llm-panel collapsed" id="llmPanel">
+                    <div class="llm-panel-header" onclick="toggleLLMPanel()">
+                        <span class="title">🤖 LLM 设置</span>
+                        <span class="sub" id="llmHeaderStatus">未配置 · 点击展开</span>
+                    </div>
+                    <div class="llm-body">
+                        <div class="llm-provider-presets">
+                            <button class="secondary small" onclick="applyLLMPreset('openai')">OpenAI</button>
+                            <button class="secondary small" onclick="applyLLMPreset('deepseek')">DeepSeek</button>
+                            <button class="secondary small" onclick="applyLLMPreset('kimi')">Kimi</button>
+                            <button class="secondary small" onclick="applyLLMPreset('ollama')">Ollama 本地</button>
+                        </div>
+                        <div class="llm-row">
+                            <label>API Key</label>
+                            <input type="password" id="llmApiKey" placeholder="sk-...">
+                        </div>
+                        <div class="llm-row">
+                            <label>Base URL</label>
+                            <input type="text" id="llmBaseUrl" placeholder="https://api.openai.com/v1">
+                        </div>
+                        <div class="llm-row">
+                            <label>模型</label>
+                            <input type="text" id="llmModel" placeholder="gpt-4o-mini">
+                        </div>
+                        <div class="llm-row">
+                            <button class="secondary small" onclick="testLLM()">🔌 测试连接</button>
+                            <span class="llm-status wait" id="llmTestStatus">未测试</span>
+                            <span class="grow"></span>
+                            <button class="secondary small" onclick="saveLLMConfig()">💾 保存</button>
+                        </div>
+                        <div class="llm-hint">
+                            配置保存在浏览器 localStorage, 不会发送到第三方。<br>
+                            支持 OpenAI / DeepSeek / Kimi / Moonshot / 本地 Ollama 等任何 OpenAI 兼容 API。<br>
+                            环境变量 <code>OPENAI_API_KEY</code> / <code>OPENAI_BASE_URL</code> / <code>OPENAI_MODEL</code> 同样生效, UI 配置优先。
+                        </div>
+                    </div>
+                </div>
+
                 <div class="card-title">
                     <span>⬛ 棋盘编辑器</span>
                     <span class="sub">点击格子编辑 · 粘贴截图自动识别</span>
@@ -529,6 +633,7 @@
         let highlightedStep = null;   // 当前选中的推理步骤涉及的坐标
         let teachingMode = false;
         let ocrBusy = false;
+        let llmConfig = null;         // {api_key, base_url, model} from localStorage
 
         const canvas = document.getElementById('boardCanvas');
         const ctx = canvas.getContext('2d');
@@ -538,6 +643,117 @@
 
         // 经典扫雷数字配色
         const DIGIT_COLORS = ['', '#1B4FD8', '#1E8E3E', '#D93025', '#1A237E', '#8B1A1A', '#00838F', '#202124', '#6B7280'];
+
+        /* ==================== LLM 配置 ==================== */
+        const LLM_PRESETS = {
+            openai:   { base_url: 'https://api.openai.com/v1',      model: 'gpt-4o-mini' },
+            deepseek: { base_url: 'https://api.deepseek.com/v1',    model: 'deepseek-chat' },
+            kimi:     { base_url: 'https://api.moonshot.cn/v1',      model: 'moonshot-v1-8k' },
+            ollama:   { base_url: 'http://localhost:11434/v1',       model: 'qwen2.5:7b' },
+        };
+
+        function loadLLMConfig() {
+            try {
+                const saved = localStorage.getItem('ms-llm-config');
+                if (saved) {
+                    llmConfig = JSON.parse(saved);
+                    document.getElementById('llmApiKey').value = llmConfig.api_key || '';
+                    document.getElementById('llmBaseUrl').value = llmConfig.base_url || '';
+                    document.getElementById('llmModel').value = llmConfig.model || '';
+                    updateLLMHeaderStatus(true);
+                    // 自动勾选"调用 LLM"
+                    document.getElementById('useLLM').checked = true;
+                }
+            } catch (e) { /* ignore */ }
+            // 也检查后端环境变量状态
+            fetch('/api/llm/status').then(r => r.json()).then(data => {
+                if (data.env_configured && !llmConfig) {
+                    const msg = `环境变量已配置 (${data.env_model || '未知模型'})`;
+                    document.getElementById('llmHeaderStatus').textContent = msg + ' · 点击展开';
+                    document.getElementById('llmTestStatus').textContent = '环境变量已配置';
+                    document.getElementById('llmTestStatus').className = 'llm-status ok';
+                    document.getElementById('useLLM').checked = true;
+                }
+            }).catch(() => {});
+        }
+
+        function saveLLMConfig() {
+            const cfg = {
+                api_key: document.getElementById('llmApiKey').value.trim(),
+                base_url: document.getElementById('llmBaseUrl').value.trim(),
+                model: document.getElementById('llmModel').value.trim(),
+            };
+            if (!cfg.api_key) {
+                setLLMTestStatus('err', 'API Key 不能为空');
+                return;
+            }
+            llmConfig = cfg;
+            localStorage.setItem('ms-llm-config', JSON.stringify(cfg));
+            updateLLMHeaderStatus(true);
+            document.getElementById('useLLM').checked = true;
+            setLLMTestStatus('ok', '已保存');
+            addChat('system', '✅ LLM 配置已保存, 已自动启用「调用 LLM」。');
+        }
+
+        function getLLMConfigForRequest() {
+            if (llmConfig && llmConfig.api_key) return llmConfig;
+            return null;
+        }
+
+        function updateLLMHeaderStatus(configured) {
+            const el = document.getElementById('llmHeaderStatus');
+            if (configured && llmConfig) {
+                el.textContent = `已配置: ${llmConfig.model || '?'} · 点击展开`;
+            } else {
+                el.textContent = '未配置 · 点击展开';
+            }
+        }
+
+        function toggleLLMPanel() {
+            const panel = document.getElementById('llmPanel');
+            panel.classList.toggle('collapsed');
+        }
+
+        function applyLLMPreset(key) {
+            const p = LLM_PRESETS[key];
+            if (!p) return;
+            if (!document.getElementById('llmBaseUrl').value || confirm('应用预设会覆盖当前 Base URL 和模型, 继续?')) {
+                document.getElementById('llmBaseUrl').value = p.base_url;
+                document.getElementById('llmModel').value = p.model;
+            }
+        }
+
+        function setLLMTestStatus(type, msg) {
+            const el = document.getElementById('llmTestStatus');
+            el.className = 'llm-status ' + type;
+            el.textContent = msg;
+        }
+
+        async function testLLM() {
+            const cfg = {
+                api_key: document.getElementById('llmApiKey').value.trim(),
+                base_url: document.getElementById('llmBaseUrl').value.trim(),
+                model: document.getElementById('llmModel').value.trim(),
+            };
+            if (!cfg.api_key) { setLLMTestStatus('err', 'API Key 不能为空'); return; }
+            setLLMTestStatus('wait', '测试中...');
+            try {
+                const resp = await fetch('/api/llm/test', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ llm_config: cfg })
+                });
+                const data = await resp.json();
+                if (data.success) {
+                    setLLMTestStatus('ok', `✅ 连接成功 (${data.model})`);
+                } else {
+                    setLLMTestStatus('err', '❌ ' + (data.error || '未知错误'));
+                }
+            } catch (e) {
+                setLLMTestStatus('err', '❌ 请求失败: ' + e.message);
+            }
+        }
+
 
         /* ==================== 主题 ==================== */
         function applyTheme(t) {
@@ -1013,6 +1229,11 @@
                 mode,
                 use_llm: useLLM
             };
+            // 启用 LLM 时附带运行时配置 (优先于环境变量)
+            if (useLLM) {
+                const cfg = getLLMConfigForRequest();
+                if (cfg) req.llm_config = cfg;
+            }
             try {
                 const resp = await fetch('/api/analyze', {
                     method: 'POST',
@@ -1129,6 +1350,7 @@
         window.addEventListener('resize', drawBoard);
         addChat('system', '👋 欢迎使用扫雷认知助手！三种方式录入局面：\n1) 在输入框按 Ctrl+V 粘贴截图或文本棋盘\n2) 点击棋盘格手动编辑（右键插旗）\n3) 从「加载示例」选择经典残局\n完成后点击「分析局面」。');
         loadPreset('endgame');
+        loadLLMConfig();
     </script>
 </body>
 </html>

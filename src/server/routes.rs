@@ -10,7 +10,7 @@ use std::sync::Arc;
 use tower_http::services::ServeDir;
 
 use crate::engine::{DeterministicEngine, ProbabilityEngine, RegionAnalyzer};
-use crate::llm::{LLMClient, LLMMode, Translator};
+use crate::llm::{LLMClient, LLMConfig, LLMMode, Translator};
 use crate::model::{InferenceIR, PlayerView};
 
 /// 应用状态
@@ -42,6 +42,9 @@ pub struct AnalyzeRequest {
     pub mode: Option<String>,
     /// 是否调用 LLM (默认 false, 返回本地转译结果)
     pub use_llm: Option<bool>,
+    /// 可选: 运行时 LLM 配置 (覆盖环境变量)
+    /// 前端 UI 传入, 不依赖 docker env
+    pub llm_config: Option<LLMConfig>,
 }
 
 /// 分析响应
@@ -71,11 +74,36 @@ pub struct OcrResponse {
     pub error: Option<String>,
 }
 
+/// LLM 测试连接请求
+#[derive(Debug, Deserialize)]
+pub struct LLMTestRequest {
+    pub llm_config: LLMConfig,
+}
+
+/// LLM 测试连接响应
+#[derive(Debug, Serialize)]
+pub struct LLMTestResponse {
+    pub success: bool,
+    pub model: Option<String>,
+    pub error: Option<String>,
+}
+
+/// LLM 配置状态查询响应 (不泄露 api_key)
+#[derive(Debug, Serialize)]
+pub struct LLMStatusResponse {
+    /// 环境变量是否已配置 LLM
+    pub env_configured: bool,
+    pub env_model: Option<String>,
+    pub env_base_url: Option<String>,
+}
+
 /// 创建路由
 pub fn create_router(state: AppState) -> Router {
     Router::new()
         .route("/api/analyze", post(analyze))
         .route("/api/ocr", post(ocr))
+        .route("/api/llm/test", post(test_llm))
+        .route("/api/llm/status", get(llm_status))
         .route("/api/health", get(health))
         .with_state(Arc::new(state))
         .fallback_service(ServeDir::new("static").fallback(ServeDir::new("static/index.html")))
@@ -133,16 +161,34 @@ async fn analyze(
     let translator = Translator::new(mode.clone());
     let use_llm = req.use_llm.unwrap_or(false);
 
+    // LLM 客户端优先级: 请求中的运行时配置 > 环境变量 > 无
+    let llm_client: Option<LLMClient> = if use_llm {
+        if let Some(cfg) = &req.llm_config {
+            if cfg.is_valid() {
+                Some(LLMClient::new(cfg.clone()))
+            } else {
+                None
+            }
+        } else {
+            state.llm_client.clone()
+        }
+    } else {
+        None
+    };
+
     let (analysis, used_llm) = if use_llm {
-        if let Some(ref client) = state.llm_client {
+        if let Some(client) = &llm_client {
             let system_prompt = translator.build_system_prompt();
             let user_message = translator.build_user_message(&view, &ir);
             match client.chat(&system_prompt, &user_message).await {
                 Ok(resp) => (resp, true),
-                Err(e) => (format!("LLM 调用失败: {}, 回退到本地分析\n\n{}", e, translator.local_translate(&ir)), false),
+                Err(e) => {
+                    let local = translator.local_translate(&ir);
+                    (format!("⚠️ LLM 调用失败, 已回退到本地分析\n\n错误: {}\n\n{}", e, local), false)
+                }
             }
         } else {
-            ("未配置 OPENAI_API_KEY, 回退到本地分析\n\n".to_string() + &translator.local_translate(&ir), false)
+            ("⚠️ 未配置 LLM API Key, 回退到本地分析\n\n".to_string() + &translator.local_translate(&ir), false)
         }
     } else {
         (translator.local_translate(&ir), false)
@@ -198,4 +244,44 @@ async fn ocr(
     })?;
 
     Ok(Json(ocr_resp))
+}
+
+/// 测试 LLM 连接 (前端 UI "测试连接" 按钮调用)
+async fn test_llm(
+    Json(req): Json<LLMTestRequest>,
+) -> Result<Json<LLMTestResponse>, (StatusCode, String)> {
+    let cfg = req.llm_config;
+    if !cfg.is_valid() {
+        return Ok(Json(LLMTestResponse {
+            success: false,
+            model: None,
+            error: Some("API Key 不能为空".to_string()),
+        }));
+    }
+
+    let client = LLMClient::new(cfg);
+    match client.test_connection().await {
+        Ok(model) => Ok(Json(LLMTestResponse {
+            success: true,
+            model: Some(model),
+            error: None,
+        })),
+        Err(e) => Ok(Json(LLMTestResponse {
+            success: false,
+            model: None,
+            error: Some(e),
+        })),
+    }
+}
+
+/// 查询 LLM 配置状态 (不泄露 api_key, 只告知环境变量是否已配置)
+async fn llm_status() -> Json<LLMStatusResponse> {
+    let env_configured = std::env::var("OPENAI_API_KEY").map(|s| !s.is_empty()).unwrap_or(false);
+    let env_model = std::env::var("OPENAI_MODEL").ok();
+    let env_base_url = std::env::var("OPENAI_BASE_URL").ok();
+    Json(LLMStatusResponse {
+        env_configured,
+        env_model,
+        env_base_url,
+    })
 }
