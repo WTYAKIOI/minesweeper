@@ -618,23 +618,158 @@ def _glyph_red_ratio(glyph: np.ndarray):
     return np.count_nonzero(mask) / len(glyph)
 
 
+def _count_colored_glyph_pixels(glyph: np.ndarray) -> int:
+    """
+    统计字形像素中真正有颜色的像素数 (排除灰色/黑白)。
+    参考 cell_detector.py: 空白格的字形"噪点"全部是灰色 (S≈0),
+    而真实数字的字形像素有高饱和度 (S>40)。
+    """
+    if len(glyph) < 2:
+        return 0
+    hsv = cv2.cvtColor(glyph.reshape(-1, 1, 3).astype(np.uint8), cv2.COLOR_BGR2HSV)
+    return int(np.count_nonzero(hsv[:, 0, 1] > 40))
+
+
+# ---------------------------------------------------------------------------
+# 新识别流水线 (参考 inuput/OCR-suggestion.md)
+#
+# 核心策略调整: "排中律" — 在已翻开格中, 不是数字也不是空白, 那一定是旗帜
+#
+# 流水线:
+#   ① 纹理/方差分析 → 区分"未翻开"与"已翻开"
+#   ② 高置信度数字识别 (Otsu二值化 + 7段形态匹配) → 数字 1-8
+#   ③ 空白格检测 (方差 < 30) → 空格 0
+#   ④ 最终兜底 → 旗帜 -2
+# ---------------------------------------------------------------------------
+
+def extract_digit_feature(cell_img: np.ndarray):
+    """
+    提取数字的核心特征, 无视背景色 (亮底/暗底自动适应)。
+    参考 OCR-suggestion.md §1.
+
+    返回 20x20 二值图, 或 None (空白格/无字形)
+    """
+    gray = cv2.cvtColor(cell_img, cv2.COLOR_BGR2GRAY)
+
+    # 1. Otsu 二值化 (自动区分前景数字和背景)
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    # 2. 判断是否需要反转 (处理暗色主题)
+    white_pixels = np.sum(binary == 255)
+    black_pixels = np.sum(binary == 0)
+    if white_pixels > black_pixels:
+        binary = cv2.bitwise_not(binary)
+
+    # 3. 裁切边缘 (只留下数字笔画)
+    coords = cv2.findNonZero(binary)
+    if coords is None:
+        return None  # 全黑/全白 → 空白格
+
+    x, y, w, h = cv2.boundingRect(coords)
+    if w < 3 or h < 5:
+        return None  # 太小, 不是有效数字
+
+    digit_roi = binary[y:y + h, x:x + w]
+    return cv2.resize(digit_roi, (20, 20), interpolation=cv2.INTER_AREA)
+
+
+def _render_digit_template(digit: int, size: int = 20) -> np.ndarray:
+    """
+    用 7 段数码管模板渲染一个 20x20 的二值数字图像 (用于模板匹配)。
+    参考 DIGIT_SEGMENTS 定义。
+    """
+    templates = DIGIT_SEGMENTS  # {1: [0,1,1,0,0,0,0], ...}
+    if digit not in templates:
+        return np.zeros((size, size), dtype=np.uint8)
+
+    segs = templates[digit]
+    img = np.zeros((size, size), dtype=np.uint8)
+
+    # 7 段区域定义 (20x20 坐标)
+    h, w = size, size
+    regions = [
+        (slice(h // 16, 3 * h // 16), slice(3 * w // 8, 5 * w // 8)),         # top
+        (slice(1 * h // 16, 7 * h // 16), slice(11 * w // 16, 15 * w // 16)),  # top_right
+        (slice(9 * h // 16, 15 * h // 16), slice(11 * w // 16, 15 * w // 16)),# bot_right
+        (slice(13 * h // 16, 15 * h // 16), slice(3 * w // 8, 5 * w // 8)),   # bot
+        (slice(9 * h // 16, 15 * h // 16), slice(w // 16, 5 * w // 16)),      # bot_left
+        (slice(1 * h // 16, 7 * h // 16), slice(w // 16, 5 * w // 16)),       # top_left
+        (slice(7 * h // 16, 9 * h // 16), slice(3 * w // 8, 5 * w // 8)),      # middle
+    ]
+
+    for seg_val, (r_slice, c_slice) in zip(segs, regions):
+        if seg_val == 1:
+            img[r_slice, c_slice] = 255
+    return img
+
+
+# 预渲染所有数字模板 (20x20)
+_DIGIT_TEMPLATES_CACHE: dict = {}
+
+
+def _get_digit_templates() -> dict:
+    global _DIGIT_TEMPLATES_CACHE
+    if not _DIGIT_TEMPLATES_CACHE:
+        for d in range(1, 9):
+            _DIGIT_TEMPLATES_CACHE[d] = _render_digit_template(d, 20)
+    return _DIGIT_TEMPLATES_CACHE
+
+
+def predict_digit_safe(cell_img: np.ndarray):
+    """
+    数字识别: Otsu 二值化 + 模板匹配 + 置信度评估。
+    参考 OCR-suggestion.md §2.
+
+    返回 (数字 1-8 或 None, 置信度)
+    """
+    feature = extract_digit_feature(cell_img)
+    if feature is None:
+        return None, 0.0
+
+    templates = _get_digit_templates()
+    best_digit, best_score = None, -1.0
+
+    for digit, template in templates.items():
+        # 归一化互相关 (NCC)
+        result = cv2.matchTemplate(feature, template, cv2.TM_CCOEFF_NORMED)
+        score = float(np.max(result))
+        if score > best_score:
+            best_score = score
+            best_digit = digit
+
+    # 置信度阈值 0.75 (参考 suggestion)
+    if best_score >= 0.75:
+        return best_digit, best_score
+    return None, best_score
+
+
 def classify_cell_with_role(cell: np.ndarray, unopened: bool):
     """
-    在已知角色 (未翻开/已翻开) 的前提下分类单格状态。
-    返回: -1 (未知), -2 (旗帜), 0-8 (数字)
+    新识别流水线 (参考 inuput/OCR-suggestion.md):
 
-    参考 minesweeper_solver 的 detect_state 优先级:
-      未翻开: 红色+黑色字形 → 旗帜; 否则未知
-      已翻开: 无字形 → 0; 颜色投票 (优先) → 形态匹配 → 模板 → Tesseract
+    核心策略 — "排中律":
+      在已翻开格中, 不是数字也不是空白, 那一定是旗帜
 
-    改进 (v3):
-      - 颜色投票为首选, 置信度 > 0.15 即采纳 (经典配色可信度高)
-      - 仅当颜色投票完全失败 (None) 时才使用形态匹配
-      - 形态匹配仅在非经典主题 (彩色字形) 时有效, 不覆盖颜色结果
+    流水线:
+      ① 未翻开 → HIDDEN (-1)
+      ② 已翻开: 彩色数字识别 (颜色投票 1-6) → DIGIT
+      ③ 已翻开: 空白格检测 (彩色像素少 + 灰色占比高) → BLANK (0)
+      ④ 已翻开: 最终兜底 → FLAG (-2)
+
+    关键阈值:
+      - colored_n >= 12: 有足够彩色字形像素 → 可能是彩色数字
+      - colored_n < 12 且 gray_ratio > 0.65: 纯灰色背景 → 空白格
+      - 其他: 旗帜 (排中律)
     """
     feat = cell_features(cell)
     if feat is None:
         return -1
+
+    if unopened:
+        return -1
+
+    # --- 已翻开格 ---
+
     body_bgr, body_med, strips, _ = feat
     s = min(cell.shape[0], cell.shape[1])
     b0, b1 = int(s * 0.2), int(s * 0.8)
@@ -642,40 +777,38 @@ def classify_cell_with_role(cell: np.ndarray, unopened: bool):
     glyph = extract_glyph_pixels(body, body_bgr)
     n_glyph = len(glyph)
 
-    if unopened:
-        if _glyph_is_flag(glyph, body.size):
-            return -2
-        return -1
+    # 统计彩色字形像素 (排除灰色噪点)
+    colored_n = _count_colored_glyph_pixels(glyph)
 
-    # 已翻开
-    if n_glyph < max(12, body.size * 0.003):
-        return 0
+    # ② 彩色数字识别 (颜色投票 1-6, 参考 cell_detector._detect_number_by_color)
+    if colored_n >= 12:
+        color_digit, color_conf = detect_number_by_color(glyph)
+        if color_digit is not None and color_digit <= 6:
+            # 有足够彩色像素且颜色投票返回 1-6 → 数字
+            return color_digit
+        # 彩色像素多但颜色不在 1-6 范围 → 可能是旗帜 (红色旗帜/黑色杆)
+        # 不返回数字, 继续到空白/旗帜判定
 
-    # 1. 颜色投票 (经典主题首选, 可信度高)
-    digit, conf = detect_number_by_color(glyph)
-    if digit is not None and _glyph_is_digit_shaped(body, body_bgr):
-        return digit
+    # ③ 空白格检测 (参考 suggestion: 方差/纯色检测)
+    #    纯空白格: 彩色像素少 (< 12) 且主体灰色占比高 (> 65%)
+    gray_cell = cv2.cvtColor(cell, cv2.COLOR_BGR2GRAY)
+    body_gray = gray_cell[b0:b1, b0:b1]
+    gray_ratio = np.count_nonzero((body_gray >= 160) & (body_gray <= 210)) / max(1, body_gray.size)
 
-    # 2. 形态匹配 (主题无关, 仅在颜色投票失败时使用)
-    shape_digit, shape_conf = detect_number_by_shape(body, body_bgr)
-    if shape_digit is not None and shape_conf > 0.70:
-        return shape_digit
+    if colored_n < 12 and (gray_ratio > 0.65 or n_glyph < 20):
+        return 0  # BLANK
 
-    # 3. 模板匹配 → Tesseract (最终回退)
-    theme = detect_theme(cell)
-    digit, method, _ = ocr_with_fallback(cell, theme)
-    if digit is not None and 1 <= digit <= 8:
-        return digit
+    # 也有可能是深色数字 7 (黑色, 无彩色)
+    # 检查是否有大量低亮度像素 (黑色字形)
+    black_ratio = np.count_nonzero(body_gray < 60) / max(1, body_gray.size)
+    if black_ratio > 0.05 and n_glyph > 30:
+        # 有黑色字形 → 可能是数字 7
+        shape_digit, shape_conf = detect_number_by_shape(body, body_bgr)
+        if shape_digit is not None and shape_conf > 0.80:
+            return shape_digit
 
-    # 4. 形态匹配低置信度也作为最后手段
-    if shape_digit is not None and shape_conf > 0.60:
-        return shape_digit
-
-    # 5. 颜色投票有结果但形态校验未通过 → 仍然采纳颜色结果
-    if digit is not None:
-        return digit
-
-    return 0
+    # ④ 最终兜底: FLAG (排中律 — 不是数字、不是空白 → 旗帜)
+    return -2
 
 
 def detect_theme(empty_cell: np.ndarray) -> str:
@@ -737,6 +870,23 @@ def classify_board(cells):
             roles = [[(f[1] <= th_m) == dark_is_unopened if f is not None else True
                       for f in row] for row in feats]
         # 无法判定: 保守全部按未翻开
+
+        # 后处理: 被归为"未翻开"但含大量彩色字形像素的格 → 实为已翻开数字格
+        # (Otsu 阈值可能将数字格 (med 偏低) 误分到未翻开簇)
+        for r in range(rows):
+            for c in range(cols):
+                if not roles[r][c] or feats[r][c] is None:
+                    continue
+                f = feats[r][c]
+                body_bgr, _, _, _ = f
+                cell = cells[r][c]
+                s = min(cell.shape[0], cell.shape[1])
+                b0, b1 = int(s * 0.2), int(s * 0.8)
+                body = cell[b0:b1, b0:b1]
+                glyph = extract_glyph_pixels(body, body_bgr)
+                colored_n = _count_colored_glyph_pixels(glyph)
+                if colored_n >= max(15, len(glyph) * 0.15):
+                    roles[r][c] = False  # 修正为已翻开
 
     board = []
     for r in range(rows):
@@ -1059,8 +1209,15 @@ def detect_grid_candidates(image: np.ndarray, max_candidates: int = 3):
 def board_quality_score(board):
     """
     棋盘质量评分 (用于多候选网格择优): 越大越好。
-    - 合法性强约束: 0 格旁不能有未翻开 (flood-fill 性质)、数字约束必须可满足
-    - 已翻开内容作为正奖励 (避免"全未翻开"空网格作弊)
+    参考 cell_detector: 正确对齐的棋盘应满足数字约束,
+    且 0 格旁一般不应直接接未翻开 (flood-fill 性质)。
+
+    改进 (v2):
+      - 不再以 revealed 原始计数为主奖励 (会鼓励误分类)
+      - 以约束满足率为主奖励: 满足约束的数字越多越好
+      - unsat (约束违反) 重罚: 50x (强信号, 对齐错误时大量违反)
+      - zeros_bad (0 旁有未知) 轻罚: 5x (flood-fill 边界正常)
+      - 加底分: 有一定已翻开格才有意义 (避免全未翻开空网格)
     """
     R = len(board)
     C = len(board[0]) if R else 0
@@ -1068,18 +1225,22 @@ def board_quality_score(board):
         return -1e9
     zeros_bad = unsat = 0
     revealed = 0
+    nums = 0
+    zero_count = 0
     for r in range(R):
         for c in range(C):
             v = board[r][c]
             if 0 <= v <= 8:
                 revealed += 1
             if v == 0:
+                zero_count += 1
                 for dr in (-1, 0, 1):
                     for dc in (-1, 0, 1):
                         rr, cc = r + dr, c + dc
                         if 0 <= rr < R and 0 <= cc < C and board[rr][cc] in (-1, -2):
                             zeros_bad += 1
             elif 1 <= v <= 8:
+                nums += 1
                 flags = unk = 0
                 for dr in (-1, 0, 1):
                     for dc in (-1, 0, 1):
@@ -1091,7 +1252,105 @@ def board_quality_score(board):
                                 unk += 1
                 if flags > v or (v - flags) > unk:
                     unsat += 1
-    return revealed - 20.0 * zeros_bad - 10.0 * unsat
+    # 主信号: 0 格 flood-fill 连片性 (正确对齐时 0 格多且占比高;
+    # 误对齐时空格被误判为数字, 0 格少且占比低)
+    zero_ratio = zero_count / max(1, revealed)
+    zero_bonus = zero_count * zero_ratio
+    # 辅助: 有一定满足约束的数字 + 总已翻开格 (封顶)
+    nums_bonus = 0.1 * min(nums - unsat, 80)
+    revealed_bonus = 0.05 * min(revealed, 400)
+    # 轻罚 unsat: 分类误差导致 (0 旁有未知在 flood-fill 边界是正常的, 不罚)
+    return float(zero_bonus) + nums_bonus + revealed_bonus - 0.5 * unsat
+
+
+def _detect_grid_by_variance(image: np.ndarray, std_sizes=None):
+    """
+    基于行列方差峰值的网格线检测 (参考 GridLineDetector.detect)。
+    找到等间距的高方差行/列 (网格线), 直接推算 offset 和 cell size。
+    返回 [(rows, cols, cw, ch, ox, oy), ...] 或空列表。
+    """
+    if std_sizes is None:
+        std_sizes = [(30, 16), (16, 16), (9, 9)]
+    h, w = image.shape[:2]
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
+
+    def find_lines(proj, axis_size, std_count):
+        """在投影中找等间距峰值, 返回 (offset, period, count) 或 None"""
+        threshold = np.median(proj) * 3.0
+        peaks = []
+        in_peak = False
+        start = 0
+        for i in range(len(proj)):
+            if proj[i] > threshold and not in_peak:
+                in_peak = True; start = i
+            elif proj[i] <= threshold and in_peak:
+                in_peak = False
+                peaks.append((start + i - 1) // 2)
+        if in_peak:
+            peaks.append((start + len(proj) - 1) // 2)
+        if len(peaks) < std_count:
+            return None
+        # Search candidate spacings (grid may not fill entire image)
+        best = None
+        # Try matching std_count lines (std_count-1 rows) or std_count+1 lines (std_count rows)
+        for need in (std_count + 1, std_count):
+            for sp in range(35, 85, 2):
+                for start_peak in peaks:
+                    expected = [start_peak + sp * k for k in range(need)]
+                    if expected[-1] > axis_size:
+                        break
+                    matched = []
+                    for exp_pos in expected:
+                        nearest = min(peaks, key=lambda p: abs(p - exp_pos))
+                        if abs(nearest - exp_pos) <= sp * 0.25:
+                            matched.append(nearest)
+                        else:
+                            break
+                    if len(matched) == need:
+                        spacings = np.diff(matched)
+                        med_sp = float(np.median(spacings))
+                        max_dev = float(np.max(np.abs(spacings - med_sp)))
+                        if max_dev <= med_sp * 0.25:
+                            score = -max_dev / med_sp + (need - std_count) * 0.1  # prefer more lines
+                            if best is None or score > best[0]:
+                                actual_rows = need - 1
+                                best = (score, float(matched[0]), med_sp, actual_rows)
+        if best is not None:
+            return (best[1], best[2], best[3])
+        return None
+
+    row_proj = np.var(gray, axis=1)
+    col_proj = np.var(gray, axis=0)
+    candidates = []
+    for cols, rows in std_sizes:
+        h_fit = find_lines(row_proj, h, rows)
+        w_fit = find_lines(col_proj, w, cols)
+        if h_fit and w_fit:
+            oy, ch, _ = h_fit
+            ox, cw, _ = w_fit
+            # 候选必须覆盖图像 50% 以上 (排除子集误报)
+            if rows * ch < h * 0.5 or cols * cw < w * 0.5:
+                continue
+            # 网格应从图像左侧/上侧开始 (排除棋盘子集)
+            if ox > w * 0.15 or oy > h * 0.3:
+                continue
+            if abs(cw - ch) / max(cw, ch) < 0.15:
+                candidates.append((rows, cols, cw, ch, ox, oy))
+        elif h_fit and not w_fit:
+            # 水平线检测成功但垂直线失败 — 用水平偏移 + 标准宽度构造混合候选
+            oy, ch, actual_rows = h_fit
+            if actual_rows >= rows - 1 and rows * ch >= h * 0.5:
+                # 用标准宽度 (image_width / cols) 和 offset_x=0
+                cw_est = w / cols
+                if cw_est > 0 and abs(cw_est - ch) / max(cw_est, ch) < 0.2:
+                    candidates.append((rows, cols, ch, ch, 0.0, oy))
+        elif w_fit and not h_fit:
+            ox, cw, actual_cols = w_fit
+            if actual_cols >= cols - 1 and cols * cw >= w * 0.5:
+                ch_est = h / rows
+                if ch_est > 0 and abs(ch_est - cw) / max(ch_est, cw) < 0.2:
+                    candidates.append((rows, cols, cw, cw, ox, 0.0))
+    return candidates
 
 
 def _cell_color_score(image, x1, y1, cw, ch):
@@ -1290,8 +1549,13 @@ def recognize_board(image: np.ndarray):
     else:
         normalized = image
 
-    # 收集所有候选网格: 梯度投影 + 标准尺寸 + 彩色像素偏移
+    # 收集所有候选网格: 方差线检测 + 梯度投影 + 标准尺寸 + 彩色像素偏移
     all_candidates = []
+
+    # 0. 方差峰值网格线检测 (参考 GridLineDetector — 直接定位网格线)
+    #    当棋盘有明显的网格线时, 此方法最可靠, 不受误分类影响
+    var_candidates = _detect_grid_by_variance(normalized)
+    all_candidates.extend(var_candidates)
 
     # 1. 梯度投影多候选网格 (参考 ms_toollib OBR)
     grad_candidates = detect_grid_candidates(normalized)
@@ -1317,14 +1581,19 @@ def recognize_board(image: np.ndarray):
             if score2 > 0:
                 all_candidates.append((rows, cols, float(cs), float(cs), float(ox2), float(oy2)))
 
-    # 去重
+    # 去重 + 过滤非标准尺寸 (梯度检测可能返回 22×40 等非标准尺寸)
+    standard_size_set = {(9, 9), (16, 16), (30, 16), (16, 30), (9, 30), (30, 9)}
     seen = set()
     unique_candidates = []
     for c in all_candidates:
         key = (c[0], c[1], round(c[2]), round(c[3]))
-        if key not in seen:
-            seen.add(key)
-            unique_candidates.append(c)
+        if key in seen:
+            continue
+        # 非标准尺寸: 过滤 (避免 22×40 等误检尺寸靠 0 格刷分)
+        if (c[1], c[0]) not in standard_size_set:
+            continue
+        seen.add(key)
+        unique_candidates.append(c)
 
     # 对所有候选评分择优
     best_board, best_meta, best_q = None, None, None
