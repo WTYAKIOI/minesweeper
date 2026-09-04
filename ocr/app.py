@@ -8,6 +8,14 @@
   -1  → 未知 (未翻开)
   -2  → 旗帜
   0-8 → 已翻开数字
+
+识别方案 (参考 reference/ 下两个项目):
+  - minesweeper_solver: cv2.inRange 颜色范围逐像素投票判数字
+    (亮蓝=1 / 绿=2 / 亮红=3 / 深蓝=4 / 深红=5 / 青=6 / 黑=7 / 灰=8 为分离区间)，
+    状态按颜色匹配比例优先级判定 (空/旗/未开/数字)，失败回退 Tesseract。
+  - Metasweeper (ms_toollib): 经典 Windows 配色 LUT 与 OBR 分割思路。
+    本服务在其基础上做了主题自适应: 以格子主体色为基准提取字形像素，
+    再对字形像素做颜色区间投票，因此亮色/暗色主题均可识别。
 """
 
 import io
@@ -38,10 +46,6 @@ def decode_image(data: bytes) -> np.ndarray:
     return img
 
 
-# ---------------------------------------------------------------------------
-# 阶段一：自适应颜色匹配（K-means 聚类 + 动态阈值 + 光照归一化）
-# ---------------------------------------------------------------------------
-
 def normalize_illumination(image: np.ndarray) -> np.ndarray:
     """直方图均衡化，解决整体偏暗/偏亮的问题"""
     if len(image.shape) == 3:
@@ -52,82 +56,84 @@ def normalize_illumination(image: np.ndarray) -> np.ndarray:
         return cv2.equalizeHist(image)
 
 
-def extract_dominant_colors(image: np.ndarray, n_colors: int = 6) -> np.ndarray:
-    """用 K-means 聚类提取图片中的主导颜色，按亮度排序"""
-    pixels = image.reshape(-1, 3).astype(np.float32)
-    if len(pixels) > 5000:
-        idx = np.random.choice(len(pixels), 5000, replace=False)
-        pixels = pixels[idx]
-    try:
-        from sklearn.cluster import KMeans
-        kmeans = KMeans(n_clusters=min(n_colors, len(np.unique(pixels, axis=0))),
-                        random_state=42, n_init=10)
-        kmeans.fit(pixels)
-        colors = kmeans.cluster_centers_.astype(int)
-    except Exception:
-        colors = np.unique(pixels.reshape(-1, 3), axis=0)[:n_colors].astype(int)
-    brightness = np.sum(colors, axis=1)
-    sorted_idx = np.argsort(brightness)
-    return colors[sorted_idx]
+# ---------------------------------------------------------------------------
+# 数字颜色分类 (参考 minesweeper_solver/src/config.py 的 NUMBER_COLORS)
+#
+# 经典 Windows 扫雷配色 (BGR)。关键点: 亮蓝(1)/深蓝(4)、亮红(3)/深红(5)
+# 是互不重叠的亮度区间，用逐像素 inRange 投票取最大匹配数，
+# 而非均值匹配 —— 均值会被抗锯齿像素抬高，导致 4→1、5→3 的误判。
+# 区间在参考项目基础上做了少量展宽，以容纳抗锯齿过渡像素。
+# ---------------------------------------------------------------------------
+
+NUMBER_RANGES = {
+    1: ((185, 0, 0), (255, 70, 70)),      # 亮蓝
+    2: ((0, 90, 0), (60, 150, 60)),       # 绿
+    3: ((0, 0, 175), (70, 70, 255)),      # 亮红
+    4: ((95, 0, 0), (150, 45, 45)),       # 深蓝
+    5: ((0, 0, 90), (45, 45, 145)),       # 深红 (棕)
+    6: ((95, 95, 0), (150, 150, 60)),     # 青
+    7: ((0, 0, 0), (70, 70, 70)),         # 黑
+    8: ((95, 95, 95), (145, 145, 145)),   # 灰
+}
+
+# 旗帜: 红旗面 (亮红或深红) + 黑旗杆 (参考 minesweeper_solver: red+black → flag)
+_FLAG_RED_LO = np.array([0, 0, 90])
+_FLAG_RED_HI = np.array([70, 70, 255])
 
 
-def adaptive_color_match(cell_image: np.ndarray):
-    """根据图片自适应判断数字颜色，返回 (数字, 置信度)"""
-    b, g, r = cell_image[:, :, 0].astype(int), cell_image[:, :, 1].astype(int), cell_image[:, :, 2].astype(int)
-    is_gray = (abs(r - g) < 25) & (abs(g - b) < 25) & (abs(r - b) < 25)
-    colored = ~is_gray
+def extract_glyph_pixels(body: np.ndarray, body_bgr: np.ndarray, dev: int = 25):
+    """提取偏离格子主体色的字形像素 (主题自适应)"""
+    d = np.abs(body.reshape(-1, 3).astype(int) - body_bgr.astype(int)).max(axis=1)
+    return body.reshape(-1, 3)[d > dev]
 
-    if not colored.any():
+
+def detect_number_by_color(glyph: np.ndarray):
+    """
+    对字形像素做颜色区间投票 (参考 minesweolver_solver 的 _detect_number_by_color)。
+    返回 (数字 1-8 或 None, 置信度)
+    """
+    if len(glyph) < 8:
         return None, 0.0
-
-    # 只对彩色像素做聚类，避免边框/背景干扰
-    cb, cg, cr = b[colored], g[colored], r[colored]
-    colored_pixels = np.stack([cb, cg, cr], axis=1).astype(np.float32)
-
-    if len(colored_pixels) > 5000:
-        idx = np.random.choice(len(colored_pixels), 5000, replace=False)
-        colored_pixels = colored_pixels[idx]
-
-    try:
-        from sklearn.cluster import KMeans
-        n_clusters = min(3, len(np.unique(colored_pixels, axis=0)))
-        if n_clusters < 1:
-            return None, 0.0
-        kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-        kmeans.fit(colored_pixels)
-        colors = kmeans.cluster_centers_.astype(int)
-    except Exception:
+    votes = {}
+    for digit, (lo, hi) in NUMBER_RANGES.items():
+        mask = cv2.inRange(glyph.reshape(-1, 1, 3).astype(np.uint8),
+                           np.array(lo), np.array(hi))
+        n = int(np.count_nonzero(mask))
+        if n > 0:
+            votes[digit] = n
+    if not votes:
         return None, 0.0
+    digit = max(votes, key=votes.get)
+    conf = votes[digit] / len(glyph)
+    # 获胜颜色需覆盖足够比例的字形像素
+    if votes[digit] < max(8, 0.12 * len(glyph)):
+        return None, conf
+    return digit, conf
 
-    # 取最大的聚类中心作为数字颜色
-    labels = kmeans.labels_
-    counts = np.bincount(labels)
-    main_idx = np.argmax(counts)
-    fg_color = colors[main_idx]
 
-    known_digit_colors = {
-        1: np.array([0, 0, 255]),
-        2: np.array([0, 128, 0]),
-        3: np.array([255, 0, 0]),
-        4: np.array([0, 0, 128]),
-        5: np.array([128, 0, 0]),
-        6: np.array([0, 128, 128]),
-        7: np.array([0, 0, 0]),
-        8: np.array([128, 128, 128]),
-    }
-
-    best_match = None
-    best_dist = float('inf')
-    for digit, color in known_digit_colors.items():
-        dist = np.linalg.norm(fg_color - color)
-        if dist < best_dist:
-            best_dist = dist
-            best_match = digit
-
-    if best_dist > 100:
-        return None, 0.0
-    confidence = max(0.0, 1.0 - best_dist / 100.0)
-    return best_match, confidence
+def _glyph_is_digit_shaped(body: np.ndarray, body_bgr: np.ndarray, dev: int = 25):
+    """
+    字形形态校验: 数字笔画应紧凑且位于格子中央 (包围盒居中、占比适中)。
+    用于排除未翻开格纹理、bevel 残留等大面积/边缘分布的假字形。
+    """
+    d = np.abs(body.astype(int) - body_bgr.astype(int)).max(axis=2)
+    mask = d > dev
+    n = int(np.count_nonzero(mask))
+    total = mask.size
+    if n < max(12, total * 0.02) or n > total * 0.65:
+        return False
+    ys, xs = np.where(mask)
+    h0, h1, w0, w1 = ys.min(), ys.max(), xs.min(), xs.max()
+    H, W = mask.shape
+    # 包围盒尺寸合理 (数字占中央一部分)
+    if not (0.2 * H <= h1 - h0 + 1 <= 0.95 * H):
+        return False
+    if not (0.12 * W <= w1 - w0 + 1 <= 0.95 * W):
+        return False
+    # 包围盒中心居中
+    if abs((h0 + h1) / 2 - H / 2) > 0.3 * H or abs((w0 + w1) / 2 - W / 2) > 0.3 * W:
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -197,8 +203,6 @@ def detect_grid_lines(board: np.ndarray):
     """
     检测水平线和垂直线，推断行列数和单元格大小。
     返回 (rows, cols, cell_w, cell_h)
-    策略一：形态学线检测
-    策略二（回退）：自相关分析 + 标准棋盘尺寸匹配
     """
     gray = cv2.cvtColor(board, cv2.COLOR_BGR2GRAY)
     h, w = gray.shape[:2]
@@ -227,7 +231,6 @@ def detect_grid_lines(board: np.ndarray):
         v_diffs = np.diff(v_peaks)
         cell_h = int(np.median(h_diffs)) if len(h_diffs) > 0 else h // rows
         cell_w = int(np.median(v_diffs)) if len(v_diffs) > 0 else w // cols
-        # 验证：行列数必须是标准尺寸
         if (rows, cols) in [(9, 9), (16, 16), (30, 16)] or (5 <= rows <= 30 and 5 <= cols <= 30):
             return rows, cols, cell_w, cell_h
 
@@ -254,7 +257,6 @@ def detect_grid_lines(board: np.ndarray):
     if rp > 0 and cp > 0:
         est_rows = round(h / rp)
         est_cols = round(w / cp)
-        # 验证是否为标准棋盘尺寸
         for (cols, rows) in [(30, 16), (16, 16), (9, 9)]:
             if abs(rows - est_rows) <= 2 and abs(cols - est_cols) <= 2:
                 return rows, cols, cp, rp
@@ -295,205 +297,141 @@ def _find_peaks(proj, threshold=0):
     return peaks
 
 
-def segment_cells(board: np.ndarray, rows: int, cols: int, cell_w: int, cell_h: int):
+def segment_cells(board: np.ndarray, rows: int, cols: int, cell_w: float, cell_h: float,
+                  ox: float = 0.0, oy: float = 0.0):
     """
-    将棋盘图像分割成 rows×cols 个单元格图像。
-    返回二维列表 cell_images[y][x] = ndarray
+    将棋盘图像分割成 rows×cols 个单元格图像 (保留全部格子)。
+    支持亚像素起点/周期 (先 round 再切)。
+    越界部分以 None 占位，由上层标记为未知。
+    返回二维列表 cell_images[y][x] = ndarray 或 None
     """
+    h, w = board.shape[:2]
     cells = []
     for r in range(rows):
         row_cells = []
         for c in range(cols):
-            x1 = c * cell_w
-            y1 = r * cell_h
-            x2 = x1 + cell_w
-            y2 = y1 + cell_h
-            cell_img = board[y1:y2, x1:x2]
-            row_cells.append(cell_img)
+            x1 = int(round(ox + c * cell_w))
+            y1 = int(round(oy + r * cell_h))
+            x2 = int(round(ox + (c + 1) * cell_w))
+            y2 = int(round(oy + (r + 1) * cell_h))
+            if x1 < 0 or y1 < 0 or x2 > w or y2 > h or x2 <= x1 or y2 <= y1:
+                row_cells.append(None)
+            else:
+                row_cells.append(board[y1:y2, x1:x2])
         cells.append(row_cells)
     return cells
 
 
 # ---------------------------------------------------------------------------
-# 单元格分类
+# 单元格特征与状态分类 (参考 minesweeper_solver/src/cell_detector.py)
 # ---------------------------------------------------------------------------
 
-def classify_cell(cell: np.ndarray) -> int:
+def cell_features(cell: np.ndarray):
     """
-    分类单元格状态。
+    计算单格特征:
+      body_bgr   主体色 (中央 20%~80%)
+      body_med   主体灰度中值 (未翻开/已翻开格通常底色不同)
+      strips     四条边带 (8%~22%) 的平均灰度 (bevel/边框结构, 用于
+                 与本簇主体色对比后判定哪一簇是未翻开格)
+      glyph_n    字形像素数 (偏离主体色的像素)
+    返回 (body_bgr, body_med, strips, glyph_n) 或 None
+    """
+    s = min(cell.shape[0], cell.shape[1])
+    b0, b1 = int(s * 0.2), int(s * 0.8)
+    body = cell[b0:b1, b0:b1]
+    if body.size == 0:
+        return None
+    body_bgr = np.median(body.reshape(-1, 3), axis=0)
+    body_med = float(body_bgr.mean())
+
+    g = cv2.cvtColor(cell, cv2.COLOR_BGR2GRAY)
+    e0, e1 = int(s * 0.08), int(s * 0.22)
+    strips = (
+        float(g[e0:e1, e1:s - e1].mean()),          # 上边带
+        float(g[s - e1:s - e0, e1:s - e1].mean()),  # 下边带
+        float(g[e1:s - e1, e0:e1].mean()),          # 左边带
+        float(g[e1:s - e1, s - e1:s - e0].mean()),  # 右边带
+    )
+    glyph_n = len(extract_glyph_pixels(body, body_bgr))
+    return body_bgr, body_med, strips, glyph_n
+
+
+def _otsu_threshold_1d(vals):
+    """一维 Otsu 阈值; 不可分时返回 None"""
+    vals = np.asarray(vals, dtype=np.float64)
+    if len(vals) < 4 or vals.max() - vals.min() < 1e-6:
+        return None
+    hist, edges = np.histogram(vals, bins=64, range=(vals.min(), vals.max()))
+    centers = (edges[:-1] + edges[1:]) / 2
+    total = hist.sum()
+    w0 = np.cumsum(hist).astype(float)
+    w1 = total - w0
+    valid = (w0 > 0) & (w1 > 0)
+    if not valid.any():
+        return None
+    m0 = np.cumsum(hist * centers)
+    mt = m0[-1]
+    with np.errstate(invalid='ignore', divide='ignore'):
+        m0 = m0 / w0
+        m1 = (mt - np.cumsum(hist * centers)) / w1
+        var_between = w0 * w1 * (m0 - m1) ** 2
+    var_between[~valid] = -1
+    idx = int(np.argmax(var_between))
+    if var_between[idx] <= 0:
+        return None
+    return float(centers[idx])
+
+
+def _glyph_red_ratio(glyph: np.ndarray):
+    """字形中红色像素占比 (旗帜检测)"""
+    if len(glyph) == 0:
+        return 0.0
+    g = glyph.reshape(-1, 1, 3).astype(np.uint8)
+    mask = cv2.inRange(g, _FLAG_RED_LO, _FLAG_RED_HI)
+    return np.count_nonzero(mask) / len(glyph)
+
+
+def classify_cell_with_role(cell: np.ndarray, unopened: bool):
+    """
+    在已知角色 (未翻开/已翻开) 的前提下分类单格状态。
     返回: -1 (未知), -2 (旗帜), 0-8 (数字)
 
-    回退链：经典颜色匹配 → 自适应颜色(K-means) → 模板匹配 → Tesseract
+    参考 minesweeper_solver 的 detect_state 优先级:
+      未翻开: 红色字形 → 旗帜; 否则未知
+      已翻开: 无字形 → 0; 颜色投票 → 数字; 失败 → 模板 → Tesseract
     """
-    h, w = cell.shape[:2]
-    pad = max(2, min(h, w) // 8)
-    inner = cell[pad:h - pad, pad:w - pad]
-    if inner.size == 0:
+    feat = cell_features(cell)
+    if feat is None:
         return -1
+    body_bgr, body_med, strips, _ = feat
+    s = min(cell.shape[0], cell.shape[1])
+    b0, b1 = int(s * 0.2), int(s * 0.8)
+    body = cell[b0:b1, b0:b1]
+    glyph = extract_glyph_pixels(body, body_bgr)
+    n_glyph = len(glyph)
 
-    b, g, r = inner[:, :, 0].astype(int), inner[:, :, 1].astype(int), inner[:, :, 2].astype(int)
-    total = inner.shape[0] * inner.shape[1]
-    gray = cv2.cvtColor(inner, cv2.COLOR_BGR2GRAY)
-
-    is_gray = (abs(r - g) < 25) & (abs(g - b) < 25) & (abs(r - b) < 25)
-    colored_count = np.count_nonzero(~is_gray)
-
-    vals, counts = np.unique(gray, return_counts=True)
-    mode_val = int(vals[np.argmax(counts)])
-
-    # 无彩色像素：区分未翻开 vs 已翻开空格
-    if colored_count < total * 0.005:
-        if mode_val < 175:
-            return -1
-        else:
-            return 0
-
-    # 有彩色像素：旗帜或数字
-    cb, cg, cr = b[~is_gray], g[~is_gray], r[~is_gray]
-    mean_b, mean_g, mean_r = np.mean(cb), np.mean(cg), np.mean(cr)
-    red_mask = (r > 120) & (g < 80) & (b < 80)
-    red_ratio = np.count_nonzero(red_mask) / total
-    bg_is_revealed = mode_val > 175
-
-    # 红色 + 未翻开背景 → 旗帜
-    if mean_r > 120 and mean_b < 80 and mean_g < 80:
-        if not bg_is_revealed and (colored_count > total * 0.1 or red_ratio > 0.03):
+    if unopened:
+        if n_glyph > max(20, body.size * 0.004) and _glyph_red_ratio(glyph) > 0.3:
             return -2
-        elif bg_is_revealed:
-            return 3
-
-    # 第一层：经典颜色匹配
-    result = _color_to_number(mean_b, mean_g, mean_r, is_gray, total)
-    if result > 0:
-        return result
-
-    # 第二层：三层回退 (自适应颜色 → 模板 → Tesseract)
-    theme = detect_theme(inner)
-    result, method, conf = ocr_with_fallback(cell, theme)
-    if result is not None and 1 <= result <= 8:
-        return result
-
-    return 0
-
-
-def _color_to_number(mean_b, mean_g, mean_r, is_gray, total):
-    """根据彩色像素的平均 BGR 值识别数字 1-8"""
-    if mean_b > 120 and mean_r < 100 and mean_g < 100:
-        return 1  # 蓝
-    if mean_g > 80 and mean_g < 200 and mean_r < 100 and mean_b < 100:
-        return 2  # 绿
-    if mean_r > 150 and mean_b < 100 and mean_g < 100:
-        return 3  # 红 (已翻开背景上的)
-    if mean_b > 80 and mean_b < 180 and mean_r < 50 and mean_g < 50:
-        return 4  # 深蓝
-    if mean_r > 80 and mean_r < 180 and mean_b < 50 and mean_g < 50:
-        return 5  # 暗红
-    if mean_b > 80 and mean_b < 180 and mean_g > 80 and mean_g < 180 and mean_r < 50:
-        return 6  # 青
-    if mean_r < 50 and mean_g < 50 and mean_b < 50:
-        return 7  # 黑
-    if 100 < mean_b < 170 and 100 < mean_g < 170 and 100 < mean_r < 170:
-        return 8  # 灰
-
-    # 扩展匹配 (兼容不同配色方案)
-    if mean_b > mean_r + 20 and mean_b > mean_g + 20:
-        return 1 if mean_b > 150 else 4
-    if mean_g > mean_r + 20 and mean_g > mean_b + 20:
-        return 2
-    if mean_r > mean_b + 20 and mean_r > mean_g + 20:
-        return 3 if mean_r > 150 else 5
-    if mean_b > 80 and mean_g > 80 and mean_r < 50:
-        return 6
-
-    return 0
-
-
-def recognize_number(cell: np.ndarray) -> int:
-    """
-    识别单元格中的数字 (0-8)。
-    优先使用颜色匹配，回退到 Tesseract OCR。
-    """
-    h, w = cell.shape[:2]
-    b, g, r = cell[:, :, 0].astype(int), cell[:, :, 1].astype(int), cell[:, :, 2].astype(int)
-    total = cell.shape[0] * cell.shape[1]
-    is_gray = (abs(r - g) < 25) & (abs(g - b) < 25) & (abs(r - b) < 25)
-    colored = ~is_gray
-
-    if np.any(colored):
-        cb, cg, cr = b[colored], g[colored], r[colored]
-        mb, mg, mr = np.mean(cb), np.mean(cg), np.mean(cr)
-        result = _color_to_number(mb, mg, mr, is_gray, total)
-        if result > 0:
-            return result
-
-    # 回退：Tesseract OCR
-    gray = cv2.cvtColor(cell, cv2.COLOR_BGR2GRAY)
-    scale = max(2, 32 // min(h, w) + 1)
-    big = cv2.resize(gray, (w * scale, h * scale), interpolation=cv2.INTER_CUBIC)
-    _, binary = cv2.threshold(big, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    binary_inv = cv2.bitwise_not(binary)
-
-    for config in ["--psm 10 -c tessedit_char_whitelist=012345678", "--psm 8 -c tessedit_char_whitelist=012345678"]:
-        for img in [binary, binary_inv]:
-            try:
-                import pytesseract
-                text = pytesseract.image_to_string(img, config=config).strip()
-                if text and text.isdigit():
-                    n = int(text)
-                    if 0 <= n <= 8:
-                        return n
-            except Exception:
-                pass
-
-    return _template_match(gray)
-
-
-# 颜色模板 (数字在典型扫雷游戏中的颜色)
-NUMBER_COLORS = {
-    1: [(0, 0, 255), (0, 0, 200)],      # 蓝色
-    2: [(0, 128, 0), (0, 100, 0)],       # 绿色
-    3: [(0, 0, 255), (0, 0, 180)],       # 红色 (某些主题)
-    4: [(128, 0, 128), (100, 0, 100)],   # 紫色
-    5: [(0, 0, 128), (0, 0, 100)],       # 深红
-    6: [(0, 128, 128), (0, 100, 100)],   # 青色
-    7: [(0, 0, 0), (30, 30, 30)],        # 黑色
-    8: [(128, 128, 128), (100, 100, 100)],# 灰色
-}
-
-
-def _template_match(gray: np.ndarray) -> int:
-    """
-    回退数字识别：基于像素密度和连通域。
-    如果找不到明确数字，返回 0 (空格 = 周围无雷)。
-    """
-    # 二值化
-    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
-    # 如果几乎全白 (已翻开但无数字)，返回 0
-    white_ratio = np.count_nonzero(binary) / binary.size
-    if white_ratio > 0.95:
-        return 0
-
-    # 如果几乎全黑 (可能是未翻开)，返回 -1
-    if white_ratio < 0.05:
         return -1
 
-    # 统计连通域数量来粗略判断数字
-    num_labels, _ = cv2.connectedComponents(binary)
-    # 1 个背景 + 1 个数字 = 2 个连通域 → 单个数字
-    if num_labels <= 2:
-        # 难以确定具体数字，回退到 0
+    # 已翻开
+    if n_glyph < max(12, body.size * 0.003):
         return 0
+    digit, conf = detect_number_by_color(glyph)
+    if digit is not None and _glyph_is_digit_shaped(body, body_bgr):
+        return digit
 
+    # 回退: 模板匹配 → Tesseract
+    theme = detect_theme(cell)
+    digit, method, _ = ocr_with_fallback(cell, theme)
+    if digit is not None and 1 <= digit <= 8:
+        return digit
     return 0
 
-
-# ---------------------------------------------------------------------------
-# 阶段二：模板匹配多主题支持
-# ---------------------------------------------------------------------------
 
 def detect_theme(empty_cell: np.ndarray) -> str:
-    """根据未翻开格子的样式判断主题"""
+    """根据格子亮度判断主题"""
     mean_color = np.mean(empty_cell, axis=(0, 1)) if empty_cell.ndim == 3 else np.mean(empty_cell)
     brightness = np.mean(mean_color)
     if brightness > 200:
@@ -503,6 +441,70 @@ def detect_theme(empty_cell: np.ndarray) -> str:
     else:
         return 'flat'
 
+
+def classify_board(cells):
+    """
+    棋盘级两遍分类:
+      第一遍: 每格特征 (主体色/边带/字形像素数)
+      第二遍: 主体色 Otsu 双聚类区分未翻开/已翻开格 (通常底色不同)，
+              簇角色由"边带与本簇主体的相对偏差"判定 (未翻开格有
+              bevel/边框结构 → 偏差大)；无差异时用字形负载判定
+              (已翻开簇承载数字字形)。
+    保证输出保留全部 rows×cols 格子。
+    """
+    rows, cols = len(cells), len(cells[0]) if cells else 0
+
+    # 第一遍: 特征
+    feats = [[cell_features(c) if c is not None else None for c in row] for row in cells]
+    valid = [f for row in feats for f in row if f is not None]
+    roles = [[True] * cols for _ in range(rows)]  # 默认未翻开
+
+    meds = [f[1] for f in valid]
+    th_m = _otsu_threshold_1d(meds)
+    if th_m is not None:
+        def cluster_role(dark_group, light_group):
+            """返回 dark_is_unopened: bool 或 None (无法判定)"""
+            def edge_dev(group):
+                if not group:
+                    return 0.0
+                body = float(np.median([f[1] for f in group]))
+                return float(np.median([max(abs(s - body) for s in f[2]) for f in group]))
+            d_dark, d_light = edge_dev(dark_group), edge_dev(light_group)
+            # bevel/边框结构明显的一簇 = 未翻开
+            if d_dark > d_light + 2.0:
+                return True
+            if d_light > d_dark + 2.0:
+                return False
+            # 扁平主题: 含字形像素多的簇 = 已翻开
+            gd = sum(1 for f in dark_group if f[3] > 0)
+            gl = sum(1 for f in light_group if f[3] > 0)
+            if gd != gl:
+                return gl > gd   # 字形多的一簇不是未翻开
+            return None
+
+        dark = [f for f in valid if f[1] <= th_m]
+        light = [f for f in valid if f[1] > th_m]
+        dark_is_unopened = cluster_role(dark, light) if dark and light else None
+        if dark_is_unopened is not None:
+            roles = [[(f[1] <= th_m) == dark_is_unopened if f is not None else True
+                      for f in row] for row in feats]
+        # 无法判定: 保守全部按未翻开
+
+    board = []
+    for r in range(rows):
+        row = []
+        for c in range(cols):
+            if cells[r][c] is None:
+                row.append(-1)
+            else:
+                row.append(classify_cell_with_role(cells[r][c], roles[r][c]))
+        board.append(row)
+    return board
+
+
+# ---------------------------------------------------------------------------
+# 模板匹配多主题支持
+# ---------------------------------------------------------------------------
 
 def template_match_digit(cell_gray: np.ndarray, theme: str = 'classic'):
     """用模板匹配识别数字，返回 (数字, 置信度)"""
@@ -542,7 +544,7 @@ def template_match_digit(cell_gray: np.ndarray, theme: str = 'classic'):
 
 
 # ---------------------------------------------------------------------------
-# 阶段四：用户反馈学习机制
+# 用户反馈学习机制
 # ---------------------------------------------------------------------------
 
 def auto_learn_template(cell_image: np.ndarray, confirmed_digit: int, theme: str = 'learned'):
@@ -560,12 +562,12 @@ def auto_learn_template(cell_image: np.ndarray, confirmed_digit: int, theme: str
 
 
 # ---------------------------------------------------------------------------
-# 阶段三：三层回退链 (颜色匹配 → 模板匹配 → Tesseract)
+# 回退链: 模板匹配 → Tesseract (颜色投票已在 classify_cell_with_role 完成)
 # ---------------------------------------------------------------------------
 
 def ocr_with_fallback(cell_image: np.ndarray, theme: str = 'classic'):
     """
-    三层回退识别数字。
+    识别数字的回退链 (颜色投票已在 classify_cell_with_role 完成)。
     返回: (数字或None, 使用的方法名, 置信度)
     """
     h, w = cell_image.shape[:2]
@@ -576,27 +578,31 @@ def ocr_with_fallback(cell_image: np.ndarray, theme: str = 'classic'):
 
     gray = cv2.cvtColor(inner, cv2.COLOR_BGR2GRAY)
 
-    # 1. 自适应颜色匹配
-    result, conf = adaptive_color_match(inner)
-    if result is not None and 1 <= result <= 8 and conf > 0.3:
-        return result, 'color_match', conf
-
-    # 2. 模板匹配
+    # 1. 模板匹配
     result, conf = template_match_digit(gray, theme)
     if result is not None and 1 <= result <= 8 and conf > 0.7:
         return result, 'template_match', conf
 
-    # 3. Tesseract OCR
+    # 2. Tesseract OCR (参考 minesweeper_solver 的预处理: CLAHE + 连通域清理)
     try:
-        scale = max(2, 32 // min(inner.shape[:2]) + 1)
-        big = cv2.resize(gray, (gray.shape[1] * scale, gray.shape[0] * scale),
-                         interpolation=cv2.INTER_CUBIC)
-        _, binary = cv2.threshold(big, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        binary_inv = cv2.bitwise_not(binary)
+        denoised = cv2.bilateralFilter(gray, 5, 75, 75)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(3, 3))
+        contrast = clahe.apply(denoised)
+        blurred = cv2.GaussianBlur(contrast, (3, 3), 0)
+        _, binary = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        # 清理触碰边框的连通域 (边框残留)
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+            255 - binary, connectivity=8)
+        cleaned = np.ones_like(binary) * 255
+        for label in range(1, num_labels):
+            comp = labels == label
+            if not (np.any(comp[0, :]) or np.any(comp[-1, :]) or
+                    np.any(comp[:, 0]) or np.any(comp[:, -1])):
+                cleaned[comp] = 0
         import pytesseract
-        for config in ["--psm 10 -c tessedit_char_whitelist=012345678",
-                        "--psm 8 -c tessedit_char_whitelist=012345678"]:
-            for img in [binary, binary_inv]:
+        for config in ["--psm 10 --oem 3 -c tessedit_char_whitelist=12345678",
+                       "--psm 8 --oem 3 -c tessedit_char_whitelist=12345678"]:
+            for img in [cleaned, cv2.bitwise_not(cleaned)]:
                 text = pytesseract.image_to_string(img, config=config).strip()
                 if text and text.isdigit():
                     n = int(text)
@@ -606,6 +612,239 @@ def ocr_with_fallback(cell_image: np.ndarray, theme: str = 'classic'):
         pass
 
     return None, 'failed', 0.0
+
+
+# ---------------------------------------------------------------------------
+# 网格定位: Sobel 梯度投影 + 等差网格能量拟合
+# (参考 ms_toollib obr.rs: 梯度投影找格线, 霍夫式等差拟合; 比彩色像素
+#   偏移搜索稳健 —— 后者无法区分半格错位)
+# ---------------------------------------------------------------------------
+
+def _sobel_projections(image: np.ndarray):
+    """返回 (垂直边缘列投影, 水平边缘行投影)"""
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    return np.abs(gx).sum(axis=0), np.abs(gy).sum(axis=1)
+
+
+def _autocorr_period(proj, lo=16, hi=140):
+    """自相关估计投影周期 (格子尺寸)"""
+    p = proj - proj.mean()
+    ac = np.correlate(p, p, 'full')[len(p) - 1:]
+    if ac[0] == 0:
+        return 0
+    ac = ac / ac[0]
+    lag = int(np.argmax(ac[lo:hi])) + lo
+    return lag if ac[lag] > 0.05 else 0
+
+
+def _autocorr_candidates(proj, lo=11, hi=110, topk=4):
+    """
+    自相关候选周期列表 (含倍频/半频变体)。
+    单一最强峰不可靠: 小格子图像中格子内纹理会产生半频峰,
+    大格子图像中隔行错位会产生倍频峰。
+    """
+    p = proj - proj.mean()
+    ac = np.correlate(p, p, 'full')[len(p) - 1:]
+    out = []
+    if ac[0] == 0:
+        return out
+    ac = ac / ac[0]
+    peaks = []
+    for lag in range(lo, min(hi, len(ac) - 1)):
+        if ac[lag] > ac[lag - 1] and ac[lag] >= ac[lag + 1] and ac[lag] > 0.06:
+            peaks.append((float(ac[lag]), lag))
+    peaks.sort(reverse=True)
+    cands = [lag for _, lag in peaks[:topk]]
+    for lag in cands[:2]:
+        for m in (0.5, 2.0):
+            v = lag * m
+            if lo <= v <= hi and abs(v - round(v)) < 0.01 and int(round(v)) not in cands:
+                cands.append(int(round(v)))
+    return cands[:6]
+
+
+def _fit_arith_grid(proj, period_hint):
+    """
+    在投影上拟合等差网格线 x0 + k*period, 最大化线上投影能量 (霍夫式)。
+    返回 (x0, period, lines, score) 或 None。score 为平均线能量。
+    """
+    N = len(proj)
+    best_score, best = -1.0, None
+    for p in np.arange(max(8.0, period_hint - 1.0), period_hint + 1.01, 0.25):
+        for x0 in np.arange(-p / 2, p / 2, 1.0):
+            lines = x0 + p * np.arange(int((N - x0) / p))
+            if len(lines) < 5:
+                continue
+            idx = np.round(lines).astype(int)
+            idx = idx[(idx >= 0) & (idx < N)]
+            score = float(proj[idx].sum())
+            if score > best_score:
+                best_score, best = score, (float(x0), float(p))
+
+    if best is None:
+        return None
+    x0, p = best
+    raw = x0 + p * np.arange(int((N - x0) / p))
+    idx = np.clip(np.round(raw).astype(int), 0, N - 1)
+    energies = np.array([float(proj[max(0, i - 1):i + 2].max()) for i in idx])
+    # 裁剪两端低能量线 (页面空白区延伸出的假想线)
+    if len(energies):
+        cut = max(1.0, 0.25 * np.median(energies))
+        lo, hi = 0, len(raw)
+        while lo < hi and energies[lo] < cut:
+            lo += 1
+        while hi > lo and energies[hi - 1] < cut:
+            hi -= 1
+        raw = raw[lo:hi]
+    if len(raw) < 5:
+        return None
+    avg_energy = float(np.mean([proj[max(0, i - 1):i + 2].max()
+                                for i in np.clip(np.round(raw).astype(int), 0, N - 1)]))
+    return raw[0], p, raw, avg_energy
+
+
+def _grid_start_from_lines(proj, lines, p):
+    """
+    由拟合线回推格子真实起点。
+    - 若拟合线是格内左/上 bevel 峰 (A: 主体→高光)，其后 ~0.5p..0.9p 处有
+      阴影峰 (B)，格起点 = L - 0.13p；格数 = 线数 (每格一条 A 峰，含贴边格)。
+    - 若是 B 峰 (前面有 A)，格起点 = L - 0.83p。
+    - 若前后均无峰，视为真实网格线，格起点 = L；格数 = 线数 - 1。
+    返回 (start, cells_count, is_boundary)
+    """
+    def peak_in(lo_frac, hi_frac):
+        a = int(round(lines[0] + lo_frac * p))
+        b = int(round(lines[0] + hi_frac * p))
+        a, b = max(0, min(a, b)), min(len(proj), max(a, b))
+        return float(proj[a:b].max()) if b > a else 0.0
+
+    L0 = int(round(float(lines[0])))
+    own = float(proj[max(0, L0 - 3):L0 + 4].max()) if L0 + 4 > 0 else 0.0
+    fwd = peak_in(0.5, 0.9)    # 同格阴影峰 B
+    back = peak_in(-0.9, -0.5)  # 前一格阴影峰
+    if own > 0 and max(fwd, back) < 0.25 * own:
+        return float(lines[0]), len(lines) - 1, True
+    if fwd >= back:
+        return float(lines[0]) - 0.13 * p, len(lines), False
+    return float(lines[0]) - 0.83 * p, len(lines), False
+
+
+def detect_grid_candidates(image: np.ndarray, max_candidates: int = 3):
+    """
+    基于梯度投影的多候选网格检测 (参考 ms_toollib OBR)。
+    扫描行列的多个自相关候选周期, 施加方形格子约束 (|pc-pr| 小),
+    返回按拟合能量排序的 [(rows, cols, cw, ch, ox, oy), ...]。
+    """
+    v_proj, h_proj = _sobel_projections(image)
+    pcs = _autocorr_candidates(v_proj)
+    prs = _autocorr_candidates(h_proj)
+    if not pcs or not prs:
+        return []
+
+    fit_cache = {}
+    results = []
+    for pc in pcs:
+        fit_v = _fit_arith_grid(v_proj, pc)
+        if fit_v is None:
+            continue
+        fit_cache[('v', pc)] = fit_v
+        for pr in prs:
+            # 方形格子约束
+            if abs(pc - pr) > 0.22 * max(pc, pr):
+                continue
+            fit_h = fit_cache.get(('h', pr))
+            if fit_h is None:
+                fit_h = _fit_arith_grid(h_proj, pr)
+                if fit_h is None:
+                    fit_cache[('h', pr)] = False
+                    continue
+                fit_cache[('h', pr)] = fit_h
+            if fit_h is False:
+                continue
+            x0v, pf_v, lines_v, score_v = fit_v
+            x0h, pf_h, lines_h, score_h = fit_h
+            if not lines_v.size or not lines_h.size:
+                continue
+            x_start, cols, _ = _grid_start_from_lines(v_proj, lines_v, pf_v)
+            y_start, rows, _ = _grid_start_from_lines(h_proj, lines_h, pf_h)
+            x_start = min(max(x_start, 0.0), max(0.0, len(v_proj) - pf_v))
+            y_start = min(max(y_start, 0.0), max(0.0, len(h_proj) - pf_h))
+            if not (5 <= rows <= 40 and 5 <= cols <= 50):
+                continue
+            energy = (score_v / pf_v + score_h / pf_h) / 2.0
+            results.append((energy, rows, cols, pf_v, pf_h, float(x_start), float(y_start)))
+
+    # 去重 (相同行列/周期只留能量最高) 并排序
+    results.sort(key=lambda t: -t[0])
+    seen, out = set(), []
+    for energy, rows, cols, cw, ch, ox, oy in results:
+        key = (rows, cols, round(cw), round(ch))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((rows, cols, cw, ch, ox, oy))
+        if len(out) >= max_candidates:
+            break
+    return out
+
+
+def board_quality_score(board):
+    """
+    棋盘质量评分 (用于多候选网格择优): 越大越好。
+    - 合法性强约束: 0 格旁不能有未翻开 (flood-fill 性质)、数字约束必须可满足
+    - 已翻开内容作为正奖励 (避免"全未翻开"空网格作弊)
+    """
+    R = len(board)
+    C = len(board[0]) if R else 0
+    if R == 0 or C == 0:
+        return -1e9
+    zeros_bad = unsat = 0
+    revealed = 0
+    for r in range(R):
+        for c in range(C):
+            v = board[r][c]
+            if 0 <= v <= 8:
+                revealed += 1
+            if v == 0:
+                for dr in (-1, 0, 1):
+                    for dc in (-1, 0, 1):
+                        rr, cc = r + dr, c + dc
+                        if 0 <= rr < R and 0 <= cc < C and board[rr][cc] in (-1, -2):
+                            zeros_bad += 1
+            elif 1 <= v <= 8:
+                flags = unk = 0
+                for dr in (-1, 0, 1):
+                    for dc in (-1, 0, 1):
+                        rr, cc = r + dr, c + dc
+                        if 0 <= rr < R and 0 <= cc < C:
+                            if board[rr][cc] == -2:
+                                flags += 1
+                            elif board[rr][cc] == -1:
+                                unk += 1
+                if flags > v or (v - flags) > unk:
+                    unsat += 1
+    return revealed - 20.0 * zeros_bad - 10.0 * unsat
+
+
+def _cell_color_score(image, x1, y1, cw, ch):
+    """采样一个格子中心区域的彩色像素数 (对齐质量评分)"""
+    h, w = image.shape[:2]
+    x2, y2 = x1 + cw, y1 + ch
+    if x1 < 0 or y1 < 0 or x2 > w or y2 > h:
+        return -1
+    pad = int(min(cw, ch) * 0.25)
+    inner = image[y1 + pad:y2 - pad, x1 + pad:x2 - pad]
+    if inner.size == 0:
+        return 0
+    b = inner[:, :, 0].astype(int)
+    g = inner[:, :, 1].astype(int)
+    r = inner[:, :, 2].astype(int)
+    is_gray = (abs(r - g) < 25) & (abs(g - b) < 25) & (abs(r - b) < 25)
+    dark = (r < 60) & (g < 60) & (b < 60)  # 黑色数字 7 也是字形
+    return int(np.count_nonzero(~is_gray | dark))
+
 
 def _find_best_offset(image, cell_w, cell_h, rows, cols):
     """在整图上搜索最佳网格偏移 (最大化彩色像素)，采样加速"""
@@ -621,38 +860,52 @@ def _find_best_offset(image, cell_w, cell_h, rows, cols):
     max_ox = min(cell_w, w - cols * cell_w + 1)
     max_oy = min(cell_h, h - rows * cell_h + 1)
 
+    r_step = max(1, rows // 8)
+    c_step = max(1, cols // 8)
     for oy in range(0, max_oy, step_y):
         for ox in range(0, max_ox, step_x):
             score = 0
-            r_step = max(1, rows // 8)
-            c_step = max(1, cols // 8)
             for r in range(0, rows, r_step):
                 for c in range(0, cols, c_step):
-                    y1 = oy + r * cell_h
-                    x1 = ox + c * cell_w
-                    if y1 + cell_h > h or x1 + cell_w > w:
+                    s = _cell_color_score(image, ox + c * cell_w, oy + r * cell_h,
+                                          cell_w, cell_h)
+                    if s < 0:
                         continue
-                    cell = image[y1:y1 + cell_h, x1:x1 + cell_w]
-                    pad = max(2, min(cell_h, cell_w) // 8)
-                    inner = cell[pad:cell_h - pad, pad:cell_w - pad]
-                    if inner.size == 0:
-                        continue
-                    b, g, r2 = inner[:, :, 0].astype(int), inner[:, :, 1].astype(int), inner[:, :, 2].astype(int)
-                    is_gray = (abs(r2 - g) < 25) & (abs(g - b) < 25) & (abs(r2 - b) < 25)
-                    score += np.count_nonzero(~is_gray)
-            # 归一化：除以采样单元格数，再乘以总单元格数的比例因子
-            n_sampled = ((rows + r_step - 1) // r_step) * ((cols + c_step - 1) // c_step)
-            if n_sampled > 0:
-                score = score * (rows * cols) / (n_sampled * cell_w * cell_h)
+                    score += s
             if score > best_score:
                 best_score = score
                 best_ox, best_oy = ox, oy
     return best_ox, best_oy, best_score
 
 
+def _refine_offset(image, cell_w, cell_h, rows, cols, ox, oy):
+    """在粗对齐附近做细搜索 (步长 2px，含 ±2px 格宽微调)"""
+    best = (-1, ox, oy, cell_w)
+    h, w = image.shape[:2]
+    for cs in range(max(12, cell_w - 2), cell_w + 3):
+        if cols * cs > w or rows * cs > h:
+            continue
+        span = max(4, cs // 4)
+        for dy in range(-span, span + 1, 2):
+            for dx in range(-span, span + 1, 2):
+                x0, y0 = ox + dx, oy + dy
+                if x0 < 0 or y0 < 0 or x0 + cols * cs > w or y0 + rows * cs > h:
+                    continue
+                score = 0
+                for r in range(0, rows, max(1, rows // 6)):
+                    for c in range(0, cols, max(1, cols // 6)):
+                        score += max(0, _cell_color_score(image, x0 + c * cs,
+                                                          y0 + r * cs, cs, cs))
+                if score > best[0]:
+                    best = (score, x0, y0, cs)
+    if best[0] < 0:
+        return ox, oy, cell_w
+    return best[1], best[2], best[3]
+
+
 def recognize_board(image: np.ndarray):
     """
-    完整的棋盘识别流程。
+    完整的棋盘识别流程 (保留全部格子)。
     返回:
       board: 二维 int 列表 (board[y][x])
       meta: dict (rows, cols, cell_w, cell_h, offset_x, offset_y)
@@ -667,7 +920,24 @@ def recognize_board(image: np.ndarray):
     else:
         normalized = image
 
-    # 尝试标准棋盘尺寸 (9x9, 16x16, 30x16) 和一系列单元格大小
+    # 主策略: 梯度投影多候选网格 + 棋盘合法性择优 (参考 ms_toollib OBR)
+    candidates = detect_grid_candidates(normalized)
+    if candidates:
+        best_board, best_meta, best_q = None, None, None
+        for rows, cols, cw, ch, ox, oy in candidates:
+            cells = segment_cells(normalized, rows, cols, cw, ch, ox, oy)
+            board = classify_board(cells)
+            q = board_quality_score(board)
+            if best_q is None or q > best_q:
+                best_board, best_meta, best_q = board, {
+                    "rows": rows, "cols": cols,
+                    "cell_w": round(cw, 2), "cell_h": round(ch, 2),
+                    "offset_x": round(ox, 2), "offset_y": round(oy, 2),
+                }, q
+        if best_board is not None:
+            return best_board, best_meta
+
+    # 回退策略: 标准棋盘尺寸 + 彩色像素偏移搜索
     standard_sizes = [(30, 16), (16, 16), (9, 9)]
     candidates = []
 
@@ -688,6 +958,8 @@ def recognize_board(image: np.ndarray):
 
     if candidates:
         score, cs, rows, cols, ox, oy = candidates[0]
+        # 细化对齐，确保数字完整落入格内
+        ox, oy, cs = _refine_offset(normalized, cs, cs, rows, cols, ox, oy)
     else:
         board_img = detect_board(normalized)
         rows, cols, cell_w, cell_h = detect_grid_lines(board_img)
@@ -695,20 +967,9 @@ def recognize_board(image: np.ndarray):
         cs = max(cell_w, cell_h)
         normalized = board_img
 
-    # 分割并分类单元格
-    board = []
-    for r in range(rows):
-        row = []
-        for c in range(cols):
-            y1 = oy + r * cs
-            x1 = ox + c * cs
-            if y1 + cs > normalized.shape[0] or x1 + cs > normalized.shape[1]:
-                row.append(-1)
-                continue
-            cell = normalized[y1:y1 + cs, x1:x1 + cs]
-            val = classify_cell(cell)
-            row.append(val)
-        board.append(row)
+    # 分割 (全部 rows×cols 格) 并分类
+    cells = segment_cells(normalized, rows, cols, cs, cs, ox, oy)
+    board = classify_board(cells)
 
     meta = {"rows": rows, "cols": cols, "cell_w": cs, "cell_h": cs,
             "offset_x": ox, "offset_y": oy}

@@ -1,13 +1,98 @@
-# 扫雷认知助手 (Minesweeper Cognitive Agent)
+# 🧠 扫雷认知助手 (Minesweeper Cognitive Agent)
 
-Rust 推理引擎 + LLM 翻译层 + 前端棋盘编辑器 + OCR 截图识别
+Rust 推理引擎 + LLM 翻译层 + Web 棋盘编辑器 + OCR 截图识别
+
+- **确定性推理**：约束传播 + 子集规则，输出带完整依赖链的必雷 / 必安全证明
+- **概率引擎**：动态迭代蒙特卡洛模拟，30×30 大棋盘 < 150ms
+- **LLM 转译**：答案 / 教学 / 策略三种模式，把推理 IR 翻译成人类语言（含坐标幻觉检测）
+- **数据防火墙**：传给 LLM 的信息绝不包含未翻开格子的真实雷藏
+
+## 🚀 快速开始（选一种即可）
+
+### 方式一：Docker 一条命令（推荐，含 OCR）
+
+```bash
+docker compose up
+```
+
+打开 http://localhost:8080 即可使用，无需安装 Rust / Python / OpenCV。
+
+<details>
+<summary>启用 LLM（可选）</summary>
+
+```bash
+OPENAI_API_KEY=sk-xxx OPENAI_BASE_URL=https://api.openai.com/v1 OPENAI_MODEL=gpt-4o-mini docker compose up
+```
+或在 `docker-compose.yml` 的 `app.environment` 中填写后重启。
+
+</details>
+
+### 方式二：Cargo 一条命令（已有 Rust 环境）
+
+```bash
+cargo run --release
+```
+
+打开 http://localhost:8080 。推理引擎 + 前端开箱即用（LLM 与 OCR 为可选增强）。
+
+<details>
+<summary>可选：启用 LLM / OCR</summary>
+
+```bash
+# LLM (OpenAI 兼容 API: OpenAI / DeepSeek / Kimi 等)
+export OPENAI_API_KEY=sk-xxx
+export OPENAI_BASE_URL=https://api.openai.com/v1   # 可省略
+export OPENAI_MODEL=gpt-4o-mini                    # 可省略
+cargo run --release
+
+# OCR 截图识别 (Python 微服务)
+cd ocr && pip install -r requirements.txt && python app.py   # 端口 5001
+```
+
+</details>
+
+### 方式三：安装为全局命令
+
+```bash
+cargo install --path .
+minesweeper-agent serve        # 或直接运行 minesweeper-agent
+```
+
+## 📖 使用
+
+1. 打开 Web 界面，三种方式录入局面：
+   - **粘贴（推荐）**：对话输入框按 `Ctrl+V` / `Cmd+V`，截图自动 OCR、文本棋盘（`? F 0-8`）自动解析
+   - **手动编辑**：左键递增数字（1→8），右键插旗 🚩，`Shift+左键` 清零
+   - **加载示例**：下拉菜单载入经典残局
+2. 点击 **⚡ 分析局面**，棋盘上绿色 = 必安全、红色 = 必雷、蓝色百分比 = 雷概率
+3. 点击推理链步骤，棋盘橙色高亮该步涉及的格子；悬停格子查看概率与依据
+4. **🎓 教学模式**：不给答案，逐步引导提问；**📤 导出结果**：下载 Markdown 报告
+
+## CLI
+
+```bash
+minesweeper-agent serve [--port 8080] [--mc-iterations 0]   # Web 服务, 0=动态自适应(推荐)
+minesweeper-agent analyze -i tests/sample_board.json --mode answer
+minesweeper-agent ocr -i screenshot.png                      # 需 OCR 服务
+minesweeper-agent import -i tests/sample_board.json
+```
+
+## API
+
+| 端点 | 说明 |
+|------|------|
+| `POST /api/analyze` | 分析局面：`{ "board": [[1,-1,-1],...], "remaining_mines": 3, "mode": "answer\|teaching\|strategy", "use_llm": false }` |
+| `POST /api/ocr` | 截图识别代理：`{ "image": "<base64>" }` → `{ "board": [[...]], "remaining_mines": n }` |
+| `GET /api/health` | 健康检查 |
+
+**棋盘编码**：`-1` = 未知，`-2` = 旗帜，`0-8` = 已翻开数字（`board[行][列]`）。
 
 ## 架构
 
 ```
 ┌─────────────────────────────────────────────────────────┐
 │              用户交互层 (Frontend - Web)                   │
-│  截图上传 (OCR) / 棋盘手动编辑器 / 推理高亮展示 & 对话      │
+│  截图粘贴 (OCR) / 棋盘手动编辑器 / 推理高亮展示 & 对话      │
 └─────────────────────────┬───────────────────────────────┘
                           │ JSON over HTTP
                           ▼
@@ -23,144 +108,7 @@ Rust 推理引擎 + LLM 翻译层 + 前端棋盘编辑器 + OCR 截图识别
                         推理 IR (JSON) → 自然语言
 ```
 
-## 核心特性
-
-### 双引擎推理
-
-- **确定性约束传播**：类似数独的约束传播 + 子集推理规则，找出所有必雷/必安全格，生成完整推理证明链
-- **蒙特卡洛概率模拟**：对未知格子进行随机雷分配统计，输出每格的雷概率和期望信息增益
-  - **动态迭代次数**：未知格 <50 → 50 000 次；50~200 → 10 000 次；>200 → 1 000 次
-  - 30×30 大棋盘 **< 150ms** (release build)
-
-### LLM 转译层
-
-三种模式将推理 IR 翻译为人类可理解的语言：
-
-| 模式 | 说明 |
-|------|------|
-| **答案模式** | 将证明链转为"因为...所以..."的因果推理文字 |
-| **教学模式** | 将证明链倒置，生成逐步引导问题，禁止直接给答案 |
-| **策略模式** | 基于概率和收益数据，分析各区域利弊，给出坐标级建议 |
-
-**数据防火墙**：所有传给 LLM 的信息均不包含未翻开格子的真实雷藏，杜绝马后炮。坐标幻觉检测器验证 LLM 输出只引用 IR 中存在的坐标。
-
-### OCR 截图识别
-
-Python 微服务 (Flask + OpenCV + Tesseract)：
-1. 从截图中自动检测棋盘区域
-2. 检测网格线，分割为行列单元格
-3. 颜色分析识别旗帜/未翻开状态
-4. Tesseract OCR + 模板匹配识别数字 0-8
-
-## 快速开始
-
-### 方式一：Docker Compose (推荐)
-
-```bash
-docker compose up
-```
-
-打开 http://localhost:8080 即可使用。OCR 服务运行在端口 5001。
-
-### 方式二：本地运行
-
-**1. 启动 Rust 后端**
-
-```bash
-cargo run --release -- serve
-```
-
-服务启动在 http://localhost:8080，蒙特卡洛为动态自适应模式。
-
-**2. (可选) 启动 OCR 微服务**
-
-```bash
-cd ocr
-pip install -r requirements.txt
-python app.py
-```
-
-**3. 使用 LLM (可选)**
-
-```bash
-export OPENAI_API_KEY=sk-xxx
-export OPENAI_BASE_URL=https://api.openai.com/v1  # 或 DeepSeek 等
-export OPENAI_MODEL=gpt-4o-mini
-cargo run --release -- serve
-```
-
-## CLI 命令
-
-```bash
-# 启动 Web 服务
-minesweeper-agent serve --port 8080 --mc-iterations 0  # 0=动态自适应
-
-# 从 JSON 文件分析局面
-minesweeper-agent analyze -i tests/sample_board.json --mode answer
-
-# 从截图识别棋盘 (需 OCR 服务)
-minesweeper-agent ocr -i screenshot.png
-
-# 导入 JSON 并输出 PlayerView
-minesweeper-agent import -i tests/sample_board.json
-```
-
-## API
-
-### POST /api/analyze
-
-分析扫雷棋盘，返回推理结果和自然语言分析。
-
-```json
-{
-  "board": [[1,-1,-1], [-1,2,-1], [0,-1,-1]],
-  "remaining_mines": 3,
-  "mode": "answer",
-  "use_llm": false
-}
-```
-
-响应：
-
-```json
-{
-  "success": true,
-  "view": { "width": 3, "height": 3, ... },
-  "ir": { "deterministic": [...], "probabilities": [...], "regions": [...] },
-  "analysis": "【必雷格子】\n- 坐标(1, 0) 是雷...",
-  "used_llm": false
-}
-```
-
-### POST /api/ocr
-
-截图识别代理（转发给 OCR 微服务）。
-
-```json
-{ "image": "<base64编码的图像>" }
-```
-
-### GET /api/health
-
-健康检查。
-
-## 棋盘编码
-
-| 值 | 含义 |
-|----|------|
-| -1 | 未知 (未翻开) |
-| -2 | 旗帜 |
-| 0-8 | 已翻开数字 |
-
-## 技术栈
-
-| 模块 | 技术 |
-|------|------|
-| 推理核心 | Rust (serde, rand, rayon, axum) |
-| OCR | Python (Flask, OpenCV, Tesseract) |
-| LLM | OpenAI 兼容 API (reqwest) |
-| 前端 | HTML/JS Canvas |
-| 部署 | Docker Compose |
+蒙特卡洛动态迭代：未知格 `< 50` → 50 000 次；`50~200` → 10 000 次；`> 200` → 1 000 次。
 
 ## 项目结构
 
@@ -171,26 +119,36 @@ minesweeper/
 │   │   ├── deterministic.rs  # 确定性约束传播 + 子集推理
 │   │   ├── probabilistic.rs  # 蒙特卡洛模拟 (动态迭代)
 │   │   └── region.rs         # 连通区域分析 (并查集)
-│   ├── model/            # 数据模型
-│   │   ├── coord.rs          # 坐标
-│   │   ├── player_view.rs    # 玩家视角局面
-│   │   └── inference_ir.rs   # 推理中间语言 (IR)
-│   ├── llm/              # LLM 转译层
-│   │   ├── translator.rs     # IR→自然语言 (3模式)
-│   │   └── client.rs         # LLM API 客户端
+│   ├── model/            # PlayerView / Coord / InferenceIR
+│   ├── llm/              # LLM 转译 (translator + client)
 │   ├── server/           # Web 服务 (axum)
-│   └── cli.rs            # CLI 命令 (clap)
-├── ocr/                 # OCR 微服务
-│   ├── app.py               # Flask + OpenCV + Tesseract
-│   ├── requirements.txt
-│   └── Dockerfile
-├── static/              # 前端
-│   └── index.html
-├── tests/               # 集成测试
-├── Dockerfile
-├── docker-compose.yml
+│   └── cli.rs            # CLI (clap)
+├── static/index.html     # 前端 (Canvas 棋盘 + 对话引导区)
+├── ocr/                  # OCR 微服务 (Flask + OpenCV + Tesseract)
+├── tests/                # 集成测试
+├── Dockerfile / docker-compose.yml
 └── Cargo.toml
 ```
+
+## 开发
+
+```bash
+cargo test            # 单元 + 集成测试
+cargo build --release # 构建
+```
+
+## 引用的开源库
+
+| 库 | 用途 |
+|----|------|
+| [axum](https://github.com/tokio-rs/axum) / [tokio](https://github.com/tokio-rs/tokio) | Web 服务与异步运行时 |
+| [serde](https://serde.rs) / [serde_json](https://github.com/serde-rs/json) | 序列化与 JSON |
+| [rand](https://github.com/rust-random/rand) | 蒙特卡洛随机模拟 |
+| [rayon](https://github.com/rayon-rs/rayon) | 数据并行 |
+| [reqwest](https://github.com/seanmonstar/reqwest) | LLM API / OCR HTTP 客户端 |
+| [clap](https://github.com/clap-rs/clap) | 命令行参数 |
+| [Flask](https://flask.palletsprojects.com) / [OpenCV](https://opencv.org) / [Tesseract](https://github.com/tesseract-ocr/tesseract) | OCR 微服务 |
+| [Metasweeper](https://github.com/Green-Cat-Games/Metasweeper) | OBR（光学局面识别）思路参考 |
 
 ## License
 

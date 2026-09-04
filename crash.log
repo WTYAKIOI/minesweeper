@@ -1,0 +1,7 @@
+Rust panic at /home/runner/work/ms-toollib/ms-toollib/base/src/algorithms.rs:1463:10
+message: called `Result::unwrap()` on an `Err` value: Opening "params.onnx"
+
+Caused by:
+    No such file or directory (os error 2)
+
+stack trace omitted (run with RUST_BACKTRACE=1 for backtrace)
