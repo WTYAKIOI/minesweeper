@@ -1,0 +1,20 @@
+services:
+  ocr:
+    build: ./ocr
+    ports:
+      - "5001:5001"
+    restart: unless-stopped
+
+  app:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      - OCR_URL=http://ocr:5001
+      # 配置 LLM (可选)
+      # - OPENAI_API_KEY=sk-xxx
+      # - OPENAI_BASE_URL=https://api.openai.com/v1
+      # - OPENAI_MODEL=gpt-4o-mini
+    depends_on:
+      - ocr
+    restart: unless-stopped

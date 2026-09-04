@@ -1,0 +1,371 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ui version="4.0">
+ <class>Form</class>
+ <widget class="QWidget" name="Form">
+  <property name="geometry">
+   <rect>
+    <x>0</x>
+    <y>0</y>
+    <width>580</width>
+    <height>269</height>
+   </rect>
+  </property>
+  <property name="minimumSize">
+   <size>
+    <width>580</width>
+    <height>269</height>
+   </size>
+  </property>
+  <property name="maximumSize">
+   <size>
+    <width>580</width>
+    <height>269</height>
+   </size>
+  </property>
+  <property name="windowTitle">
+   <string>导入录像</string>
+  </property>
+  <property name="windowIcon">
+   <iconset>
+    <normaloff>media/cat.ico</normaloff>media/cat.ico</iconset>
+  </property>
+  <property name="windowOpacity">
+   <double>10.000000000000000</double>
+  </property>
+  <layout class="QVBoxLayout" name="verticalLayout">
+   <property name="leftMargin">
+    <number>24</number>
+   </property>
+   <property name="topMargin">
+    <number>24</number>
+   </property>
+   <property name="rightMargin">
+    <number>24</number>
+   </property>
+   <property name="bottomMargin">
+    <number>24</number>
+   </property>
+   <item>
+    <layout class="QHBoxLayout" name="horizontalLayout_exe">
+     <property name="spacing">
+      <number>10</number>
+     </property>
+     <item>
+      <widget class="QLabel" name="label_exe">
+       <property name="minimumSize">
+        <size>
+         <width>80</width>
+         <height>0</height>
+        </size>
+       </property>
+       <property name="text">
+        <string>验证程序:</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QLineEdit" name="lineEdit_exe">
+       <property name="minimumSize">
+        <size>
+         <width>0</width>
+         <height>42</height>
+        </size>
+       </property>
+       <property name="placeholderText">
+        <string>选择验证程序...</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QPushButton" name="pushButton_browse_exe">
+       <property name="minimumSize">
+        <size>
+         <width>80</width>
+         <height>42</height>
+        </size>
+       </property>
+       <property name="maximumSize">
+        <size>
+         <width>80</width>
+         <height>42</height>
+        </size>
+       </property>
+       <property name="focusPolicy">
+        <enum>Qt::NoFocus</enum>
+       </property>
+       <property name="styleSheet">
+        <string notr="true">QPushButton {
+    background: transparent;
+    border: 1px solid #999;
+    border-radius: 6px;
+    color: #444;
+    font-weight: normal;
+    font-family: &quot;Microsoft YaHei&quot;, &quot;微软雅黑&quot;, &quot;Segoe UI&quot;, Arial, sans-serif;
+    font-size: 9pt;
+}
+QPushButton:hover {
+    background: #eee;
+}</string>
+       </property>
+       <property name="text">
+        <string>浏览</string>
+       </property>
+      </widget>
+     </item>
+    </layout>
+   </item>
+   <item>
+    <layout class="QHBoxLayout" name="horizontalLayout_replay">
+     <property name="spacing">
+      <number>10</number>
+     </property>
+     <item>
+      <widget class="QLabel" name="label_replay">
+       <property name="minimumSize">
+        <size>
+         <width>80</width>
+         <height>0</height>
+        </size>
+       </property>
+       <property name="text">
+        <string>录像路径:</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QLineEdit" name="lineEdit_replay">
+       <property name="minimumSize">
+        <size>
+         <width>0</width>
+         <height>42</height>
+        </size>
+       </property>
+       <property name="placeholderText">
+        <string>选择录像文件或文件夹...</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QPushButton" name="pushButton_browse_file">
+       <property name="minimumSize">
+        <size>
+         <width>80</width>
+         <height>42</height>
+        </size>
+       </property>
+       <property name="maximumSize">
+        <size>
+         <width>80</width>
+         <height>42</height>
+        </size>
+       </property>
+       <property name="font">
+        <font>
+         <family>Microsoft YaHei,微软雅黑,Segoe UI,Arial,sans-serif</family>
+         <pointsize>9</pointsize>
+         <weight>50</weight>
+         <bold>false</bold>
+        </font>
+       </property>
+       <property name="focusPolicy">
+        <enum>Qt::NoFocus</enum>
+       </property>
+       <property name="styleSheet">
+        <string notr="true">QPushButton {
+    background: transparent;
+    border: 1px solid #999;
+    border-radius: 6px;
+    color: #444;
+    font-weight: normal;
+    font-family: &quot;Microsoft YaHei&quot;, &quot;微软雅黑&quot;, &quot;Segoe UI&quot;, Arial, sans-serif;
+    font-size: 9pt;
+}
+QPushButton:hover {
+    background: #eee;
+}</string>
+       </property>
+       <property name="text">
+        <string>选择文件</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QPushButton" name="pushButton_browse_folder">
+       <property name="minimumSize">
+        <size>
+         <width>80</width>
+         <height>42</height>
+        </size>
+       </property>
+       <property name="maximumSize">
+        <size>
+         <width>80</width>
+         <height>42</height>
+        </size>
+       </property>
+       <property name="focusPolicy">
+        <enum>Qt::NoFocus</enum>
+       </property>
+       <property name="styleSheet">
+        <string notr="true">QPushButton {
+    background: transparent;
+    border: 1px solid #999;
+    border-radius: 6px;
+    color: #444;
+    font-weight: normal;
+    font-family: &quot;Microsoft YaHei&quot;, &quot;微软雅黑&quot;, &quot;Segoe UI&quot;, Arial, sans-serif;
+    font-size: 9pt;
+}
+QPushButton:hover {
+    background: #eee;
+}</string>
+       </property>
+       <property name="text">
+        <string>选择文件夹</string>
+       </property>
+      </widget>
+     </item>
+    </layout>
+   </item>
+   <item>
+    <widget class="QProgressBar" name="progressBar">
+     <property name="minimumSize">
+      <size>
+       <width>0</width>
+       <height>28</height>
+      </size>
+     </property>
+     <property name="maximumSize">
+      <size>
+       <width>16777215</width>
+       <height>28</height>
+      </size>
+     </property>
+     <property name="visible">
+      <bool>true</bool>
+     </property>
+     <property name="styleSheet">
+      <string notr="true">QProgressBar {
+    border: 1px solid #bbb;
+    border-radius: 6px;
+    text-align: center;
+    font-size: 11pt;
+    height: 24px;
+}
+QProgressBar::chunk {
+    background-color: #00A2E8;
+    border-radius: 4px;
+}</string>
+     </property>
+     <property name="value">
+      <number>0</number>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <widget class="QLabel" name="label_progress">
+     <property name="minimumSize">
+      <size>
+       <width>200</width>
+       <height>0</height>
+      </size>
+     </property>
+     <property name="visible">
+      <bool>true</bool>
+     </property>
+     <property name="text">
+      <string/>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <layout class="QHBoxLayout" name="horizontalLayout_buttons">
+     <property name="spacing">
+      <number>10</number>
+     </property>
+     <item>
+      <widget class="QPushButton" name="pushButton_ok">
+       <property name="sizePolicy">
+        <sizepolicy hsizetype="Expanding" vsizetype="Fixed">
+         <horstretch>0</horstretch>
+         <verstretch>0</verstretch>
+        </sizepolicy>
+       </property>
+       <property name="minimumSize">
+        <size>
+         <width>184</width>
+         <height>51</height>
+        </size>
+       </property>
+       <property name="maximumSize">
+        <size>
+         <width>16777215</width>
+         <height>51</height>
+        </size>
+       </property>
+       <property name="focusPolicy">
+        <enum>Qt::NoFocus</enum>
+       </property>
+       <property name="text">
+        <string>确认</string>
+       </property>
+       <property name="shortcut">
+        <string>Return</string>
+       </property>
+       <property name="autoDefault">
+        <bool>false</bool>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QPushButton" name="pushButton_cancel">
+       <property name="sizePolicy">
+        <sizepolicy hsizetype="Expanding" vsizetype="Fixed">
+         <horstretch>0</horstretch>
+         <verstretch>0</verstretch>
+        </sizepolicy>
+       </property>
+       <property name="minimumSize">
+        <size>
+         <width>184</width>
+         <height>51</height>
+        </size>
+       </property>
+       <property name="maximumSize">
+        <size>
+         <width>16777215</width>
+         <height>51</height>
+        </size>
+       </property>
+       <property name="focusPolicy">
+        <enum>Qt::NoFocus</enum>
+       </property>
+       <property name="text">
+        <string>取消</string>
+       </property>
+      </widget>
+     </item>
+    </layout>
+   </item>
+  </layout>
+ </widget>
+ <resources/>
+ <connections>
+  <connection>
+   <sender>pushButton_cancel</sender>
+   <signal>clicked()</signal>
+   <receiver>Form</receiver>
+   <slot>close()</slot>
+   <hints>
+    <hint type="sourcelabel">
+     <x>493</x>
+     <y>317</y>
+    </hint>
+    <hint type="destinationlabel">
+     <x>290</x>
+     <y>175</y>
+    </hint>
+   </hints>
+  </connection>
+ </connections>
+</ui>

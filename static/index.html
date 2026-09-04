@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>扫雷认知助手</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #1a1a2e; color: #e0e0e0; min-height: 100vh; }
+        .container { max-width: 1200px; margin: 0 auto; padding: 20px; }
+        h1 { text-align: center; margin-bottom: 20px; color: #00d4ff; }
+        .panel { background: #16213e; border-radius: 12px; padding: 20px; margin-bottom: 20px; box-shadow: 0 4px 20px rgba(0,0,0,0.3); }
+        .panel h2 { color: #00d4ff; margin-bottom: 15px; font-size: 18px; }
+        .controls { display: flex; gap: 15px; flex-wrap: wrap; align-items: center; margin-bottom: 15px; }
+        label { font-size: 14px; color: #a0a0b0; }
+        select, input[type="number"] { background: #0f3460; color: #e0e0e0; border: 1px solid #1a4a7a; border-radius: 6px; padding: 6px 10px; font-size: 14px; }
+        button { background: #00d4ff; color: #16213e; border: none; border-radius: 6px; padding: 8px 20px; font-size: 14px; font-weight: bold; cursor: pointer; transition: all 0.2s; }
+        button:hover { background: #00b8d4; transform: translateY(-1px); }
+        button:disabled { background: #555; color: #888; cursor: not-allowed; }
+        .board-editor { display: flex; gap: 20px; flex-wrap: wrap; }
+        .board-input { flex: 1; min-width: 300px; }
+        textarea { width: 100%; background: #0f3460; color: #e0e0e0; border: 1px solid #1a4a7a; border-radius: 6px; padding: 10px; font-family: monospace; font-size: 13px; resize: vertical; min-height: 150px; }
+        .board-preview { flex: 1; min-width: 300px; }
+        #boardCanvas { border: 1px solid #333; border-radius: 6px; display: block; margin: 0 auto; cursor: pointer; }
+        .analysis-result { white-space: pre-wrap; font-size: 14px; line-height: 1.6; }
+        .loading { text-align: center; padding: 20px; color: #00d4ff; }
+        .stats { display: flex; gap: 20px; flex-wrap: wrap; margin-bottom: 15px; }
+        .stat-item { background: #0f3460; border-radius: 6px; padding: 8px 16px; font-size: 13px; }
+        .stat-item span { color: #00d4ff; font-weight: bold; }
+        .preset-btn { background: #0f3460; color: #e0e0e0; border: 1px solid #1a4a7a; border-radius: 4px; padding: 4px 12px; font-size: 12px; cursor: pointer; margin-right: 5px; }
+        .preset-btn:hover { background: #1a4a7a; }
+        .hint { font-size: 12px; color: #888; margin-top: 8px; }
+        .ocr-section { margin-bottom: 15px; padding-bottom: 15px; border-bottom: 1px solid #1a4a7a; }
+        .upload-btn { background: #0f3460; color: #e0e0e0; border: 1px solid #1a4a7a; border-radius: 6px; padding: 8px 20px; font-size: 14px; cursor: pointer; transition: all 0.2s; display: inline-block; }
+        .upload-btn:hover { background: #1a4a7a; }
+        #imageInput { display: none; }
+        .image-preview { max-width: 100%; max-height: 200px; margin-top: 10px; border-radius: 6px; display: none; }
+        .ocr-hint { font-size: 12px; color: #888; margin-top: 5px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>扫雷认知助手</h1>
+
+        <div class="panel">
+            <h2>棋盘输入</h2>
+            <div class="ocr-section">
+                <label>截图识别 (OCR)</label>
+                <input type="file" id="imageInput" accept="image/*">
+                <button class="upload-btn" onclick="document.getElementById('imageInput').click()">上传截图</button>
+                <button class="upload-btn" id="ocrBtn" onclick="recognizeScreenshot()" disabled>识别棋盘</button>
+                <img id="imagePreview" class="image-preview" alt="预览">
+                <div class="ocr-hint">上传扫雷截图，自动识别棋盘。需启动 OCR 微服务 (端口 5001)。</div>
+            </div>
+            <div class="controls">
+                <button class="preset-btn" onclick="loadPreset('beginner')">初级 9x9/10雷</button>
+                <button class="preset-btn" onclick="loadPreset('intermediate')">中级 16x16/40雷</button>
+                <button class="preset-btn" onclick="loadPreset('expert')">高级 30x16/99雷</button>
+            </div>
+            <div class="board-editor">
+                <div class="board-input">
+                    <label>棋盘矩阵 (每行用逗号分隔，-1=未知，-2=旗帜，0-8=数字)</label>
+                    <textarea id="boardInput" rows="10" placeholder="1,-1,-1,-1
+2,-1,-2,-1
+1,-1,-1,-1"></textarea>
+                    <div class="hint">行数=高度，列数=宽度。直接在棋盘上点击可切换格子状态。</div>
+                </div>
+                <div class="board-preview">
+                    <label>棋盘预览 (点击切换状态: 未知→数字→旗帜)</label>
+                    <canvas id="boardCanvas" width="400" height="400"></canvas>
+                </div>
+            </div>
+            <div class="controls" style="margin-top: 15px;">
+                <label>剩余雷数: <input type="number" id="mineCount" value="10" min="0" style="width:60px"></label>
+                <label>分析模式:
+                    <select id="mode">
+                        <option value="answer">答案模式</option>
+                        <option value="teaching">教学模式</option>
+                        <option value="strategy">策略模式</option>
+                    </select>
+                </label>
+                <label><input type="checkbox" id="useLLM"> 调用 LLM</label>
+                <button onclick="parseBoard()" style="margin-left:auto;">解析棋盘</button>
+                <button onclick="analyze()">分析</button>
+            </div>
+        </div>
+
+        <div class="panel" id="resultPanel" style="display:none;">
+            <h2>分析结果</h2>
+            <div class="stats" id="stats"></div>
+            <div class="analysis-result" id="analysisResult"></div>
+        </div>
+
+        <div class="panel" id="loadingPanel" style="display:none;">
+            <div class="loading" id="loadingText">正在分析中...</div>
+        </div>
+    </div>
+
+    <script>
+        let board = [];
+        let cellSize = 30;
+        let canvas = document.getElementById('boardCanvas');
+        let ctx = canvas.getContext('2d');
+        let selectedImage = null;
+
+        document.getElementById('imageInput').addEventListener('change', function(e) {
+            const file = e.target.files[0];
+            if (!file) return;
+            selectedImage = file;
+            const reader = new FileReader();
+            reader.onload = function(ev) {
+                const preview = document.getElementById('imagePreview');
+                preview.src = ev.target.result;
+                preview.style.display = 'block';
+                document.getElementById('ocrBtn').disabled = false;
+            };
+            reader.readAsDataURL(file);
+        });
+
+        async function recognizeScreenshot() {
+            if (!selectedImage) {
+                alert('请先选择截图文件');
+                return;
+            }
+            document.getElementById('loadingPanel').style.display = 'block';
+            document.getElementById('resultPanel').style.display = 'none';
+
+            const reader = new FileReader();
+            reader.onload = async function(ev) {
+                const b64 = ev.target.result.split(',')[1];
+                try {
+                    const resp = await fetch('/api/ocr', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ image: b64 })
+                    });
+                    if (!resp.ok) {
+                        const err = await resp.text();
+                        throw new Error(err);
+                    }
+                    const data = await resp.json();
+                    document.getElementById('loadingPanel').style.display = 'none';
+
+                    if (data.success && data.board) {
+                        board = data.board;
+                        if (data.remaining_mines != null) {
+                            document.getElementById('mineCount').value = data.remaining_mines;
+                        }
+                        updateTextarea();
+                        drawBoard();
+                        alert('识别成功: ' + board.length + 'x' + (board[0] ? board[0].length : 0) + ' 棋盘');
+                    } else {
+                        alert('识别失败: ' + (data.error || '未知错误'));
+                    }
+                } catch (e) {
+                    document.getElementById('loadingPanel').style.display = 'none';
+                    alert('OCR 识别失败: ' + e.message + '\n\n请确保 OCR 微服务已启动 (端口 5001)');
+                }
+            };
+            reader.readAsDataURL(selectedImage);
+        }
+
+        function loadPreset(type) {
+            const presets = {
+                beginner: { w: 9, h: 9, mines: 10 },
+                intermediate: { w: 16, h: 16, mines: 40 },
+                expert: { w: 30, h: 16, mines: 99 }
+            };
+            const p = presets[type];
+            if (!p) return;
+            board = [];
+            for (let y = 0; y < p.h; y++) {
+                let row = [];
+                for (let x = 0; x < p.w; x++) row.push(-1);
+                board.push(row);
+            }
+            document.getElementById('mineCount').value = p.mines;
+            updateTextarea();
+            drawBoard();
+        }
+
+        function updateTextarea() {
+            document.getElementById('boardInput').value = board.map(r => r.join(',')).join('\n');
+        }
+
+        function parseBoard() {
+            const text = document.getElementById('boardInput').value.trim();
+            if (!text) return;
+            board = text.split('\n').map(line => line.trim().split(',').map(v => parseInt(v.trim())));
+            drawBoard();
+        }
+
+        function drawBoard() {
+            if (!board.length) return;
+            const h = board.length;
+            const w = board[0].length;
+            const maxW = 500, maxH = 500;
+            cellSize = Math.min(maxW / w, maxH / h, 35);
+            canvas.width = w * cellSize;
+            canvas.height = h * cellSize;
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            for (let y = 0; y < h; y++) {
+                for (let x = 0; x < w; x++) {
+                    const val = board[y][x];
+                    const px = x * cellSize, py = y * cellSize;
+                    // background
+                    if (val === -1) {
+                        ctx.fillStyle = '#2a2a4a';
+                    } else if (val === -2) {
+                        ctx.fillStyle = '#4a2a2a';
+                    } else {
+                        ctx.fillStyle = '#1a3a5a';
+                    }
+                    ctx.fillRect(px, py, cellSize, cellSize);
+                    // border
+                    ctx.strokeStyle = '#0a0a1e';
+                    ctx.lineWidth = 1;
+                    ctx.strokeRect(px, py, cellSize, cellSize);
+                    // text
+                    if (val === -2) {
+                        ctx.fillStyle = '#ff4444';
+                        ctx.font = (cellSize * 0.6) + 'px sans-serif';
+                        ctx.textAlign = 'center';
+                        ctx.textBaseline = 'middle';
+                        ctx.fillText('P', px + cellSize/2, py + cellSize/2);
+                    } else if (val >= 0 && val <= 8) {
+                        const colors = ['', '#00d4ff', '#00ff88', '#ff8800', '#ff0088', '#ff4400', '#00ffff', '#ffffff', '#ff00ff'];
+                        ctx.fillStyle = colors[val] || '#fff';
+                        ctx.font = 'bold ' + (cellSize * 0.55) + 'px monospace';
+                        ctx.textAlign = 'center';
+                        ctx.textBaseline = 'middle';
+                        ctx.fillText(val.toString(), px + cellSize/2, py + cellSize/2);
+                    }
+                }
+            }
+        }
+
+        canvas.onclick = function(e) {
+            if (!board.length) return;
+            const rect = canvas.getBoundingClientRect();
+            const sx = (e.clientX - rect.left) / rect.width * canvas.width;
+            const sy = (e.clientY - rect.top) / rect.height * canvas.height;
+            const x = Math.floor(sx / cellSize);
+            const y = Math.floor(sy / cellSize);
+            if (y >= board.length || x >= board[0].length) return;
+            // cycle: unknown(-1) -> 0 -> 1..8 -> flagged(-2) -> unknown
+            const cur = board[y][x];
+            if (cur === -1) board[y][x] = 0;
+            else if (cur === -2) board[y][x] = -1;
+            else if (cur >= 0 && cur < 8) board[y][x] = cur + 1;
+            else if (cur === 8) board[y][x] = -2;
+            else board[y][x] = -1;
+            updateTextarea();
+            drawBoard();
+        };
+
+        async function analyze() {
+            if (!board.length) {
+                alert('请先输入棋盘');
+                return;
+            }
+            document.getElementById('resultPanel').style.display = 'none';
+            document.getElementById('loadingPanel').style.display = 'block';
+
+            const req = {
+                board: board,
+                remaining_mines: parseInt(document.getElementById('mineCount').value),
+                mode: document.getElementById('mode').value,
+                use_llm: document.getElementById('useLLM').checked
+            };
+
+            try {
+                const resp = await fetch('/api/analyze', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(req)
+                });
+                if (!resp.ok) {
+                    const err = await resp.text();
+                    throw new Error(err);
+                }
+                const data = await resp.json();
+                document.getElementById('loadingPanel').style.display = 'none';
+
+                const stats = document.getElementById('stats');
+                stats.innerHTML = `
+                    <div class="stat-item">尺寸: <span>${data.view.width}x${data.view.height}</span></div>
+                    <div class="stat-item">已翻开: <span>${data.view.revealed.length}</span></div>
+                    <div class="stat-item">未知: <span>${data.view.unknown.length}</span></div>
+                    <div class="stat-item">必雷: <span>${data.ir.deterministic.filter(p => p.conclusion.is_mine).length}</span></div>
+                    <div class="stat-item">必安全: <span>${data.ir.deterministic.filter(p => !p.conclusion.is_mine).length}</span></div>
+                    <div class="stat-item">LLM: <span>${data.used_llm ? '是' : '否'}</span></div>
+                `;
+                document.getElementById('analysisResult').textContent = data.analysis;
+                document.getElementById('resultPanel').style.display = 'block';
+            } catch (e) {
+                document.getElementById('loadingPanel').style.display = 'none';
+                alert('分析失败: ' + e.message);
+            }
+        }
+
+        loadPreset('beginner');
+    </script>
+</body>
+</html>

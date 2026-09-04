@@ -1,0 +1,198 @@
+name: Build metasweeper
+
+on:
+  push:
+    tags:
+      - '*'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+
+      - name: Generate translation qm files
+        run: |
+          lrelease src/ui/en_US.ts -qm src/en_US.qm
+          lrelease src/ui/de_DE.ts -qm src/de_DE.qm
+          lrelease src/ui/pl_PL.ts -qm src/pl_PL.qm
+          lrelease src/ui/ja_JP.ts -qm src/ja_JP.qm
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: |
+          python -V
+          python -m pip install --upgrade pip
+          pip install flake8 pyinstaller>=6.19.0 cython
+          pip install -r requirements.txt
+
+      - name: Generate metasweeper_checksum.pyd
+        run: |
+          cd package_tool
+          python setup.py build_ext --inplace
+          ren *.pyd metasweeper_checksum.pyd
+          cd ..
+          move package_tool\metasweeper_checksum.pyd src\metasweeper_checksum.pyd
+          del src\metasweeper_checksum.py
+
+      - name: Generate random icon
+        run: |
+          cd package_tool
+          python -u randomize_cat_icon.py
+          Copy-Item cat.ico ..\src\media\cat.ico -Force
+
+      - name: Package main app with PyInstaller
+        run: |
+          pyinstaller `
+            --icon src/media/cat.ico `
+            --noconsole `
+            --noconfirm `
+            --clean `
+            --paths src `
+            --name metasweeper `
+            --add-data "src/media;media" `
+            --add-data "src/plugins;plugins" `
+            --add-data "src/en_US.qm;." `
+            --add-data "src/de_DE.qm;." `
+            --add-data "src/pl_PL.qm;." `
+            --add-data "src/ja_JP.qm;." `
+            --exclude PIL --exclude Pillow --exclude Cython `
+            --exclude setuptools --exclude pkg_resources `
+            --exclude certifi --exclude charset_normalizer `
+            --exclude psutil --exclude numpy `
+            --runtime-hook package_tool/hook-debugpy-pyinstaller.py `
+            src/main.py
+
+      - name: Package plugin_manager with PyInstaller
+        run: |
+          pyinstaller `
+            --noconfirm `
+            --name plugin_manager `
+            --windowed `
+            --icon src/media/cat.ico `
+            --add-data "src/plugins;plugins" `
+            --add-data "src/shared_types;shared_types" `
+            --add-data "src/en_US.qm;." `
+            --add-data "src/de_DE.qm;." `
+            --add-data "src/ja_JP.qm;." `
+            --add-data "src/pl_PL.qm;." `
+            --hidden-import sqlite3 `
+            --hidden-import code `
+            --hidden-import xmlrpc `
+            --hidden-import xmlrpc.server `
+            --hidden-import xmlrpc.client `
+            --hidden-import http.server `
+            --hidden-import socketserver `
+            --hidden-import email `
+            --hidden-import email.utils `
+            --hidden-import requests `
+            --hidden-import Crypto.Cipher.AES `
+            --hidden-import Crypto.Random `
+            --hidden-import win32api `
+            --hidden-import win32event `
+            --hidden-import winerror `
+            --hidden-import ms_toollib `
+            --hidden-import PyQt5.QtQuickWidgets `
+            --hidden-import PyQt5.QtQuick `
+            --hidden-import PyQt5.QtQml `
+            --hidden-import PyQt5.QtChart `
+            --exclude PIL --exclude Pillow --exclude Cython `
+            --exclude setuptools --exclude pkg_resources `
+            --exclude psutil --exclude numpy `
+            --runtime-hook package_tool/hook-debugpy-pyinstaller.py `
+            --distpath dist\plugin_manager_out `
+            src\plugin_manager\_run.py
+
+      - name: Copy plugin resources into metasweeper dist
+        run: |
+          $dest = "dist\metasweeper"
+          Copy-Item "dist\plugin_manager_out\plugin_manager\plugin_manager.exe" -Destination $dest -Force
+          Copy-Item "dist\plugin_manager_out\plugin_manager\_internal\*" -Destination "$dest\_internal" -Recurse -Force
+          Copy-Item "src\params.onnx" -Destination "$dest\params.onnx" -Force
+          Copy-Item "plugin-dev-tutorial.md" -Destination $dest -Force
+          New-Item -ItemType Directory -Force "$dest\user_plugins" | Out-Null
+          Remove-Item "$dest\plugin_manager\_run.py" -Force -ErrorAction SilentlyContinue
+          Remove-Item "dist\plugin_manager_out" -Recurse -Force -ErrorAction SilentlyContinue
+
+      - name: Copy extra dependencies for plugin subprocess
+        run: |
+          python -c "
+          import shutil, site, os
+          sp = site.getsitepackages()[0]
+          dest = 'dist/metasweeper/_internal'
+          for pkg in ['debugpy', 'msgspec']:
+              src = os.path.join(sp, pkg)
+              dst = os.path.join(dest, pkg)
+              if os.path.exists(src):
+                  shutil.copytree(src, dst, dirs_exist_ok=True)
+                  n = sum(1 for _,_,fs in os.walk(dst) for f in fs)
+                  kb = sum(os.path.getsize(os.path.join(d, f)) for d,_,fs in os.walk(dst) for f in fs) // 1024
+                  print(f'Copied {pkg} ({n} files, {kb} KB)')
+                  for sub in ['_vendored', '_vendored2']:
+                      vd = os.path.join(dst, sub)
+                      if os.path.isdir(vd):
+                          print(f'  {sub}/ present ({len(os.listdir(vd))} items)')
+                      else:
+                          print(f'  {sub}/ absent (OK for debugpy >=1.8)')
+              else:
+                  print(f'WARNING: {pkg} not found in site-packages!')
+          "
+
+      - name: Strip unnecessary Qt binaries
+        shell: powershell
+        run: |
+          $qt = "dist\metasweeper\_internal\PyQt5\Qt5"
+
+          # 1) 删除不用的 Qt 模块 DLL (~8.6 MB)
+          # 注意：Qt5Quick/Qt5Qml/Qt5QmlModels 被 stats 插件(QQuickWidget/QML)使用，必须保留
+          $unusedDlls = @(
+            "Qt5DBus.dll"
+          )
+          foreach ($dll in $unusedDlls) {
+            $path = "$qt\bin\$dll"
+            if (Test-Path $path) { Remove-Item $path -Force; Write-Output "Removed $dll" }
+          }
+
+          # 2) 删除软件 OpenGL 回退 (~20 MB)
+          $swgl = "$qt\bin\opengl32sw.dll"
+          if (Test-Path $swgl) { Remove-Item $swgl -Force; Write-Output "Removed opengl32sw.dll" }
+
+          # 3) 删除不必要的 Qt 平台插件 (~1.5 MB)
+          $unusedPlugins = @("qminimal.dll", "qoffscreen.dll", "qwebgl.dll")
+          $pluginDir = "$qt\plugins\platforms"
+          foreach ($dll in $unusedPlugins) {
+            $path = "$pluginDir\$dll"
+            if (Test-Path $path) { Remove-Item $path -Force; Write-Output "Removed $dll" }
+          }
+
+          # 4) 保留 qtbase_*.qm（Qt 内建对话框翻译），删除其他模块的无用翻译 (~4 MB)
+          $transDir = "$qt\translations"
+          if (Test-Path $transDir) {
+            Get-ChildItem "$transDir\*.qm" | Where-Object {
+              -not $_.BaseName.StartsWith("qtbase_")
+            } | Remove-Item -Force
+            $remaining = (Get-ChildItem "$transDir\*.qm" | Measure-Object).Count
+            Write-Output "Trimmed Qt translations (kept $remaining qtbase_*.qm files)"
+          }
+
+
+
+          # 报告最终大小
+          $total = (Get-ChildItem -Recurse "dist\metasweeper" -File | Measure-Object -Property Length -Sum).Sum
+          Write-Output "Final metasweeper dist size: $('{0:N2}' -f ($total/1MB)) MB"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: Metasweeper-snapshot
+          path: dist/

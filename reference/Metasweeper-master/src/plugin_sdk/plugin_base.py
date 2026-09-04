@@ -1,0 +1,1159 @@
+"""
+插件基类定义
+
+每个插件同时具备：
+|- 后台数据处理能力（订阅事件、处理数据）
+|- 界面交互能力（可选的 PyQt 界面）
+
+注意：插件共享同一个 ZMQClient，事件通过 EventDispatcher 内部分发
+每个插件运行在独立线程中（QObject + moveToThread），通过 Qt 事件循环串行消费事件，保证线程安全
+"""
+
+from __future__ import annotations
+import inspect
+from pathlib import Path
+
+from plugin_sdk.config_types.other_info import ConfigT
+
+
+from .service_registry import ServiceNotFoundError
+from lib_zmq_plugins.shared.base import BaseEvent, CommandResponse, get_event_tag
+from PyQt5.QtGui import QIcon, QPixmap, QPainter, QPen, QColor, QBrush, QFont
+from PyQt5.QtCore import Qt, QThread, QObject, pyqtSignal, pyqtSlot
+
+from concurrent.futures import Future
+import threading
+from abc import abstractmethod
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from enum import Enum, StrEnum
+from typing import TYPE_CHECKING, Any, Callable, ClassVar, Generic, Type, TypeVar, cast
+from .config_types import OtherInfoBase
+_E = TypeVar("_E", bound="BaseEvent")
+_T = TypeVar("_T")  # 用于服务获取方法的泛型
+
+if TYPE_CHECKING:
+    from plugin_manager.logging_setup import LogConfig
+    from PyQt5.QtGui import QIcon
+
+
+if TYPE_CHECKING:
+    from PyQt5.QtWidgets import QWidget
+    from lib_zmq_plugins.client.zmq_client import ZMQClient
+    from plugin_manager.event_dispatcher import EventDispatcher
+
+
+def make_plugin_icon(
+    color: str = "#1976d2",
+    symbol: str = "?",
+    size: int = 64,
+) -> QIcon:
+    """
+    生成插件默认图标的工厂函数
+
+    Args:
+        color: 圆形背景颜色（十六进制）
+        symbol: 圆心显示的文字/符号
+        size: 图标像素尺寸
+
+    Returns:
+        生成的 QIcon
+
+    Usage::
+
+        PLUGIN_INFO = PluginInfo(..., icon=make_plugin_icon("#e65100", "📝"))
+    """
+    pix = QPixmap(size, size)
+    pix.fill(Qt.transparent)  # type: ignore[attr-defined]
+
+    p = QPainter(pix)
+    p.setRenderHint(QPainter.Antialiasing)
+
+    # 圆形背景
+    p.setPen(Qt.NoPen)  # type: ignore[attr-defined]
+    p.setBrush(QBrush(QColor(color)))
+    p.drawEllipse(pix.rect().adjusted(3, 3, -3, -3))
+
+    # 符号文字
+    pen = QPen(QColor("white"), 2)
+    p.setPen(pen)
+    p.setBrush(Qt.NoBrush)  # type: ignore[attr-defined]
+    font = QFont("Segoe UI Emoji", int(size * 0.44), QFont.Bold)
+    p.setFont(font)
+    p.drawText(pix.rect(), Qt.AlignCenter | Qt.AlignVCenter,  # type: ignore[attr-defined]
+               symbol)
+    p.end()
+
+    return QIcon(pix)
+
+
+class WindowMode(StrEnum):
+    """窗口加载方式枚举"""
+    TAB = "tab"           # 标签页内加载
+    DETACHED = "detached"  # 独立窗口加载
+    CLOSED = "closed"      # 不自动加载
+
+    @classmethod
+    def _values(cls):
+        return [level.value for level in cls]
+
+    @classmethod
+    def LABELS(cls):
+
+        return {
+            cls.TAB: "标签页内",
+            cls.DETACHED: "独立窗口",
+            cls.CLOSED: "不自动加载",
+        }
+
+
+class _ServiceProxy:
+    """
+    服务代理对象（内部使用）
+
+    拦截属性访问，将方法调用转换为 call_service 调用。
+    让插件开发者可以直接通过属性访问方式调用服务方法。
+    """
+
+    def __init__(self, plugin: "BasePlugin", protocol: type):
+        object.__setattr__(self, "_plugin", plugin)
+        object.__setattr__(self, "_protocol", protocol)
+
+    def __getattr__(self, name: str) -> Any:
+        # 返回一个可调用对象，调用时转发到 _call_service
+        def _method_call(*args, timeout: float = 10.0, **kwargs) -> Any:
+            if kwargs:
+                # 如果有 kwargs，不支持（服务方法通常只有位置参数）
+                raise TypeError(
+                    f"Service method call with keyword arguments is not supported. "
+                    f"Use positional arguments: {self._protocol.__name__}.{name}(*args)"
+                )
+            return self._plugin._call_service(
+                self._protocol, name, *args, timeout=timeout
+            )
+        return _method_call
+
+    def __repr__(self) -> str:
+        return f"<ServiceProxy: {self._protocol.__name__}>"
+
+
+class PluginLifecycle(str, Enum):
+    """插件生命周期状态"""
+    NEW = "NEW"                     # 刚创建，未初始化
+    INITIALIZING = "INITIALIZING"   # 线程已启动，on_initialized() 正在执行
+    READY = "READY"                 # on_initialized() 完成，正常运行
+    SHUTTING_DOWN = "SHUTTING_DOWN"  # shutdown() 调用中
+    STOPPED = "STOPPED"             # 已停止
+
+
+class LogLevel(StrEnum):
+    """日志级别枚举"""
+    TRACE = "TRACE"
+    DEBUG = "DEBUG"
+    INFO = "INFO"
+    WARNING = "WARNING"
+    ERROR = "ERROR"
+
+    @classmethod
+    def _values(cls):
+        return [level.value for level in cls]
+
+    @classmethod
+    def LABELS(cls):
+        return {
+            cls.TRACE: "TRACE (最详细)",
+            cls.DEBUG: "DEBUG",
+            cls.INFO: "INFO (常规)",
+            cls.WARNING: "WARNING",
+            cls.ERROR: "ERROR (仅错误)",
+        }
+
+
+@dataclass
+class PluginInfo(Generic[ConfigT]):
+    """插件元信息"""
+
+    name: str  # 插件名称
+    version: str = "1.0.0"  # 版本号
+    author: str = ""  # 作者
+    description: str = ""  # 描述
+    enabled: bool = True  # 是否启用
+    priority: int = 100  # 优先级（数值越小越先执行）
+    show_window: bool = True  # 初始化时是否显示窗口
+    window_mode: WindowMode = WindowMode.TAB  # 窗口加载方式
+    log_level: LogLevel = LogLevel.INFO  # 默认日志级别
+    icon: QIcon | None = None  # 插件图标，None 使用默认蓝色问号
+    log_config: "LogConfig | None" = None  # 日志轮转配置，None 使用全局默认值
+    # 插件自定义配置类（继承自 OtherInfoBase）
+    other_info: Type[ConfigT] = cast(Any, OtherInfoBase)
+    # 声明需要的控制权限（命令类型列表）
+    required_controls: list[type] = field(default_factory=list)
+
+
+class _GuiCallHandler(QObject):
+    """留在主线程的 GUI 调用处理器，确保 run_on_gui 真正在 GUI 线程执行"""
+
+    @pyqtSlot(object, object, object)
+    def execute(self, func, args, kwargs):
+        try:
+            func(*args, **kwargs)
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).error(
+                f"GUI callback error: {e}", exc_info=True)
+
+
+class BasePlugin(QObject, Generic[ConfigT]):
+    """
+    插件基类（QObject + moveToThread，每个插件运行在独立线程中）
+
+    每个插件同时具备后台数据处理和界面交互能力：
+    - 后台部分：订阅事件、处理数据、发送控制指令（在独立线程中执行）
+    - 界面部分：可选的 PyQt 界面组件（需通过 run_on_gui 安全访问）
+
+    所有插件共享同一个 ZMQClient，事件通过 EventDispatcher 投递到各插件。
+    每个插件的 handler 在自己的线程中通过 Qt 事件循环**串行**执行，天然线程安全。
+
+    子类必须实现 ``plugin_info()`` 类方法来声明元信息::
+
+        class MyPlugin(BasePlugin):
+            @classmethod
+            def plugin_info(cls) -> PluginInfo:
+                return PluginInfo(
+                    name="my_plugin",
+                    description="我的插件",
+                    icon=make_plugin_icon("#e65100", "📝"),
+                )
+    """
+
+    # ── GUI 跨线程信号（类级别，所有实例共享连接到各自 slot）──
+    gui_call = pyqtSignal(object, object, object)
+    ready = pyqtSignal(object)  # 插件就绪信号（参数：插件实例）
+    config_changed = pyqtSignal(str, object)  # 配置变化信号（参数：字段名, 新值）
+
+    # ── 事件投递信号（替代 deque 队列，QueuedConnection 天然串行）──
+    _event_dispatch = pyqtSignal(object, object)  # handler, event
+
+    _other_info: ConfigT
+
+    @classmethod
+    @abstractmethod
+    def plugin_info(cls) -> PluginInfo:
+        """返回插件元信息。子类必须重写此方法。"""
+
+    def __init__(self, info: PluginInfo):
+        QObject.__init__(self)
+
+        # 抽象检查：确保子类实现了 plugin_info()
+        if type(self).plugin_info is BasePlugin.plugin_info:
+            raise TypeError(
+                f"Can't instantiate abstract class {type(self).__name__} "
+                f"without implementing 'plugin_info()' classmethod"
+            )
+
+        # 创建专属线程，将自身移入
+        self._thread = QThread()
+        self._thread.setObjectName(f"plugin-{info.name}")
+
+        # 创建 GUI 调度器（留在主线程），确保 run_on_gui 真正在 GUI 线程执行
+        # 注意：必须在 moveToThread 之前创建，否则会跟着移到插件线程
+        self._gui_handler = _GuiCallHandler()
+        self.gui_call.connect(
+            self._gui_handler.execute, Qt.ConnectionType.QueuedConnection)  # type: ignore
+
+        self.moveToThread(self._thread)
+
+        self._info = info
+        self._client: ZMQClient | None = None
+        self._event_dispatcher: EventDispatcher | None = None
+        self._widget: QWidget | None = None
+        self._lifecycle = PluginLifecycle.NEW
+
+        # ── 线程安全基础设施 ──
+        self._resource_lock = threading.RLock()  # 保护内部共享状态
+
+        # 连接事件投递信号（QueuedConnection 保证跨线程安全、串行执行）
+        self._event_dispatch.connect(
+            self._handle_event, Qt.ConnectionType.QueuedConnection)  # type: ignore
+
+        # gui_call 已在上方连接到 _gui_handler（主线程），不再连接到 self
+
+        # 线程启动时执行初始化
+        self._thread.started.connect(self._on_thread_started)
+
+        # 每个插件拥有独立的 loguru logger（日志写入 plugins/<name>.log）
+        from plugin_manager.logging_setup import get_plugin_logger
+        self.logger, self._log_sink_id = get_plugin_logger(
+            info.name,
+            log_config=info.log_config,
+        )
+        self._log_level: LogLevel = info.log_level
+
+        # 记录本插件注册的服务（用于 shutdown 时自动注销）
+        self._registered_protocols: list[type] = []
+
+        # ── 插件自定义配置 ──
+        self._config_manager: PluginConfigManager | None = None
+        if info.other_info is not None:
+            from plugin_manager.config_manager import PluginConfigManager
+            from plugin_manager.app_paths import get_plugin_data_dir
+
+            # 实例化配置对象
+            self._other_info = info.other_info()
+            # 设置配置变化回调
+            self._other_info.set_on_change(
+                self._on_config_changed)
+            # 创建配置管理器
+            data_dir = get_plugin_data_dir(type(self))
+            self._config_manager = PluginConfigManager(data_dir)
+            # 加载配置
+            self._config_manager.load(
+                info.name, self._other_info)
+
+    def _on_config_changed(self, name: str, value: Any) -> None:
+        """配置变化回调（在配置对象中触发，需转发到主线程发射信号）"""
+        # 使用 run_on_gui 确保信号在主线程发射
+        self.run_on_gui(self._emit_config_changed, name, value)
+
+    def _emit_config_changed(self, name: str, value: Any) -> None:
+        """在主线程发射 config_changed 信号"""
+        self.config_changed.emit(name, value)
+
+    # ═══════════════════════════════════════════════════════════════════
+    # 属性
+    # ═══════════════════════════════════════════════════════════════════
+
+    @property
+    def info(self) -> PluginInfo:
+        return self._info
+
+    @property
+    def name(self) -> str:
+        return self._info.name
+
+    @property
+    def plugin_dir(self) -> Path:
+        """插件文件自身的目录（基于子类定义所在的 .py 文件推算）。"""
+        module = inspect.getmodule(type(self))
+        file_path = getattr(module, "__file__", None)
+        if file_path:
+            return Path(file_path).resolve().parent
+        # 极少数情况下无法定位源文件，回退到工作目录
+        return Path.cwd()
+
+    # ═══════════════════════════════════════════════════════════════════
+    # README
+    # ═══════════════════════════════════════════════════════════════════
+    def get_readme_text(self) -> str:
+        """读取插件目录下 README.md 的内容。
+
+        子类可通过重写 :meth:`load_READMD` 自定义 README 的来源与内容。
+        找不到文件时返回空字符串。
+        """
+        return self.load_READMD()
+
+    def load_READMD(self) -> str:
+        """加载 README 内容，子类可重写以自定义来源。
+
+        默认实现在 :attr:`plugin_dir` 中按以下顺序查找并返回第一个存在的文件：
+        ``README.md`` / ``readme.md``（包形式插件），以及
+        ``<插件文件名>_README.md``（用于单文件插件，避免多个单文件插件
+        共用 ``plugins/README.md`` 互相覆盖）。
+
+        Returns:
+            README 文本内容；不存在时返回空字符串。
+        """
+        candidates = ["README.md", "readme.md"]
+        # 单文件插件的专属 README：<模块文件名>_README.md
+        module = inspect.getmodule(type(self))
+        file_path = getattr(module, "__file__", None)
+        if file_path:
+            candidates.append(f"{Path(file_path).stem}_README.md")
+
+        for name in candidates:
+            path = self.plugin_dir / name
+            if path.is_file():
+                try:
+                    return path.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    return ""
+        return ""
+
+    @property
+    def is_enabled(self) -> bool:
+        return self._info.enabled
+
+    @property
+    def is_ready(self) -> bool:
+        """插件是否真正初始化完成（on_initialized 已执行完毕）"""
+        return self._lifecycle == PluginLifecycle.READY
+
+    @property
+    def lifecycle(self) -> PluginLifecycle:
+        """当前生命周期状态"""
+        return self._lifecycle
+
+    @property
+    def widget(self) -> QWidget | None:
+        return self._widget
+
+    @property
+    def client(self) -> ZMQClient | None:
+        return self._client
+
+    @property
+    def data_dir(self) -> "Path":
+        """插件专属数据目录（可写），自动根据插件类名创建"""
+        from pathlib import Path
+        from plugin_manager.app_paths import get_plugin_data_dir
+
+        if not hasattr(self, "_data_dir"):
+            self._data_dir = get_plugin_data_dir(type(self))
+        return self._data_dir
+
+    @property
+    def log_level(self) -> LogLevel:
+        """当前日志级别"""
+        return self._log_level
+
+    @property
+    def other_info(self):
+        """插件自定义配置对象"""
+        return self._other_info
+
+    @property
+    def config_file_path(self) -> "Path | None":
+        """插件 config.json 的完整路径；无自定义配置时为 None。"""
+        if self._config_manager is None:
+            return None
+        return self._config_manager.config_path(self._info.name)
+
+    def save_config(self) -> None:
+        """保存插件配置到文件"""
+        if self._config_manager and self._other_info:
+            self._config_manager.save(
+                self._info.name, self._other_info)  # type: ignore
+            self.logger.debug(
+                f"Config saved: {self._other_info.to_log_dict()}")
+
+    def set_log_level(self, level: LogLevel | str) -> None:
+        """动态设置插件的日志级别"""
+        from plugin_manager.logging_setup import set_plugin_log_level
+        if isinstance(level, str):
+            level = LogLevel(level.upper())
+        self._log_level = level
+        set_plugin_log_level(self._log_sink_id, level.value)
+        self.logger.debug(f"Log level changed to {level}")
+
+    @property
+    def plugin_icon(self) -> QIcon:
+        """返回插件图标（使用 PluginInfo.icon，未设置则生成默认图标）"""
+        if self._info.icon:
+            return self._info.icon
+        return make_plugin_icon()
+
+    # ═══════════════════════════════════════════════════════════════════
+    # 线程安全工具
+    # ═══════════════════════════════════════════════════════════════════
+
+    @contextmanager
+    def locked(self):
+        """
+        保护内部状态的上下文管理器
+
+        用法::
+
+            with self.locked():
+                self._internal_counter += 1
+                self._cache.clear()
+        """
+        with self._resource_lock:
+            yield
+
+    def run_on_gui(self, func: Callable[..., None], *args, **kwargs) -> None:
+        """
+        将函数调用安全地投递到 Qt GUI 主线程执行
+
+        从插件的工作线程（handler）中调用此方法来更新 GUI。
+        通过 QueuedConnection 保证跨线程安全。
+
+        Args:
+            func: 要在主线程执行的函数
+            *args: 位置参数
+            **kwargs: 关键字参数
+
+        用法::
+
+            def _on_video_save(self, event):
+                self._save_to_db(event)           # IO — 直接做
+                self.run_on_gui(self.table.refresh)  # GUI — 投递到主线程
+        """
+        self.gui_call.emit(func, args, kwargs)
+
+    # ═══════════════════════════════════════════════════════════════════
+    # 线程入口（Qt 事件循环驱动，子类不应覆写）
+    # ═══════════════════════════════════════════════════════════════════
+
+    @pyqtSlot()
+    def _on_thread_started(self) -> None:
+        """
+        插件线程启动回调：执行 on_initialized()
+
+        由 QThread.started 信号触发，在插件线程中执行。
+        """
+        # 设置 Python 线程名，使 threading.enumerate() / sys._current_frames() 可识别
+        threading.current_thread().name = f"plugin-{self.name}"
+
+        self.logger.debug(f"Plugin thread started: {self.name}")
+
+        try:
+            self.on_initialized()
+            self._lifecycle = PluginLifecycle.READY
+            self.ready.emit(self)  # 通知 UI 刷新
+        except Exception as e:
+            self.logger.error(
+                f"on_initialized error in '{self.name}': {e}",
+                exc_info=True,
+            )
+
+    @pyqtSlot(object, object)
+    def _handle_event(self, handler: Callable[[Any], None], event: Any) -> None:
+        """
+        在插件线程中串行执行事件处理（Qt 事件循环保证串行）
+
+        由 _event_dispatch 信号触发，QueuedConnection 保证跨线程安全。
+        """
+        try:
+            handler(event)
+        except Exception as e:
+            self.logger.error(
+                f"Handler error in '{self.name}': {e}",
+                exc_info=True,
+            )
+
+    # ═══════════════════════════════════════════════════════════════════
+    # 生命周期
+    # ═══════════════════════════════════════════════════════════════════
+
+    def set_client(self, client: ZMQClient) -> None:
+        self._client = client
+
+    def set_event_dispatcher(self, dispatcher: EventDispatcher) -> None:
+        self._event_dispatcher = dispatcher
+
+    def initialize(self) -> None:
+        """初始化插件并启动事件处理线程（主线程调用，快速返回）"""
+        if self._lifecycle not in (PluginLifecycle.NEW, PluginLifecycle.STOPPED):
+            return
+
+        self._setup_subscriptions()
+        self._widget = self._create_widget()
+        self._lifecycle = PluginLifecycle.INITIALIZING
+
+        # 连接控制授权变更信号
+        self._connect_control_auth_signal()
+
+        # 启动插件的事件处理线程（Qt 事件循环自动运行）
+        self._thread.start()
+        self.logger.debug(f"Plugin thread launched: {self.name}")
+
+    def _connect_control_auth_signal(self) -> None:
+        """连接控制授权变更信号"""
+        from .control_auth import ControlAuthorizationManager
+
+        auth_manager = ControlAuthorizationManager.instance()
+
+        def on_auth_changed(tag: str, plugin_name: str, granted: bool) -> None:
+            # 只处理与当前插件相关的授权变更
+            if plugin_name != self.name:
+                return
+
+            # 查找对应的命令类型
+            for cmd_type in auth_manager.get_all_control_types():
+                try:
+                    cmd_tag = auth_manager._get_tag(cmd_type)
+                    if cmd_tag == tag:
+                        # 在主线程调用回调
+                        self.run_on_gui(
+                            self.on_control_auth_changed, cmd_type, granted
+                        )
+                        break
+                except ValueError:
+                    continue
+
+        auth_manager.authorization_changed.connect(on_auth_changed)
+
+    def shutdown(self) -> None:
+        """关闭插件并停止事件处理线程"""
+        if self._lifecycle == PluginLifecycle.STOPPED:
+            return
+
+        with self._resource_lock:
+            self._lifecycle = PluginLifecycle.SHUTTING_DOWN
+
+        # 在插件线程中执行清理回调
+        # 使用 QMetaObject.invokeMethod 确保在插件线程执行
+        from PyQt5.QtCore import QMetaObject, Qt, Q_ARG
+        try:
+            QMetaObject.invokeMethod(
+                self, "_do_shutdown", Qt.ConnectionType.BlockingQueuedConnection)
+        except Exception as e:
+            # 如果线程已停止，BlockingQueuedConnection 会失败，直接调用
+            self.logger.debug(f"Fallback to direct shutdown: {e}")
+            self._do_shutdown()
+
+        # 退出线程事件循环
+        self._thread.quit()
+
+        # 等待线程结束（最多 2 秒）
+        if not self._thread.wait(2000):
+            self.logger.debug(
+                f"Plugin thread did not stop in time: {self.name}")
+
+        if self._event_dispatcher:
+            self._event_dispatcher.unsubscribe_all(self)
+
+            # 注销本插件注册的所有服务
+            for protocol in self._registered_protocols:
+                try:
+                    self._event_dispatcher.services.unregister(protocol)
+                    self.logger.debug(
+                        f"Unregistered service: {protocol.__name__}")
+                except Exception as e:
+                    self.logger.debug(
+                        f"Failed to unregister service {protocol.__name__}: {e}")
+            self._registered_protocols.clear()
+
+        if self._widget:
+            try:
+                self._widget.deleteLater()
+            except RuntimeError:
+                pass
+            self._widget = None
+
+        if self._gui_handler:
+            try:
+                self._gui_handler.deleteLater()
+            except RuntimeError:
+                pass
+            self._gui_handler = None
+
+        # 保存插件配置
+        self.save_config()
+
+        with self._resource_lock:
+            self._lifecycle = PluginLifecycle.STOPPED
+
+    @pyqtSlot()
+    def _do_shutdown(self) -> None:
+        """在插件线程中执行清理回调"""
+        try:
+            self.on_shutdown()
+        except Exception as e:
+            self.logger.error(
+                f"on_shutdown error in '{self.name}': {e}",
+                exc_info=True,
+            )
+        self.logger.debug(f"Plugin thread stopping: {self.name}")
+
+    # ═══════════════════════════════════════════════════════════════════
+    # 内部事件投递（由 EventDispatcher 调用）
+    # ═══════════════════════════════════════════════════════════════════
+
+    def _enqueue_event(self, handler: Callable[[Any], None], event: Any) -> bool:
+        """
+        将事件投递到插件（由 EventDispatcher 调用）
+
+        通过 _event_dispatch 信号投递，QueuedConnection 保证：
+        - 跨线程安全
+        - 在插件线程中串行执行
+        - 非阻塞，立即返回
+
+        Returns:
+            True（始终成功，Qt 信号无内置背压）
+        """
+        self._event_dispatch.emit(handler, event)
+        return True
+
+    # ═══════════════════════════════════════════════════════════════════
+    # 抽象方法
+    # ═══════════════════════════════════════════════════════════════════
+
+    @abstractmethod
+    def _setup_subscriptions(self) -> None:
+        """
+        设置事件订阅
+
+        子类实现此方法，订阅感兴趣的事件：
+            self.subscribe(GameStartedEvent, self._on_game_started)
+            self.subscribe(BoardUpdateEvent, self._on_board_update)
+        """
+        pass
+
+    # ═══════════════════════════════════════════════════════════════════
+    # 可选重写
+    # ═══════════════════════════════════════════════════════════════════
+
+    def _create_widget(self) -> QWidget | None:
+        """创建界面组件，返回 None 表示无界面"""
+        return None
+
+    def on_initialized(self) -> None:
+        """插件初始化完成回调"""
+        pass
+
+    def validate_config(self, pending: dict[str, Any]) -> dict[str, str]:
+        """
+        设置页在字段 validator 通过后调用，用于跨字段或依赖插件状态的校验。
+
+        Args:
+            pending: 设置页即将写入的字段名到当前控件值的映射
+
+        Returns:
+            {字段名: 错误文案}，空 dict 表示通过
+        """
+        return {}
+
+    def run_validate_config(
+        self,
+        pending: dict[str, Any],
+        timeout: float = 15.0,
+    ) -> dict[str, str]:
+        """在插件线程执行 validate_config，供设置页从 GUI 线程安全调用。"""
+        if QThread.currentThread() == self._thread or not self._thread.isRunning():
+            try:
+                result = self.validate_config(pending)
+                return result if isinstance(result, dict) else {}
+            except Exception as e:
+                return {"_plugin": str(e)}
+
+        future: Future[dict[str, str]] = Future()
+
+        def _run(_: Any) -> None:
+            try:
+                result = self.validate_config(pending)
+                future.set_result(result if isinstance(result, dict) else {})
+            except Exception as e:
+                future.set_exception(e)
+
+        self._enqueue_event(_run, None)
+        try:
+            return future.result(timeout=timeout)
+        except Exception as e:
+            return {"_plugin": str(e)}
+
+    def on_shutdown(self) -> None:
+        """插件关闭前回调"""
+        pass
+
+    def on_control_auth_changed(
+        self,
+        command_type: type,
+        granted: bool,
+    ) -> None:
+        """
+        控制权限变更回调
+
+        当插件获得或失去某个控制命令的权限时调用。
+        子类可以覆写此方法以响应权限变化。
+
+        Args:
+            command_type: 命令类型
+            granted: True 表示获得权限，False 表示失去权限
+        """
+        pass
+
+    # ═══════════════════════════════════════════════════════════════════
+    # 事件订阅（使用事件类）
+    # ═══════════════════════════════════════════════════════════════════
+
+    def subscribe(
+        self,
+        event_class: type[_E],
+        handler: Callable[[_E], None],
+    ) -> None:
+        """订阅事件"""
+        if self._event_dispatcher:
+            tag = get_event_tag(event_class)
+            self._event_dispatcher.subscribe(
+                tag, handler, self._info.priority, self)
+
+    def unsubscribe(self, event_class: type[BaseEvent]) -> None:
+        """取消订阅事件"""
+        if self._event_dispatcher:
+            tag = get_event_tag(event_class)
+            self._event_dispatcher.unsubscribe(tag, self)
+
+    # ═══════════════════════════════════════════════════════════════════
+    # 指令发送
+    # ═══════════════════════════════════════════════════════════════════
+
+    def has_control_auth(self, command_type: type) -> bool:
+        """
+        检查当前插件是否有该控制类型的权限
+
+        Args:
+            command_type: 命令类型
+
+        Returns:
+            True 表示有权限
+        """
+        from .control_auth import ControlAuthorizationManager
+        auth_manager = ControlAuthorizationManager.instance()
+        return auth_manager.is_authorized(command_type, self.name)
+
+    def _check_control_auth(self, command: Any) -> bool:
+        """检查控制权限"""
+        from .control_auth import ControlAuthorizationManager
+
+        # 获取命令的 tag
+        config = getattr(command, '__struct_config__', None)
+        if config is None:
+            self.logger.debug(f"命令无 struct_config，允许发送: {type(command)}")
+            return True  # 非结构化命令，允许发送
+
+        tag = getattr(config, 'tag', None)
+        if tag is None:
+            self.logger.debug(f"命令无 tag，允许发送: {type(command)}")
+            return True
+
+        auth_manager = ControlAuthorizationManager.instance()
+
+        # 检查授权状态
+        authorized_plugin = auth_manager.get_authorized_plugin(type(command))
+        self.logger.debug(
+            f"控制权限检查: tag={tag}, 授权给={authorized_plugin}, 当前插件={self.name}"
+        )
+
+        if not auth_manager.is_authorized(type(command), self.name):
+            self.logger.debug(
+                f"控制权限被拒绝: {tag} 未授权给 {self.name} (当前授权给: {authorized_plugin})"
+            )
+            return False
+        return True
+
+    def send_command(self, command: Any) -> None:
+        """发送控制指令到主进程（异步，带权限检查）"""
+        if not self._check_control_auth(command):
+            return
+        if self._client:
+            try:
+                self.logger.debug(f"发送命令到 ZMQ: {type(command).__name__}")
+                self._client.send_command(command)
+                self.logger.debug(f"命令已发送: {type(command).__name__}")
+            except Exception as e:
+                self.logger.error(f"发送命令失败: {e}", exc_info=True)
+        else:
+            self.logger.debug(f"无法发送命令: client 未初始化")
+
+    def request(self, command: Any, timeout: float = 5.0) -> CommandResponse | None:
+        """发送请求并等待响应（同步，带权限检查）"""
+        if not self._check_control_auth(command):
+            return None
+        if self._client:
+            return self._client.request(command, timeout)
+        return None
+
+    # ═══════════════════════════════════════════════════════════════════
+    # 服务注册（插件间通讯）
+    # ═══════════════════════════════════════════════════════════════════
+
+    def register_service(
+        self,
+        provider: object,
+        *,
+        protocol: type | None = None,
+    ) -> None:
+        """
+        注册服务（供其他插件调用）
+
+        Args:
+            provider: 服务提供者实例（通常是 self）
+            protocol: 服务接口类型（可选，自动推断）
+
+        Raises:
+            TypeError: 未实现 Protocol 的所有方法
+
+        用法::
+
+            class MyPlugin(BasePlugin):
+                def on_initialized(self):
+                    # 显式指定 protocol
+                    self.register_service(self, protocol=MyService)
+        """
+        if self._event_dispatcher is None:
+            self.logger.debug("Cannot register service: no dispatcher")
+            return
+
+        # 自动推断 protocol
+        if protocol is None:
+            # 从 provider 的基类中找到 Protocol 子类
+            for base in type(provider).__mro__:
+                if (
+                    base is not object
+                    and hasattr(base, "_is_protocol")
+                    and base._is_protocol
+                ):
+                    protocol = base
+                    break
+
+        if protocol is None:
+            self.logger.debug(
+                "Cannot register service: no protocol found. "
+                "Specify protocol= explicitly or inherit from a Protocol."
+            )
+            return
+
+        # 验证 provider 实现了 Protocol 的所有方法
+        missing_methods = self._check_protocol_implementation(
+            provider, protocol)
+        if missing_methods:
+            raise TypeError(
+                f"Cannot register service: {type(provider).__name__} does not implement "
+                f"{protocol.__name__}. Missing methods: {', '.join(missing_methods)}"
+            )
+
+        # 注册服务
+        self._event_dispatcher.services.register(protocol, provider, self.name)
+
+        # 记录已注册的 protocol（用于 shutdown 时自动注销）
+        if protocol not in self._registered_protocols:
+            self._registered_protocols.append(protocol)
+
+    def _check_protocol_implementation(
+        self,
+        provider: object,
+        protocol: type,
+    ) -> list[str]:
+        """
+        检查 provider 是否实现了 Protocol 的所有方法
+
+        Returns:
+            缺失的方法名列表（空列表表示全部实现）
+        """
+        missing = []
+
+        # 获取 Protocol 中定义的所有方法（不包括继承自 object 的）
+        for name in dir(protocol):
+            if name.startswith('_'):
+                continue
+
+            attr = getattr(protocol, name, None)
+            if attr is None:
+                continue
+
+            # 检查是否是方法（Callable）
+            if callable(attr) or isinstance(attr, property):
+                # 检查 provider 是否有该方法
+                provider_attr = getattr(type(provider), name, None)
+                if provider_attr is None:
+                    missing.append(name)
+
+        return missing
+
+    def _get_service(self, protocol: type[_T]) -> _T:
+        """
+        获取服务实例（内部使用）
+
+        注意：直接调用服务方法会在调用方线程执行，可能有线程安全问题。
+        推荐使用 get_service_proxy() 获取代理对象。
+        """
+        if self._event_dispatcher is None:
+            raise ServiceNotFoundError(protocol)
+
+        return self._event_dispatcher.services.get(protocol)
+
+    def _try_get_service(self, protocol: type[_T]) -> _T | None:
+        """
+        尝试获取服务实例（内部使用）
+
+        注意：直接调用服务方法会在调用方线程执行，可能有线程安全问题。
+        推荐使用 get_service_proxy() 获取代理对象。
+        """
+        if self._event_dispatcher is None:
+            return None
+
+        return self._event_dispatcher.services.try_get(protocol)
+
+    def has_service(self, protocol: type) -> bool:
+        """
+        检查服务是否可用
+
+        Args:
+            protocol: 服务接口类型
+
+        Returns:
+            True 表示服务已注册
+        """
+        if self._event_dispatcher is None:
+            return False
+
+        return self._event_dispatcher.services.has(protocol)
+
+    def wait_for_service(
+        self,
+        protocol: type[_T],
+        timeout: float = 10.0,
+    ) -> _T | None:
+        """
+        等待服务注册完成并获取实例
+
+        Args:
+            protocol: 服务接口类型
+            timeout: 最大等待时间（秒），默认 10 秒
+
+        Returns:
+            服务实例或 None（超时未注册）
+
+        用法::
+
+            def on_initialized(self):
+                # 等待 HistoryService 就绪
+                history = self.wait_for_service(HistoryService, timeout=10.0)
+                if history is None:
+                    self.logger.debug("HistoryService 未就绪")
+                else:
+                    records = history.query_records(100)
+        """
+        if self._event_dispatcher is None:
+            return None
+
+        return self._event_dispatcher.services.wait_for(protocol, timeout)
+
+    def _call_service(
+        self,
+        protocol: type,
+        method: str,
+        *args,
+        timeout: float = 10.0,
+    ) -> Any:
+        """
+        调用服务方法（内部实现）
+
+        由 _ServiceProxy 调用，插件开发者应使用 get_service_proxy()。
+
+        WARNING - 死锁风险:
+            如果两个插件互相调用对方的服务（A 调 B 的同时 B 调 A），
+            会产生死锁，因为双方队列都在等待对方响应。
+
+            避免方法：
+            - 使用 call_service_async() 异步调用
+            - 设计单向依赖关系，避免循环调用
+            - 不要在服务方法实现中调用其他插件的服务
+        """
+        if self._event_dispatcher is None:
+            raise ServiceNotFoundError(protocol)
+
+        provider = self._event_dispatcher.services.get(protocol)
+
+        # 创建 Future 用于接收结果
+        future: Future[Any] = Future()
+
+        # 定义在服务提供者线程执行的函数
+        def _execute_in_provider_thread(_: Any) -> None:
+            try:
+                result = getattr(provider, method)(*args)
+                future.set_result(result)
+            except Exception as e:
+                future.set_exception(e)
+
+        # 投递到服务提供者的线程
+        provider._enqueue_event(_execute_in_provider_thread, None)
+
+        # 等待结果
+        return future.result(timeout=timeout)
+
+    def call_service_async(
+        self,
+        protocol: type,
+        method: str,
+        *args,
+    ) -> Future[Any]:
+        """
+        异步调用服务方法（非阻塞，返回 Future）
+
+        Args:
+            protocol: 服务接口类型
+            method: 方法名
+            *args: 方法参数
+
+        Returns:
+            Future 对象，可调用 result() 获取结果
+
+        用法::
+
+            future = self.call_service_async(MyService, "some_method", arg1)
+            # 做其他事情...
+            result = future.result(timeout=5.0)  # 阻塞等待结果
+        """
+        if self._event_dispatcher is None:
+            future: Future[Any] = Future()
+            future.set_exception(ServiceNotFoundError(protocol))
+            return future
+
+        try:
+            provider = self._event_dispatcher.services.get(protocol)
+        except ServiceNotFoundError as e:
+            future = Future()
+            future.set_exception(e)
+            return future
+
+        future: Future[Any] = Future()
+
+        def _execute_in_provider_thread(_: Any) -> None:
+            try:
+                result = getattr(provider, method)(*args)
+                future.set_result(result)
+            except Exception as e:
+                future.set_exception(e)
+
+        provider._enqueue_event(_execute_in_provider_thread, None)
+
+        return future
+
+    def get_service_proxy(self, protocol: type[_T]) -> _T:
+        """
+        获取服务代理对象（类型安全，IDE 友好）
+
+        返回一个代理对象，通过属性访问方式调用服务方法。
+        所有方法调用都会在服务提供者线程执行，线程安全。
+
+        Args:
+            protocol: 服务接口类型
+
+        Returns:
+            服务代理对象（IDE 可推断类型，支持方法补全）
+
+        用法::
+
+            # 获取代理对象
+            service = self.get_service_proxy(MyService)
+
+            # 直接调用方法（IDE 完整补全）
+            result = service.some_method(arg1, arg2)
+            count = service.get_count()
+
+            # 以上调用等同于：
+            # result = self.call_service(MyService, "some_method", arg1, arg2)
+            # count = self.call_service(MyService, "get_count")
+        """
+        return _ServiceProxy(self, protocol)  # type: ignore[return-value]
+
+    # ═══════════════════════════════════════════════════════════════════
+    # 辅助
+    # ═══════════════════════════════════════════════════════════════════
+
+    def enable(self) -> None:
+        """启用插件"""
+        self._info.enabled = True
+        if self._lifecycle == PluginLifecycle.STOPPED or not self._thread.isRunning():
+            self.initialize()
+
+    def disable(self) -> None:
+        """禁用插件"""
+        self._info.enabled = False
+        if self._lifecycle != PluginLifecycle.STOPPED:
+            self.shutdown()
+
+    def __repr__(self) -> str:
+        return f"<Plugin {self._info.name} v{self._info.version} [{self._lifecycle.value}]>"

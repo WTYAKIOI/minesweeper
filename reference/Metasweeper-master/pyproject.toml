@@ -1,0 +1,15 @@
+[project]
+name = "Metasweeper"
+version = "3.3.2"
+description = "Metasweeper - 元扫雷"
+requires-python = ">=3.10"
+
+[tool.mypy]
+python_version = "3.12"
+strict = false
+ignore_missing_imports = true
+disallow_untyped_defs = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
