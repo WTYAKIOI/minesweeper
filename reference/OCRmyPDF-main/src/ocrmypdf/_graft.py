@@ -1,0 +1,851 @@
+# SPDX-FileCopyrightText: 2022 James R. Barlow
+# SPDX-License-Identifier: MPL-2.0
+
+"""For grafting text-only PDF pages onto freeform PDF pages."""
+
+from __future__ import annotations
+
+import logging
+from collections.abc import Collection
+from contextlib import suppress
+from dataclasses import dataclass
+from enum import Enum
+from pathlib import Path
+from typing import TYPE_CHECKING, cast
+
+if TYPE_CHECKING:
+    from ocrmypdf.hocrtransform import OcrElement
+
+from pikepdf import (
+    Dictionary,
+    Name,
+    Object,
+    Operator,
+    Page,
+    Pdf,
+    Stream,
+    parse_content_stream,
+    unparse_content_stream,
+)
+
+from ocrmypdf._jobcontext import PdfContext
+from ocrmypdf._options import ProcessingMode
+from ocrmypdf._pipeline import VECTOR_PAGE_DPI
+
+
+class RenderMode(Enum):
+    """Controls where the OCR text layer is placed relative to page content.
+
+    ON_TOP: Text layer renders above page content (reserved for future use).
+    UNDERNEATH: Text layer renders below page content (current default behavior).
+    """
+
+    ON_TOP = 0
+    UNDERNEATH = 1
+
+
+@dataclass
+class Fpdf2PageInfo:
+    """Information needed to render and graft an fpdf2 page."""
+
+    pageno: int
+    hocr_path: Path
+    dpi: float
+    autorotate_correction: int
+    emplaced_page: bool
+
+
+@dataclass
+class Fpdf2ParsedPage:
+    """Parsed page data ready for fpdf2 rendering."""
+
+    pageno: int
+    ocr_tree: OcrElement
+    dpi: float
+    autorotate_correction: int
+    emplaced_page: bool
+
+
+# Alias for backward compatibility with plan documentation
+Fpdf2DirectPage = Fpdf2ParsedPage
+
+
+def _compute_text_misalignment(
+    content_rotation: int, autorotate_correction: int, emplaced_page: bool
+) -> int:
+    """Compute rotation needed to align text layer with page content.
+
+    Args:
+        content_rotation: Original page /Rotate value (degrees).
+        autorotate_correction: Rotation applied during rasterization (degrees).
+        emplaced_page: Whether the page content was replaced with rasterized image.
+
+    Returns:
+        Rotation in degrees to apply to text layer to align with content.
+    """
+    if emplaced_page:
+        # New image is upright after autorotation was applied
+        content_rotation = autorotate_correction
+    text_rotation = autorotate_correction
+    return (text_rotation - content_rotation) % 360
+
+
+def _compute_page_rotation(
+    content_rotation: int, autorotate_correction: int, emplaced_page: bool
+) -> int:
+    """Compute final page /Rotate value after grafting.
+
+    Args:
+        content_rotation: Original page /Rotate value (degrees).
+        autorotate_correction: Rotation applied during rasterization (degrees).
+        emplaced_page: Whether the page content was replaced with rasterized image.
+
+    Returns:
+        Final /Rotate value for the page.
+    """
+    if emplaced_page:
+        content_rotation = autorotate_correction
+    return (content_rotation - autorotate_correction) % 360
+
+
+def _build_text_layer_ctm(
+    text_width: float,
+    text_height: float,
+    page_width: float,
+    page_height: float,
+    page_origin_x: float,
+    page_origin_y: float,
+    text_rotation: int,
+):
+    """Build transformation matrix to align text layer with page content.
+
+    Always computes the full CTM to handle non-zero page origins (e.g.,
+    JSTOR PDFs with MediaBox like [0, 100, 595, 982]) and minor scale
+    differences due to DPI rounding.
+
+    Args:
+        text_width: Width of text layer mediabox.
+        text_height: Height of text layer mediabox.
+        page_width: Width of target page mediabox.
+        page_height: Height of target page mediabox.
+        page_origin_x: X origin of target page mediabox.
+        page_origin_y: Y origin of target page mediabox.
+        text_rotation: Rotation in degrees (clockwise) to apply to text layer.
+
+    Returns:
+        pikepdf.Matrix transformation matrix, or None if identity.
+    """
+    from pikepdf import Matrix
+
+    wt, ht = text_width, text_height
+
+    # Center text, rotate, scale to fit page, then position at page origin
+    translate = Matrix().translated(-wt / 2, -ht / 2)
+    untranslate = Matrix().translated(page_width / 2, page_height / 2)
+    corner = Matrix().translated(page_origin_x, page_origin_y)
+
+    # Negate rotation because input is clockwise angle
+    rotate = Matrix().rotated(-text_rotation % 360)
+
+    # Swap dimensions if 90 or 270 degree rotation
+    if text_rotation in (90, 270):
+        wt, ht = ht, wt
+
+    # Scale to fit page dimensions
+    scale_x = page_width / wt if wt else 1.0
+    scale_y = page_height / ht if ht else 1.0
+    scale = Matrix().scaled(scale_x, scale_y)
+
+    ctm = translate @ rotate @ scale @ untranslate @ corner
+
+    # Return None if the result is effectively identity
+    identity = Matrix()
+    if ctm == identity:
+        return None
+
+    return ctm
+
+
+log = logging.getLogger(__name__)
+MAX_REPLACE_PAGES = 100
+
+
+def _ensure_dictionary(obj: Dictionary | Stream, name: Name):
+    if name not in obj:
+        obj[name] = Dictionary({})
+    return obj[name]
+
+
+# Operators that actually mark the page. Everything else only manipulates the
+# graphics or text state, so a content stream containing none of these draws
+# nothing. 'INLINE IMAGE' is pikepdf's pseudo-operator for a BI...ID...EI block.
+_PAINTING_OPERATORS = frozenset(
+    Operator(op)
+    for op in (
+        'Tj',
+        'TJ',
+        "'",
+        '"',
+        'S',
+        's',
+        'f',
+        'F',
+        'f*',
+        'B',
+        'B*',
+        'b',
+        'b*',
+        'sh',
+        'Do',
+        'EI',
+        'INLINE IMAGE',
+    )
+)
+
+
+def _page_resources(page: Page) -> Object:
+    """Return the page's /Resources, resolving inheritance from /Pages nodes."""
+    node = page.obj
+    seen: set[tuple[int, int]] = set()
+    while isinstance(node, Dictionary):
+        resources = node.get(Name.Resources)
+        if isinstance(resources, Dictionary):
+            return resources
+        parent = node.get(Name.Parent)
+        if not isinstance(parent, Dictionary):
+            break
+        key = (parent.objgen[0], parent.objgen[1])
+        if key in seen:
+            break  # cycle, or a chain of direct objects we cannot tell apart
+        seen.add(key)
+        node = parent
+    return Dictionary()
+
+
+def _strip_invisible_text_from_form_xobjects(
+    pdf: Pdf,
+    resources: Object,
+    name: Object,
+    inherited_render_mode: int,
+    visited: dict[tuple[int, int], bool],
+) -> bool:
+    """Recurse into the Form XObject drawn by ``name Do`` and strip it too.
+
+    Returns True if the form paints nothing once stripped, meaning the caller
+    should stop drawing it.
+    """
+    try:
+        xobj = resources[Name.XObject][cast('Name', name)]
+    except (KeyError, TypeError):
+        return False  # dangling or non-dictionary resource; nothing we can strip
+    if xobj.get(Name.Subtype) != Name.Form:
+        return False  # image XObjects carry no text operators
+    key = (xobj.objgen[0], xobj.objgen[1])
+    if key == (0, 0):
+        return False  # a direct object we cannot identify
+    if key in visited:
+        return visited[key]
+    # A Form XObject may reference itself transitively, so never revisit one.
+    # Mark it as painting while in progress, so a recursive Do is kept.
+    visited[key] = False
+    content, vestigial = _strip_invisible_text_from_content(
+        pdf,
+        cast('Stream', xobj),
+        xobj.get(Name.Resources, Dictionary()),
+        visited,
+        inherited_render_mode,
+    )
+    xobj.write(content)
+    visited[key] = vestigial
+    return vestigial
+
+
+def _strip_invisible_text_from_content(
+    pdf: Pdf,
+    obj: Page | Stream,
+    resources: Object,
+    visited: dict[tuple[int, int], bool],
+    initial_render_mode: int = 0,
+) -> tuple[bytes, bool]:
+    """Strip render-mode-3 text objects from ``obj``'s content stream.
+
+    Returns the rebuilt content stream and whether it paints nothing at all.
+    """
+    stream = []
+    in_text_obj = False
+    render_mode = initial_render_mode
+    render_mode_stack = []
+    text_objects = []
+    vestigial_names: list[Object] = []
+
+    for instruction in parse_content_stream(obj, ''):
+        operands, operator = instruction.operands, instruction.operator
+        if operator == Operator('Tr'):
+            # operands[0] is already a plain int under pikepdf's default
+            # (implicit) conversion mode, or a pikepdf.Object under explicit
+            # conversion mode; int() handles both.
+            render_mode = int(operands[0])
+
+        if operator == Operator('q'):
+            render_mode_stack.append(render_mode)
+
+        if operator == Operator('Q'):
+            # IndexError is raised if stack is empty; try to carry on
+            with suppress(IndexError):
+                render_mode = render_mode_stack.pop()
+
+        # OCRmyPDF grafts its own text layer as a Form XObject, so the invisible
+        # text is not in the page content stream at all. The current render mode
+        # is inherited across the Do, and a form that paints nothing once
+        # stripped is no longer drawn.
+        if (
+            operator == Operator('Do')
+            and not in_text_obj
+            and operands
+            and _strip_invisible_text_from_form_xobjects(
+                pdf, resources, operands[0], render_mode, visited
+            )
+        ):
+            vestigial_names.append(operands[0])
+            continue
+
+        if not in_text_obj:
+            if operator == Operator('BT'):
+                in_text_obj = True
+                text_objects.append((operands, operator))
+            else:
+                stream.append((operands, operator))
+        else:
+            text_objects.append((operands, operator))
+            if operator == Operator('ET'):
+                in_text_obj = False
+                if render_mode != 3:
+                    stream.extend(text_objects)
+                text_objects.clear()
+
+    for name in vestigial_names:
+        # The form is no longer drawn, so unlink it; it drops out at save time.
+        with suppress(KeyError, TypeError):
+            del resources[Name.XObject][cast('Name', name)]
+
+    vestigial = not any(operator in _PAINTING_OPERATORS for _, operator in stream)
+
+    # pikepdf's Collection[...] parameter doesn't structurally match our
+    # _ObjectList-based tuples even though it works fine at runtime.
+    return (
+        unparse_content_stream(
+            cast('list[tuple[Collection[Object], Operator]]', stream)
+        ),
+        vestigial,
+    )
+
+
+def strip_invisible_text(pdf: Pdf, page: Page):
+    content_stream, _vestigial = _strip_invisible_text_from_content(
+        pdf, page, _page_resources(page), {}
+    )
+    page.Contents = Stream(pdf, content_stream)
+
+
+def discard_text_search_index(pdf: Pdf) -> bool:
+    """Discard an embedded Adobe full-text search index from the catalog.
+
+    Adobe Acrobat can embed a full-text search index in the document catalog at
+    ``/Root/PieceInfo/SearchIndex``. It is built from the page text, and only
+    Acrobat reads it; other viewers ignore it and search the text on the fly.
+    Any change to the PDF invalidates the index, so once OCRmyPDF rewrites the
+    document (editing the text layer, rasterizing, optimizing) a retained index
+    would be stale and return incorrect search results in Acrobat. We cannot
+    update this vendor-private data, so we discard it; modern viewers rebuild a
+    search index on demand. Returns True if the catalog was modified.
+    """
+    try:
+        pieceinfo = pdf.Root.get(Name.PieceInfo)
+        if not isinstance(pieceinfo, Dictionary) or Name.SearchIndex not in pieceinfo:
+            return False
+        del pieceinfo[Name.SearchIndex]
+        log.debug(
+            "Discarded embedded text search index "
+            "(/Root/PieceInfo/SearchIndex) because the PDF was rewritten; "
+            "it would otherwise be stale."
+        )
+        # Drop an empty PieceInfo rather than leave a husk behind.
+        if len(pieceinfo) == 0:
+            del pdf.Root.PieceInfo
+        return True
+    except (KeyError, TypeError, AttributeError):
+        return False
+
+
+def discard_page_thumbnails(pdf: Pdf) -> int:
+    """Discard embedded per-page thumbnail images.
+
+    A page object may carry an optional ``/Thumb`` image XObject — a miniature
+    rendering of the page (ISO 32000-2, 12.3.4). It is only a navigation aid and
+    modern viewers generate page thumbnails on demand. OCRmyPDF alters page
+    appearance (deskew, clean, rasterize, re-render) and plugins may edit pages
+    arbitrarily, so any retained thumbnail would be stale and misrepresent its
+    page. We discard them; viewers rebuild thumbnails as needed. Returns the
+    number of thumbnails removed.
+    """
+    removed = 0
+    for page in pdf.pages:
+        pageobj = page.obj
+        if Name.Thumb in pageobj:
+            del pageobj[Name.Thumb]
+            removed += 1
+    if removed:
+        log.debug(
+            "Discarded %d embedded page thumbnail(s) (/Thumb) because the PDF "
+            "was rewritten; they would otherwise be stale.",
+            removed,
+        )
+    return removed
+
+
+def discard_structure_tree(pdf: Pdf) -> bool:
+    """Discard the logical structure (tagged-PDF) tree from the document.
+
+    The structure tree (``/Root/StructTreeRoot``, ``/Root/MarkInfo``) maps
+    marked content in the page content streams to semantic elements via MCIDs.
+    When OCRmyPDF rasterizes pages (force) or strips and rewrites the text layer
+    (redo), those MCIDs are destroyed or renumbered, leaving the tree dangling
+    and inconsistent with the new content. We cannot rebuild it to match, so we
+    discard it; the page-level ``/StructParents`` keys go too. Returns True if
+    the catalog was modified.
+    """
+    modified = False
+    try:
+        if Name.StructTreeRoot in pdf.Root:
+            del pdf.Root.StructTreeRoot
+            modified = True
+        if Name.MarkInfo in pdf.Root:
+            del pdf.Root.MarkInfo
+            modified = True
+        for page in pdf.pages:
+            if Name.StructParents in page.obj:
+                del page.obj[Name.StructParents]
+                modified = True
+    except (KeyError, TypeError, AttributeError):
+        return modified
+    if modified:
+        log.debug(
+            "Discarded the logical structure tree (/Root/StructTreeRoot) "
+            "because the PDF was re-OCR'd; it would otherwise be stale."
+        )
+    return modified
+
+
+class OcrGrafter:
+    """Manages grafting text-only PDFs onto regular PDFs."""
+
+    def __init__(self, context: PdfContext):
+        self.context = context
+        self.path_base = context.origin
+
+        self.pdf_base = Pdf.open(self.path_base)
+
+        self.pdfinfo = context.pdfinfo
+        self.output_file = context.get_path('graft_layers.pdf')
+
+        self.emplacements = 1
+        self.render_mode = RenderMode.UNDERNEATH
+
+        # Check renderer type
+        pdf_renderer = context.options.pdf_renderer
+        self.use_sandwich_renderer = pdf_renderer == 'sandwich'
+
+        # For fpdf2: accumulate pages before rendering
+        self.fpdf2_hocr_pages: list[Fpdf2PageInfo] = []
+        self.fpdf2_parsed_pages: list[Fpdf2ParsedPage] = []
+
+    def graft_page(
+        self,
+        *,
+        pageno: int,
+        image: Path | None,
+        ocr_output: Path | None,
+        ocr_tree: OcrElement | None,
+        autorotate_correction: int,
+    ):
+        """Graft OCR output onto a page of the base PDF.
+
+        Args:
+            pageno: Zero-based page number.
+            image: Path to the visible page image PDF, or None if not replacing.
+            ocr_output: Path to OCR output file. For fpdf2 renderer this is an
+                hOCR file; for sandwich renderer this is a text-only PDF.
+            ocr_tree: OCR tree for fpdf2 renderer.
+            autorotate_correction: Orientation correction in degrees (0, 90, 180, 270).
+        """
+        if self.context.options.mode == ProcessingMode.strip_text:
+            # Strip mode: remove the invisible OCR text layer in place without
+            # rasterizing or grafting anything. Honor --pages if specified.
+            options = self.context.options
+            if not options.pages or pageno in options.pages:
+                strip_invisible_text(self.pdf_base, self.pdf_base.pages[pageno])
+            return
+
+        if ocr_output and ocr_tree:
+            raise ValueError(
+                'Cannot specify both ocr_output and ocr_tree for fpdf2 renderer'
+            )
+        # Handle image emplacement first
+        emplaced_page = False
+        content_rotation = self.pdfinfo[pageno].rotation
+        path_image = Path(image).resolve() if image else None
+        if path_image is not None and path_image != self.path_base:
+            # We are updating the old page with a rasterized PDF of the new
+            # page (without changing objgen, to preserve references)
+            log.debug("Emplacement update")
+            with Pdf.open(path_image) as pdf_image:
+                self.emplacements += 1
+                foreign_image_page = pdf_image.pages[0]
+                self.pdf_base.pages.append(foreign_image_page)
+                local_image_page = self.pdf_base.pages[-1]
+                self.pdf_base.pages[pageno].emplace(
+                    local_image_page, retain=(Name.Parent,)
+                )
+                del self.pdf_base.pages[-1]
+            emplaced_page = True
+
+        if self.use_sandwich_renderer:
+            # Sandwich renderer: graft pre-rendered PDF immediately
+            if ocr_output:
+                text_misaligned = _compute_text_misalignment(
+                    content_rotation, autorotate_correction, emplaced_page
+                )
+                self._graft_sandwich_text_layer(
+                    pageno=pageno,
+                    textpdf=ocr_output,
+                    text_rotation=text_misaligned,
+                )
+                page_rotation = _compute_page_rotation(
+                    content_rotation, autorotate_correction, emplaced_page
+                )
+                self.pdf_base.pages[pageno].Rotate = page_rotation
+        else:
+            # fpdf2 renderer: accumulate page info for batch rendering.
+            # The hOCR coordinates are in the corrected (upright) coordinate system.
+            # We store autorotate_correction and emplaced_page to set the final
+            # page /Rotate tag after grafting.
+            if ocr_tree:
+                self.fpdf2_parsed_pages.append(
+                    Fpdf2ParsedPage(
+                        ocr_tree=ocr_tree,
+                        pageno=pageno,
+                        autorotate_correction=autorotate_correction,
+                        emplaced_page=emplaced_page,
+                        dpi=self.pdfinfo[pageno].dpi.to_scalar(),
+                    )
+                )
+            if ocr_output:
+                self.fpdf2_hocr_pages.append(
+                    Fpdf2PageInfo(
+                        hocr_path=ocr_output,
+                        pageno=pageno,
+                        autorotate_correction=autorotate_correction,
+                        emplaced_page=emplaced_page,
+                        dpi=self.pdfinfo[pageno].dpi.to_scalar(),
+                    )
+                )
+
+    def finalize(self):
+        # Can have hocr OR parsed pages OR neither (no OCR), but not both
+        assert not (self.fpdf2_hocr_pages and self.fpdf2_parsed_pages), (
+            "Can't have both hocr and ocrtree pages"
+        )
+
+        if self.fpdf2_hocr_pages:
+            # Render all pages with fpdf2, then graft
+            parsed_pages = self._parse_hocr_pages()
+            self.fpdf2_parsed_pages = parsed_pages
+
+        if self.fpdf2_parsed_pages:
+            self._render_and_graft_fpdf2_pages()
+
+        discard_text_search_index(self.pdf_base)
+        discard_page_thumbnails(self.pdf_base)
+        if self.context.options.mode in (ProcessingMode.force, ProcessingMode.redo):
+            discard_structure_tree(self.pdf_base)
+        self.pdf_base.save(self.output_file)
+        self.pdf_base.close()
+        return self.output_file
+
+    def _parse_hocr_pages(self) -> list[Fpdf2ParsedPage]:
+        """Render all pages to multi-page PDF with shared fonts, then graft."""
+        from ocrmypdf.hocrtransform.hocr_parser import HocrParser
+
+        log.info(
+            "Parsing %d pages with HocrParser",
+            len(self.fpdf2_hocr_pages),
+        )
+
+        # Parse all hOCR files and collect OcrElements
+        pages_data: list[Fpdf2ParsedPage] = []
+        for page_info in self.fpdf2_hocr_pages:
+            if page_info.hocr_path.stat().st_size == 0:
+                continue  # Skip empty pages
+
+            # Parse hOCR to OcrElement
+            parser = HocrParser(page_info.hocr_path)
+            ocr_tree = parser.parse()
+
+            # Use DPI from hOCR (scan_res) which reflects actual rasterization DPI.
+            # Fall back to pdfinfo DPI or VECTOR_PAGE_DPI for vector-only pages.
+            effective_dpi = ocr_tree.dpi or page_info.dpi or float(VECTOR_PAGE_DPI)
+            pages_data.append(
+                Fpdf2ParsedPage(
+                    pageno=page_info.pageno,
+                    ocr_tree=ocr_tree,
+                    dpi=effective_dpi,
+                    autorotate_correction=page_info.autorotate_correction,
+                    emplaced_page=page_info.emplaced_page,
+                )
+            )
+
+        return pages_data
+
+    def _render_and_graft_fpdf2_pages(self):
+        font_dir = Path(__file__).parent / "data"
+
+        # Render all pages to single PDF
+        multi_page_pdf_path = self.context.get_path('fpdf2_multipage.pdf')
+
+        from ocrmypdf.font import MultiFontManager
+        from ocrmypdf.fpdf_renderer import Fpdf2MultiPageRenderer
+
+        multi_font_manager = MultiFontManager(font_dir)
+        # Build renderer input as (pageno, ocr_tree, dpi) tuples
+        renderer_pages_data = [
+            (parsed.pageno, parsed.ocr_tree, parsed.dpi)
+            for parsed in self.fpdf2_parsed_pages
+        ]
+        renderer = Fpdf2MultiPageRenderer(
+            pages_data=renderer_pages_data,
+            multi_font_manager=multi_font_manager,
+            invisible_text=True,
+        )
+
+        renderer.render(multi_page_pdf_path)
+
+        # Now graft each page from the multi-page PDF
+        with Pdf.open(multi_page_pdf_path) as pdf_text:
+            for idx, parsed in enumerate(self.fpdf2_parsed_pages):
+                # Copy page from multi-page PDF
+                text_page = pdf_text.pages[idx]
+
+                content_rotation = self.pdfinfo[parsed.pageno].rotation
+                text_misaligned = _compute_text_misalignment(
+                    content_rotation,
+                    parsed.autorotate_correction,
+                    parsed.emplaced_page,
+                )
+                self._graft_fpdf2_text_layer(parsed.pageno, text_page, text_misaligned)
+
+                page_rotation = _compute_page_rotation(
+                    content_rotation,
+                    parsed.autorotate_correction,
+                    parsed.emplaced_page,
+                )
+                self.pdf_base.pages[parsed.pageno].Rotate = page_rotation
+
+        # Clean up multi-page PDF if not keeping temp files
+        if not self.context.options.keep_temporary_files:
+            with suppress(FileNotFoundError):
+                multi_page_pdf_path.unlink()
+
+    def _graft_fpdf2_text_layer(self, pageno: int, text_page: Page, text_rotation: int):
+        """Graft a single text page onto the base PDF.
+
+        Similar to existing _graft_text_layer but works with
+        already-rendered pikepdf Page instead of file path.
+
+        Args:
+            pageno: Zero-based page number.
+            text_page: The text-only PDF page to graft.
+            text_rotation: Rotation to apply to align text with content (degrees).
+        """
+        from pikepdf import Array
+
+        base_page = self.pdf_base.pages[pageno]
+
+        # Extract content stream from text_page
+        text_contents = text_page.Contents.read_bytes()
+
+        # Get the mediabox from the text page
+        mediabox = Array([float(x) for x in text_page.mediabox])  # type: ignore[misc]
+        wt = float(mediabox[2]) - float(mediabox[0])
+        ht = float(mediabox[3]) - float(mediabox[1])
+
+        # Get base page mediabox
+        base_mediabox = base_page.mediabox
+        wp = float(base_mediabox[2]) - float(base_mediabox[0])
+        hp = float(base_mediabox[3]) - float(base_mediabox[1])
+
+        # Create Form XObject from text page content
+        base_resources = _ensure_dictionary(base_page.obj, Name.Resources)
+        base_xobjs = _ensure_dictionary(base_resources, Name.XObject)
+        text_xobj_name = Name.random(prefix="OCR-")
+        xobj = self.pdf_base.make_stream(text_contents)
+        base_xobjs[text_xobj_name] = xobj
+        xobj.Type = Name.XObject
+        xobj.Subtype = Name.Form
+        xobj.FormType = 1
+        xobj.BBox = base_mediabox
+
+        # Copy resources from text page's Resources to xobj
+        # We need to handle this carefully since text_page is from a foreign PDF
+        if hasattr(text_page, 'Resources') and text_page.Resources:
+            # Create empty Resources dictionary for xobj
+            xobj_resources = _ensure_dictionary(xobj, Name.Resources)
+
+            # Copy fonts if they exist
+            if Name.Font in text_page.Resources:
+                xobj_fonts = _ensure_dictionary(xobj_resources, Name.Font)
+                text_fonts = text_page.Resources[Name.Font]
+                # Copy each font from the foreign PDF
+                for font_name, font_obj in text_fonts.items():
+                    xobj_fonts[font_name] = self.pdf_base.copy_foreign(font_obj)
+
+            # Copy ExtGState (graphics state) if it exists - needed for transparency
+            if Name.ExtGState in text_page.Resources:
+                xobj_extstates = _ensure_dictionary(xobj_resources, Name.ExtGState)
+                text_extstates = text_page.Resources[Name.ExtGState]
+                # Copy each graphics state from the foreign PDF
+                for gs_name, gs_obj in text_extstates.items():
+                    xobj_extstates[gs_name] = self.pdf_base.copy_foreign(gs_obj)
+
+        # Build transformation matrix for rotation and scaling
+        ctm = _build_text_layer_ctm(
+            wt,
+            ht,
+            wp,
+            hp,
+            float(base_mediabox[0]),
+            float(base_mediabox[1]),
+            text_rotation,
+        )
+        if ctm is not None:
+            pdf_draw_xobj = (
+                (b'q %s cm\n' % ctm.encode()) + (b'%s Do\n' % text_xobj_name) + b'Q\n'
+            )
+        else:
+            pdf_draw_xobj = b'q\n' + (b'%s Do\n' % text_xobj_name) + b'\nQ\n'
+
+        new_text_layer = Stream(self.pdf_base, pdf_draw_xobj)
+
+        # Strip old invisible text if redo mode is enabled
+        if self.context.options.mode == ProcessingMode.redo:
+            strip_invisible_text(self.pdf_base, base_page)
+
+        # Add text layer to base page
+        base_page.contents_coalesce()
+        base_page.contents_add(
+            new_text_layer, prepend=self.render_mode == RenderMode.UNDERNEATH
+        )
+        base_page.contents_coalesce()
+
+    def _graft_sandwich_text_layer(
+        self,
+        *,
+        pageno: int,
+        textpdf: Path,
+        text_rotation: int,
+    ):
+        """Graft a pre-rendered text-only PDF onto the base PDF.
+
+        This is used by the sandwich renderer which generates PDFs directly
+        from Tesseract rather than going through hOCR.
+        """
+        from pikepdf import PdfError
+
+        log.debug("Grafting sandwich text layer")
+        if Path(textpdf).stat().st_size == 0:
+            return
+
+        try:
+            with Pdf.open(textpdf) as pdf_text:
+                pdf_text_contents = pdf_text.pages[0].Contents.read_bytes()
+
+                base_page = self.pdf_base.pages[pageno]
+
+                # Get font from the text PDF
+                pdf_text_fonts = pdf_text.pages[0].Resources.get(
+                    Name.Font, Dictionary()
+                )
+                font = None
+                font_key = None
+                for f in ('/f-0-0', '/F1'):
+                    pdf_text_font = pdf_text_fonts.get(f, None)
+                    if pdf_text_font is not None:
+                        font_key = Name(f)
+                        font = self.pdf_base.copy_foreign(pdf_text_font)
+                        break
+
+                # Get mediabox dimensions for rotation calculations
+                mediabox = pdf_text.pages[0].mediabox
+                wt = float(mediabox[2]) - float(mediabox[0])
+                ht = float(mediabox[3]) - float(mediabox[1])
+
+                base_mediabox = base_page.mediabox
+                wp = float(base_mediabox[2]) - float(base_mediabox[0])
+                hp = float(base_mediabox[3]) - float(base_mediabox[1])
+
+                # Build transformation matrix for rotation and scaling
+                ctm = _build_text_layer_ctm(
+                    wt,
+                    ht,
+                    wp,
+                    hp,
+                    float(base_mediabox[0]),
+                    float(base_mediabox[1]),
+                    text_rotation,
+                )
+                log.debug("Grafting with ctm %r", ctm)
+
+                # Create Form XObject
+                base_resources = _ensure_dictionary(base_page.obj, Name.Resources)
+                base_xobjs = _ensure_dictionary(base_resources, Name.XObject)
+                text_xobj_name = Name.random(prefix="OCR-")
+                xobj = self.pdf_base.make_stream(pdf_text_contents)
+                base_xobjs[text_xobj_name] = xobj
+                xobj.Type = Name.XObject
+                xobj.Subtype = Name.Form
+                xobj.FormType = 1
+                xobj.BBox = base_mediabox
+
+                # Add font to xobj resources
+                if font_key is not None and font is not None:
+                    xobj_resources = _ensure_dictionary(xobj, Name.Resources)
+                    xobj_fonts = _ensure_dictionary(xobj_resources, Name.Font)
+                    if font_key not in xobj_fonts:
+                        xobj_fonts[font_key] = font
+
+                if ctm is not None:
+                    pdf_draw_xobj = (
+                        (b'q %s cm\n' % ctm.encode())
+                        + (b'%s Do\n' % text_xobj_name)
+                        + b'\nQ\n'
+                    )
+                else:
+                    pdf_draw_xobj = b'q\n' + (b'%s Do\n' % text_xobj_name) + b'\nQ\n'
+                new_text_layer = Stream(self.pdf_base, pdf_draw_xobj)
+
+                if self.context.options.mode == ProcessingMode.redo:
+                    strip_invisible_text(self.pdf_base, base_page)
+                base_page.contents_coalesce()
+                base_page.contents_add(
+                    new_text_layer, prepend=self.render_mode == RenderMode.UNDERNEATH
+                )
+                base_page.contents_coalesce()
+
+                # Add font to page resources
+                if font_key is not None and font is not None:
+                    page_resources = _ensure_dictionary(base_page.obj, Name.Resources)
+                    page_fonts = _ensure_dictionary(page_resources, Name.Font)
+                    if font_key not in page_fonts:
+                        page_fonts[font_key] = font
+        except (FileNotFoundError, PdfError):
+            # PdfError occurs if a 0-length file is written e.g. due to OCR timeout
+            pass

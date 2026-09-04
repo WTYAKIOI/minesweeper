@@ -1,0 +1,408 @@
+# SPDX-FileCopyrightText: 2022 James R. Barlow
+# SPDX-License-Identifier: MPL-2.0
+name: Test and deploy
+
+on:
+  push:
+    branches:
+      - main
+      - ci
+      - release/*
+      - feature/*
+    paths-ignore:
+      - README*
+  pull_request:
+  schedule:
+    # Nightly run with --runslow on all platforms; slow tests are otherwise
+    # only run on one Linux matrix cell per push/PR.
+    - cron: "40 8 * * *"
+
+jobs:
+  lint:
+    name: Lint (prek)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.9.x"
+          # Disabled because setup-uv keys its cache on the runner default Python
+          # rather than the matrix one, so all jobs collide on one ~100 KB cache.
+          enable-cache: false
+
+      - name: "Set up Python"
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - name: Run prek
+        run: |
+          uv run prek run --all-files
+
+  test_linux:
+    name: Test ${{ matrix.os }} with Python ${{ matrix.python }}
+    needs: lint
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+        python: ["3.11", "3.12", "3.13", "3.14"]
+        include:
+          - os: ubuntu-22.04
+            tesseract_ppa: "ppa"
+            python: "3.11"
+          - os: ubuntu-24.04
+            python: "3.14"
+            runslow: "runslow"
+
+    env:
+      OS: ${{ matrix.os }}
+      PYTHON: ${{ matrix.python }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.9.x"
+          # Disabled because setup-uv keys its cache on the runner default Python
+          # rather than the matrix one, so all jobs collide on one ~100 KB cache.
+          enable-cache: false
+
+      - name: "Set up Python"
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install Tesseract from PPA
+        if: matrix.tesseract_ppa == 'ppa'
+        run: |
+          sudo add-apt-repository -y ppa:alex-p/tesseract-ocr5
+
+      - name: Install common packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            curl \
+            fonts-noto-core \
+            fonts-noto-cjk \
+            ghostscript \
+            jbig2dec \
+            img2pdf \
+            libexempi8 \
+            libffi-dev \
+            libsm6 libxext6 libxrender-dev \
+            pngquant \
+            poppler-utils \
+            tesseract-ocr \
+            tesseract-ocr-deu \
+            tesseract-ocr-eng \
+            tesseract-ocr-osd \
+            unpaper \
+            zlib1g
+
+      - name: Install Python packages
+        run: |
+          uv sync --group test
+
+      - name: Report versions
+        run: |
+          tesseract --version
+          gs --version
+          pngquant --version
+          unpaper --version
+          uv run --no-dev img2pdf --version
+
+      - name: Test
+        env:
+          # The PPA cell runs the same tesseract line that generated
+          # tests/cache; hold it to strict cache-version agreement.
+          OCRMYPDF_TEST_CACHE_STRICT: ${{ matrix.tesseract_ppa == 'ppa' && '1' || '' }}
+        run: |
+          uv run --no-dev pytest --cov-report xml --cov --durations=25 ${{ (github.event_name == 'schedule' || matrix.runslow == 'runslow') && '--runslow' || '' }} tests/
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v7
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+        with:
+          files: ./coverage.xml
+          env_vars: OS,PYTHON
+
+  test_macos:
+    name: Test macOS
+    needs: lint
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [macos-latest]
+        python: ["3.11", "3.12", "3.13", "3.14"]
+
+    env:
+      OS: ${{ matrix.os }}
+      PYTHON: ${{ matrix.python }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Homebrew deps
+        continue-on-error: true
+        run: |
+          brew update
+          brew install \
+            exempi \
+            ghostscript \
+            jbig2enc \
+            openjpeg \
+            pngquant \
+            poppler \
+            tesseract \
+            verapdf
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.9.x"
+          # Disabled because setup-uv keys its cache on the runner default Python
+          # rather than the matrix one, so all jobs collide on one ~100 KB cache.
+          enable-cache: false
+
+      - name: "Set up Python"
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install Python packages
+        run: |
+          uv sync --group test
+
+      - name: Report versions
+        run: |
+          tesseract --version
+          gs --version
+          pngquant --version
+          uv run --no-dev img2pdf --version
+
+      - name: Test
+        run: |
+          uv run --no-dev pytest --cov-report xml --cov --durations=25 ${{ github.event_name == 'schedule' && '--runslow' || '' }} tests/
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v7
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+        with:
+          files: ./coverage.xml
+          env_vars: OS,PYTHON
+
+  test_windows:
+    name: Test Windows
+    needs: lint
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [windows-latest]
+        python: ["3.11", "3.12", "3.13", "3.14"]
+
+    env:
+      OS: ${{ matrix.os }}
+      PYTHON: ${{ matrix.python }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.9.x"
+          # Disabled because setup-uv keys its cache on the runner default Python
+          # rather than the matrix one, so all jobs collide on one ~100 KB cache.
+          enable-cache: false
+
+      - name: "Set up Python"
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install system packages
+        run: |
+          choco install --yes --no-progress tesseract
+          choco install --yes --no-progress --ignore-checksums ghostscript --version 9.56.1
+          choco install --yes --no-progress poppler --version=25.11.0
+
+      - name: Install Python packages
+        run: |
+          uv sync --group test
+
+      - name: Test
+        run: |
+          uv run --no-dev pytest --cov-report xml --cov --durations=25 ${{ github.event_name == 'schedule' && '--runslow' || '' }} tests/
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v7
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+        with:
+          files: ./coverage.xml
+          env_vars: OS,PYTHON
+
+  wheel_sdist_linux:
+    name: Build sdist and wheels
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.9.x"
+          # Disabled because setup-uv keys its cache on the runner default Python
+          # rather than the matrix one, so all jobs collide on one ~100 KB cache.
+          enable-cache: false
+
+      - name: Make wheels and sdist
+        run: |
+          uv build --sdist --wheel
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: artifact
+          path: |
+            ./dist/*.whl
+            ./dist/*.tar.gz
+
+  stage_release:
+    name: Stage release artifacts
+    needs: [wheel_sdist_linux, test_linux, test_macos, test_windows]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: artifact
+          path: dist
+
+      - name: Read version from source
+        id: version
+        run: |
+          VERSION=$(python3 -c "exec(open('src/ocrmypdf/_version.py').read()); print(__version__)")
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Create or update draft release
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          TAG="v${{ steps.version.outputs.version }}"
+
+          # If release.yml already published this version, _version.py may
+          # still reflect it until the next version bump commit. Don't
+          # re-draft an already-published release on later pushes to main.
+          if [[ "$(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null)" == "false" ]]; then
+            echo "Release $TAG is already published; skipping."
+            exit 0
+          fi
+
+          # Delete existing draft release if it exists (ignore errors)
+          gh release delete "$TAG" --yes 2>/dev/null || true
+
+          # Create new draft release with all artifacts
+          gh release create "$TAG" \
+            --draft \
+            --title "$TAG" \
+            --notes "Draft release - will be updated when tag is pushed" \
+            dist/*
+
+  docker_ubuntu:
+    name: Build Ubuntu-based Docker image
+    needs: [wheel_sdist_linux, test_linux, test_macos, test_windows]
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+    steps:
+      - name: Set image tag to release or branch
+        run: echo "DOCKER_IMAGE_TAG=${GITHUB_REF##*/}" >> $GITHUB_ENV
+
+      - name: If main, set to latest
+        run: echo 'DOCKER_IMAGE_TAG=latest' >> $GITHUB_ENV
+        if: env.DOCKER_IMAGE_TAG == 'main'
+
+      - name: Set Docker Hub repository to username
+        run: echo "DOCKER_REPOSITORY=jbarlow83" >> $GITHUB_ENV
+
+      - name: Set image name
+        run: echo "DOCKER_IMAGE_NAME=ocrmypdf" >> $GITHUB_ENV
+
+      - uses: actions/checkout@v7
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: jbarlow83
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        id: buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Print image tag
+        run: echo "Building image ${DOCKER_REPOSITORY}/${DOCKER_IMAGE_NAME}:${DOCKER_IMAGE_TAG}"
+
+      - name: Build
+        run: |
+          docker buildx build \
+            --push \
+            --platform linux/arm64/v8,linux/amd64  \
+            --tag "${DOCKER_REPOSITORY}/${DOCKER_IMAGE_NAME}:${DOCKER_IMAGE_TAG}" \
+            --tag "${DOCKER_REPOSITORY}/${DOCKER_IMAGE_NAME}-ubuntu:${DOCKER_IMAGE_TAG}" \
+            --file .docker/Dockerfile .
+
+  docker_alpine:
+    name: Build Alpine-based Docker images
+    needs: [wheel_sdist_linux, test_linux, test_macos, test_windows]
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+    steps:
+      - name: Set image tag to release or branch
+        run: echo "DOCKER_IMAGE_TAG=${GITHUB_REF##*/}" >> $GITHUB_ENV
+
+      - name: If main, set to latest
+        run: echo 'DOCKER_IMAGE_TAG=latest' >> $GITHUB_ENV
+        if: env.DOCKER_IMAGE_TAG == 'main'
+
+      - name: Set Docker Hub repository to username
+        run: echo "DOCKER_REPOSITORY=jbarlow83" >> $GITHUB_ENV
+
+      - name: Set image name
+        run: echo "DOCKER_IMAGE_NAME=ocrmypdf-alpine" >> $GITHUB_ENV
+
+      - uses: actions/checkout@v7
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: jbarlow83
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        id: buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Print image tag
+        run: echo "Building image ${DOCKER_REPOSITORY}/${DOCKER_IMAGE_NAME}:${DOCKER_IMAGE_TAG}"
+
+      - name: Build
+        run: |
+          docker buildx build \
+            --push \
+            --platform linux/amd64,linux/arm64  \
+            --tag "${DOCKER_REPOSITORY}/${DOCKER_IMAGE_NAME}:${DOCKER_IMAGE_TAG}" \
+            --file .docker/Dockerfile.alpine .

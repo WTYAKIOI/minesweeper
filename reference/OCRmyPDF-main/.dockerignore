@@ -1,0 +1,47 @@
+# SPDX-FileCopyrightText: 2022 James R. Barlow
+# SPDX-License-Identifier: MPL-2.0
+
+# dotfiles
+.*
+!.coveragerc
+!.dockerignore
+!.git_archival.txt
+!.gitattributes
+!.gitignore
+!.pre-commit-config.yaml
+!.readthedocs.yml
+
+# Dev scratch
+*.ipynb
+**/*.pyc
+/*.pdf
+/*.qdf
+/*.png
+/scratch.py
+IDEAS
+log/
+tests/resources/private/
+tmp/
+venv*/
+/debug_tests.py
+*.traineddata
+/private
+
+# Package building
+*.egg-info/
+build/
+dist/
+wheelhouse/
+pip-wheel-metadata/
+
+# Code coverage
+htmlcov/
+
+# Docker specific
+bin/
+docs/
+include/
+lib/
+
+# Docker include .git/
+!.git/

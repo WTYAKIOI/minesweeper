@@ -5,6 +5,7 @@ Rust 推理引擎 + LLM 翻译层 + Web 棋盘编辑器 + OCR 截图识别
 - **确定性推理**：约束传播 + 子集规则，输出带完整依赖链的必雷 / 必安全证明
 - **概率引擎**：动态迭代蒙特卡洛模拟，30×30 大棋盘 < 150ms
 - **LLM 转译**：答案 / 教学 / 策略三种模式，把推理 IR 翻译成人类语言（含坐标幻觉检测）
+- **OCR 截图识别**：三层回退（颜色投票 → 7 段形态匹配 → Tesseract），支持经典 / 暗色 / 紫色等多主题
 - **数据防火墙**：传给 LLM 的信息绝不包含未翻开格子的真实雷藏
 
 ## 🚀 快速开始（选一种即可）
@@ -83,6 +84,8 @@ minesweeper-agent import -i tests/sample_board.json
 |------|------|
 | `POST /api/analyze` | 分析局面：`{ "board": [[1,-1,-1],...], "remaining_mines": 3, "mode": "answer\|teaching\|strategy", "use_llm": false }` |
 | `POST /api/ocr` | 截图识别代理：`{ "image": "<base64>" }` → `{ "board": [[...]], "remaining_mines": n }` |
+| `POST /api/debug` | OCR 调试：返回每格的颜色/形态分析细节，便于排查误识别 |
+| `POST /api/learn` | 用户反馈学习：`{ "image": "<base64>", "digit": n }` → 加入模板库 |
 | `GET /api/health` | 健康检查 |
 
 **棋盘编码**：`-1` = 未知，`-2` = 旗帜，`0-8` = 已翻开数字（`board[行][列]`）。
@@ -125,7 +128,10 @@ minesweeper/
 │   └── cli.rs            # CLI (clap)
 ├── static/index.html     # 前端 (Canvas 棋盘 + 对话引导区)
 ├── ocr/                  # OCR 微服务 (Flask + OpenCV + Tesseract)
+│   └── app.py            # 三层回退: 颜色投票 → 7段形态匹配 → Tesseract
 ├── tests/                # 集成测试
+│   ├── integration_test.rs  # Rust 推理引擎测试
+│   └── test_ocr.py          # OCR 数字识别测试
 ├── Dockerfile / docker-compose.yml
 └── Cargo.toml
 ```

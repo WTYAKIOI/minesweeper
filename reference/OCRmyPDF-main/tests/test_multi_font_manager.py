@@ -1,0 +1,685 @@
+# SPDX-FileCopyrightText: 2025 James R. Barlow
+# SPDX-License-Identifier: MPL-2.0
+
+"""Unit tests for MultiFontManager and FontProvider."""
+
+from __future__ import annotations
+
+import logging
+from pathlib import Path
+
+import pytest
+
+from ocrmypdf.font import BuiltinFontProvider, FontManager, MultiFontManager
+
+
+@pytest.fixture
+def font_dir():
+    """Return path to font directory."""
+    return Path(__file__).parent.parent / "src" / "ocrmypdf" / "data"
+
+
+@pytest.fixture
+def multi_font_manager(font_dir):
+    """Create MultiFontManager instance for testing."""
+    return MultiFontManager(font_dir)
+
+
+def has_cjk_font(manager: MultiFontManager) -> bool:
+    """Check if CJK font is available (from system)."""
+    return 'NotoSansCJK-Regular' in manager.fonts
+
+
+def has_arabic_font(manager: MultiFontManager) -> bool:
+    """Check if Arabic font is available (from system)."""
+    return 'NotoSansArabic-Regular' in manager.fonts
+
+
+def has_devanagari_font(manager: MultiFontManager) -> bool:
+    """Check if Devanagari font is available (from system)."""
+    return 'NotoSansDevanagari-Regular' in manager.fonts
+
+
+# Marker for tests that require CJK fonts
+requires_cjk = pytest.mark.skipif(
+    "not has_cjk_font(MultiFontManager())",
+    reason="CJK font not available (not installed on system)",
+)
+
+
+# --- MultiFontManager Initialization Tests ---
+
+
+def test_init_loads_builtin_fonts(multi_font_manager):
+    """Test that initialization loads all expected builtin fonts."""
+    # Only NotoSans-Regular and Occulta are bundled
+    assert 'NotoSans-Regular' in multi_font_manager.fonts
+    assert 'Occulta' in multi_font_manager.fonts
+
+    # At least 2 builtin fonts should be loaded
+    assert len(multi_font_manager.fonts) >= 2
+
+    # Arabic, Devanagari, CJK are optional (system fonts)
+
+
+def test_missing_font_directory():
+    """Test that missing font directory raises error for fallback font."""
+    with pytest.raises(FileNotFoundError):
+        MultiFontManager(Path("/nonexistent/path"))
+
+
+# --- Arabic Script Language Tests ---
+# These tests require Arabic fonts to be installed on the system
+
+
+def test_select_font_for_arabic_language(multi_font_manager):
+    """Test font selection with Arabic language hint."""
+    if not has_arabic_font(multi_font_manager):
+        pytest.skip("Arabic font not available")
+    font_manager = multi_font_manager.select_font_for_word("مرحبا", "ara")
+    assert font_manager == multi_font_manager.fonts['NotoSansArabic-Regular']
+
+
+def test_select_font_for_persian_language(multi_font_manager):
+    """Test font selection with Persian language hint."""
+    if not has_arabic_font(multi_font_manager):
+        pytest.skip("Arabic font not available")
+    font_manager = multi_font_manager.select_font_for_word("سلام", "per")
+    assert font_manager == multi_font_manager.fonts['NotoSansArabic-Regular']
+
+
+def test_select_font_for_urdu_language(multi_font_manager):
+    """Test font selection with Urdu language hint."""
+    if not has_arabic_font(multi_font_manager):
+        pytest.skip("Arabic font not available")
+    font_manager = multi_font_manager.select_font_for_word("ہیلو", "urd")
+    assert font_manager == multi_font_manager.fonts['NotoSansArabic-Regular']
+
+
+def test_farsi_language_code(multi_font_manager):
+    """Test that 'fas' (Farsi alternative code) maps to Arabic font."""
+    if not has_arabic_font(multi_font_manager):
+        pytest.skip("Arabic font not available")
+    font_manager = multi_font_manager.select_font_for_word("سلام", "fas")
+    assert font_manager == multi_font_manager.fonts['NotoSansArabic-Regular']
+
+
+# --- Devanagari Script Language Tests ---
+# These tests require Devanagari fonts to be installed on the system
+
+
+def test_select_font_for_hindi_language(multi_font_manager):
+    """Test font selection with Hindi language hint."""
+    if not has_devanagari_font(multi_font_manager):
+        pytest.skip("Devanagari font not available")
+    font_manager = multi_font_manager.select_font_for_word("नमस्ते", "hin")
+    assert font_manager == multi_font_manager.fonts['NotoSansDevanagari-Regular']
+
+
+def test_select_font_for_sanskrit_language(multi_font_manager):
+    """Test font selection with Sanskrit language hint."""
+    if not has_devanagari_font(multi_font_manager):
+        pytest.skip("Devanagari font not available")
+    font_manager = multi_font_manager.select_font_for_word("संस्कृतम्", "san")
+    assert font_manager == multi_font_manager.fonts['NotoSansDevanagari-Regular']
+
+
+def test_select_font_for_marathi_language(multi_font_manager):
+    """Test font selection with Marathi language hint."""
+    if not has_devanagari_font(multi_font_manager):
+        pytest.skip("Devanagari font not available")
+    font_manager = multi_font_manager.select_font_for_word("मराठी", "mar")
+    assert font_manager == multi_font_manager.fonts['NotoSansDevanagari-Regular']
+
+
+def test_select_font_for_nepali_language(multi_font_manager):
+    """Test font selection with Nepali language hint."""
+    if not has_devanagari_font(multi_font_manager):
+        pytest.skip("Devanagari font not available")
+    font_manager = multi_font_manager.select_font_for_word("नेपाली", "nep")
+    assert font_manager == multi_font_manager.fonts['NotoSansDevanagari-Regular']
+
+
+# --- CJK Language Tests ---
+# These tests require CJK fonts to be installed on the system
+
+
+def test_select_font_for_chinese_language(multi_font_manager):
+    """Test font selection with Chinese language hint (ISO 639-3)."""
+    if not has_cjk_font(multi_font_manager):
+        pytest.skip("CJK font not available")
+    font_manager = multi_font_manager.select_font_for_word("你好", "zho")
+    # A real, glyph-covering CJK font is selected (which specific family
+    # depends on what is installed: pan-CJK super font or a per-language subset).
+    assert font_manager.font_path.name != 'Occulta.ttf'
+
+
+def test_select_font_for_chinese_generic(multi_font_manager):
+    """Test font selection with generic Chinese language code."""
+    if not has_cjk_font(multi_font_manager):
+        pytest.skip("CJK font not available")
+    font_manager = multi_font_manager.select_font_for_word("中文", "chi")
+    # A real, glyph-covering CJK font is selected (which specific family
+    # depends on what is installed: pan-CJK super font or a per-language subset).
+    assert font_manager.font_path.name != 'Occulta.ttf'
+
+
+def test_select_font_for_chinese_simplified(multi_font_manager):
+    """Test font selection with Tesseract's chi_sim language code."""
+    if not has_cjk_font(multi_font_manager):
+        pytest.skip("CJK font not available")
+    font_manager = multi_font_manager.select_font_for_word("简体字", "chi_sim")
+    # A real, glyph-covering CJK font is selected (which specific family
+    # depends on what is installed: pan-CJK super font or a per-language subset).
+    assert font_manager.font_path.name != 'Occulta.ttf'
+
+
+def test_select_font_for_chinese_traditional(multi_font_manager):
+    """Test font selection with Tesseract's chi_tra language code."""
+    if not has_cjk_font(multi_font_manager):
+        pytest.skip("CJK font not available")
+    font_manager = multi_font_manager.select_font_for_word("漢字", "chi_tra")
+    # A real, glyph-covering CJK font is selected (which specific family
+    # depends on what is installed: pan-CJK super font or a per-language subset).
+    assert font_manager.font_path.name != 'Occulta.ttf'
+
+
+def test_select_font_for_japanese_language(multi_font_manager):
+    """Test font selection with Japanese language hint."""
+    if not has_cjk_font(multi_font_manager):
+        pytest.skip("CJK font not available")
+    font_manager = multi_font_manager.select_font_for_word("こんにちは", "jpn")
+    # A real, glyph-covering CJK font is selected (which specific family
+    # depends on what is installed: pan-CJK super font or a per-language subset).
+    assert font_manager.font_path.name != 'Occulta.ttf'
+
+
+def test_select_font_for_korean_language(multi_font_manager):
+    """Test font selection with Korean language hint."""
+    if not has_cjk_font(multi_font_manager):
+        pytest.skip("CJK font not available")
+    font_manager = multi_font_manager.select_font_for_word("안녕하세요", "kor")
+    # A real, glyph-covering CJK font is selected (which specific family
+    # depends on what is installed: pan-CJK super font or a per-language subset).
+    assert font_manager.font_path.name != 'Occulta.ttf'
+
+
+# --- Latin/English Tests ---
+
+
+def test_select_font_for_english_text(multi_font_manager):
+    """Test font selection for English text."""
+    font_manager = multi_font_manager.select_font_for_word("Hello World", "eng")
+    assert font_manager == multi_font_manager.fonts['NotoSans-Regular']
+
+
+def test_select_font_without_language_hint(multi_font_manager):
+    """Test font selection without language hint falls back to glyph checking."""
+    font_manager = multi_font_manager.select_font_for_word("Hello", None)
+    assert font_manager == multi_font_manager.fonts['NotoSans-Regular']
+
+
+# --- Fallback Behavior Tests ---
+
+
+def test_select_font_arabic_text_without_language_hint(multi_font_manager):
+    """Test that Arabic text is handled via fallback without language hint."""
+    if not has_arabic_font(multi_font_manager):
+        pytest.skip("Arabic font not available")
+    font_manager = multi_font_manager.select_font_for_word("مرحبا", None)
+    # Should get NotoSansArabic-Regular via fallback chain glyph checking
+    assert font_manager == multi_font_manager.fonts['NotoSansArabic-Regular']
+
+
+def test_devanagari_text_without_language_hint(multi_font_manager):
+    """Test that Devanagari text is handled via fallback without language hint."""
+    # NotoSans-Regular includes Devanagari glyphs, so it's selected first in fallback
+    font_manager = multi_font_manager.select_font_for_word("नमस्ते", None)
+    # Could be NotoSans-Regular or NotoSansDevanagari-Regular depending on availability
+    assert font_manager is not None
+
+
+def test_cjk_text_without_language_hint(multi_font_manager):
+    """Test that CJK text is handled via fallback without language hint."""
+    if not has_cjk_font(multi_font_manager):
+        pytest.skip("CJK font not available")
+    font_manager = multi_font_manager.select_font_for_word("你好", None)
+    # A real, glyph-covering CJK font is selected (which specific family
+    # depends on what is installed: pan-CJK super font or a per-language subset).
+    assert font_manager.font_path.name != 'Occulta.ttf'
+
+
+def test_fallback_to_occulta_font(multi_font_manager):
+    """Test that unsupported characters fall back to Occulta.ttf."""
+    # Use a character unlikely to be in any standard font
+    font_manager = multi_font_manager.select_font_for_word("test", "xyz")
+    # Should return some valid font
+    assert font_manager in multi_font_manager.fonts.values()
+
+
+def test_fallback_fonts_constant(multi_font_manager):
+    """Test that FALLBACK_FONTS contains expected fonts."""
+    # Check that core fonts are in fallback list
+    assert 'NotoSans-Regular' in MultiFontManager.FALLBACK_FONTS
+    assert 'NotoSansArabic-Regular' in MultiFontManager.FALLBACK_FONTS
+    assert 'NotoSansDevanagari-Regular' in MultiFontManager.FALLBACK_FONTS
+    assert 'NotoSansCJK-Regular' in MultiFontManager.FALLBACK_FONTS
+
+    # Only NotoSans-Regular is bundled; other scripts are system fonts
+    assert 'NotoSans-Regular' in multi_font_manager.fonts
+
+
+# --- Glyph Coverage Tests ---
+
+
+def test_has_all_glyphs_for_english(multi_font_manager):
+    """Test glyph coverage checking for English text."""
+    assert multi_font_manager.has_all_glyphs('NotoSans-Regular', "Hello World")
+    assert multi_font_manager.has_all_glyphs('NotoSans-Regular', "café")
+
+
+def test_has_all_glyphs_for_arabic(multi_font_manager):
+    """Test glyph coverage checking for Arabic text."""
+    if not has_arabic_font(multi_font_manager):
+        pytest.skip("Arabic font not available")
+    assert multi_font_manager.has_all_glyphs('NotoSansArabic-Regular', "مرحبا")
+
+
+def test_has_all_glyphs_for_devanagari(multi_font_manager):
+    """Test glyph coverage checking for Devanagari text."""
+    if not has_devanagari_font(multi_font_manager):
+        pytest.skip("Devanagari font not available")
+    assert multi_font_manager.has_all_glyphs('NotoSansDevanagari-Regular', "नमस्ते")
+
+
+def test_has_all_glyphs_for_cjk(multi_font_manager):
+    """Test glyph coverage checking for CJK text."""
+    if not has_cjk_font(multi_font_manager):
+        pytest.skip("CJK font not available")
+    assert multi_font_manager.has_all_glyphs('NotoSansCJK-Regular', "你好")
+
+
+def test_empty_text_has_all_glyphs(multi_font_manager):
+    """Test that empty text returns True for glyph coverage."""
+    assert multi_font_manager.has_all_glyphs('NotoSans-Regular', "")
+
+
+def test_has_all_glyphs_missing_font(multi_font_manager):
+    """Test that has_all_glyphs returns False for non-existent font."""
+    assert not multi_font_manager.has_all_glyphs('NonExistentFont', "test")
+
+
+# --- Caching Tests ---
+
+
+def test_font_selection_caching(multi_font_manager):
+    """Test that font selection results are cached."""
+    font1 = multi_font_manager.select_font_for_word("Hello", "eng")
+
+    cache_key = ("Hello", "eng")
+    assert cache_key in multi_font_manager._selection_cache
+
+    font2 = multi_font_manager.select_font_for_word("Hello", "eng")
+    assert font1 == font2
+
+
+# --- Language Font Map Tests ---
+
+
+def test_language_font_map_coverage():
+    """Test that LANGUAGE_FONT_MAP has valid structure."""
+    # Only NotoSans-Regular is bundled now
+    # This test just verifies the structure is valid
+    for font_name in MultiFontManager.LANGUAGE_FONT_MAP.values():
+        # All font names should be valid strings
+        assert isinstance(font_name, str)
+        assert font_name.startswith('NotoSans')
+
+
+# --- get_all_fonts Tests ---
+
+
+def test_get_all_fonts(multi_font_manager):
+    """Test get_all_fonts returns all loaded fonts."""
+    all_fonts = multi_font_manager.get_all_fonts()
+    assert isinstance(all_fonts, dict)
+    # At least 2 builtin fonts should be loaded (NotoSans-Regular and Occulta)
+    assert len(all_fonts) >= 2
+    assert 'NotoSans-Regular' in all_fonts
+    assert 'Occulta' in all_fonts
+    # Arabic, Devanagari, CJK are optional (system fonts)
+
+
+# --- FontProvider Tests ---
+
+
+class MockFontProvider:
+    """Mock FontProvider for testing missing fonts."""
+
+    def __init__(self, available_fonts: dict[str, FontManager], fallback: FontManager):
+        """Initialize mock font provider with given fonts."""
+        self._fonts = available_fonts
+        self._fallback = fallback
+
+    def get_font(self, font_name: str) -> FontManager | None:
+        return self._fonts.get(font_name)
+
+    def get_available_fonts(self) -> list[str]:
+        return list(self._fonts.keys())
+
+    def get_fallback_font(self) -> FontManager:
+        return self._fallback
+
+
+def test_custom_font_provider(font_dir):
+    """Test that custom FontProvider can be injected."""
+    fonts = {
+        'NotoSans-Regular': FontManager(font_dir / 'NotoSans-Regular.ttf'),
+        'Occulta': FontManager(font_dir / 'Occulta.ttf'),
+    }
+    provider = MockFontProvider(fonts, fonts['Occulta'])
+
+    manager = MultiFontManager(font_provider=provider)
+
+    # Should only have the fonts we provided
+    assert len(manager.fonts) == 2
+    assert 'NotoSans-Regular' in manager.fonts
+    assert 'Occulta' in manager.fonts
+
+
+def test_missing_font_uses_fallback(font_dir):
+    """Test that missing fonts gracefully fall back."""
+    fonts = {
+        'NotoSans-Regular': FontManager(font_dir / 'NotoSans-Regular.ttf'),
+        'Occulta': FontManager(font_dir / 'Occulta.ttf'),
+    }
+    provider = MockFontProvider(fonts, fonts['Occulta'])
+
+    manager = MultiFontManager(font_provider=provider)
+
+    # Arabic text should fall back to Occulta since NotoSansArabic is missing
+    font = manager.select_font_for_word("مرحبا", "ara")
+    assert font == fonts['Occulta']
+
+
+def test_builtin_font_provider_loads_expected_fonts(font_dir):
+    """Test BuiltinFontProvider loads all expected builtin fonts."""
+    provider = BuiltinFontProvider(font_dir)
+
+    available = provider.get_available_fonts()
+    assert 'NotoSans-Regular' in available
+    assert 'Occulta' in available
+    # Only Latin (NotoSans) and glyphless fallback (Occulta) are bundled.
+    # All other scripts (Arabic, Devanagari, CJK, etc.) are discovered
+    # from system fonts by SystemFontProvider to reduce package size.
+    assert len(available) == 2
+
+
+def test_builtin_font_provider_get_font(font_dir):
+    """Test BuiltinFontProvider.get_font returns correct fonts."""
+    provider = BuiltinFontProvider(font_dir)
+
+    font = provider.get_font('NotoSans-Regular')
+    assert font is not None
+    assert isinstance(font, FontManager)
+
+    missing = provider.get_font('NonExistent')
+    assert missing is None
+
+
+def test_builtin_font_provider_get_fallback(font_dir):
+    """Test BuiltinFontProvider.get_fallback_font returns Occulta font."""
+    provider = BuiltinFontProvider(font_dir)
+
+    fallback = provider.get_fallback_font()
+    assert fallback is not None
+    assert fallback == provider.get_font('Occulta')
+
+
+def test_builtin_font_provider_missing_font_logs_warning(tmp_path, font_dir, caplog):
+    """Test that missing expected fonts log a warning."""
+    # Create minimal font directory with only Occulta.ttf
+    (tmp_path / 'Occulta.ttf').write_bytes((font_dir / 'Occulta.ttf').read_bytes())
+
+    with caplog.at_level(logging.WARNING):
+        provider = BuiltinFontProvider(tmp_path)
+
+    # Should have logged warnings for missing fonts
+    assert 'NotoSans-Regular' in caplog.text
+    assert 'not found' in caplog.text
+
+    # But Occulta should be loaded
+    assert provider.get_fallback_font() is not None
+
+
+def test_builtin_font_provider_missing_occulta_raises(tmp_path):
+    """Test that missing Occulta.ttf raises FileNotFoundError."""
+    with pytest.raises(FileNotFoundError, match="Required fallback font"):
+        BuiltinFontProvider(tmp_path)
+
+
+class _StubHbFont:
+    """Minimal uharfbuzz Font stand-in with controllable glyph coverage."""
+
+    def __init__(self, covered_codepoints: set[int]):
+        self._covered = covered_codepoints
+
+    def get_nominal_glyph(self, codepoint: int) -> int:
+        return 1 if codepoint in self._covered else 0
+
+
+class _FakeFontManager:
+    """FontManager stand-in whose glyph coverage is fixed per test."""
+
+    def __init__(self, name: str, covered_chars: str):
+        self.font_path = Path(name)
+        self._hb = _StubHbFont({ord(c) for c in covered_chars})
+
+    def get_hb_font(self) -> _StubHbFont:
+        return self._hb
+
+
+class _FakeFontProvider:
+    """FontProvider returning controlled fonts by logical name."""
+
+    def __init__(self, fonts: dict[str, _FakeFontManager]):
+        self._fonts = fonts
+        self._fallback = _FakeFontManager('Occulta.ttf', '')
+
+    def get_font(self, name: str) -> _FakeFontManager | None:
+        return self._fonts.get(name)
+
+    def get_available_fonts(self) -> list[str]:
+        return list(self._fonts)
+
+    def get_fallback_font(self) -> _FakeFontManager:
+        return self._fallback
+
+
+def test_japanese_prefers_jp_family_over_other_cjk():
+    """A Japanese language hint selects NotoSansJP, not another CJK family."""
+    fonts = {
+        'NotoSansSC-Regular': _FakeFontManager('NotoSansSC.ttf', '中'),
+        'NotoSansJP-Regular': _FakeFontManager('NotoSansJP.ttf', '中こ'),
+    }
+    manager = MultiFontManager(font_provider=_FakeFontProvider(fonts))
+    # 'こ' (kana) is only covered by JP; both cover the kanji '中'.
+    font = manager.select_font_for_word('中こ', 'jpn')
+    assert font.font_path.name == 'NotoSansJP.ttf'
+
+
+def test_chinese_simplified_prefers_sc_family():
+    """A Simplified Chinese hint selects NotoSansSC over the pan-CJK font."""
+    fonts = {
+        'NotoSansSC-Regular': _FakeFontManager('NotoSansSC.ttf', '简'),
+        'NotoSansCJK-Regular': _FakeFontManager('NotoSansCJK.ttc', '简'),
+    }
+    manager = MultiFontManager(font_provider=_FakeFontProvider(fonts))
+    font = manager.select_font_for_word('简', 'chi_sim')
+    assert font.font_path.name == 'NotoSansSC.ttf'
+
+
+def test_cjk_fails_over_when_preferred_subset_lacks_glyph():
+    """If the language's subset font lacks a glyph, another CJK family is used."""
+    fonts = {
+        # Simplified Chinese subset cannot render Japanese kana.
+        'NotoSansSC-Regular': _FakeFontManager('NotoSansSC.ttf', '中'),
+        'NotoSansJP-Regular': _FakeFontManager('NotoSansJP.ttf', '中こ'),
+    }
+    manager = MultiFontManager(font_provider=_FakeFontProvider(fonts))
+    # Tagged Simplified Chinese, but the text needs kana only JP covers.
+    font = manager.select_font_for_word('こ', 'chi_sim')
+    assert font.font_path.name == 'NotoSansJP.ttf'
+
+
+def test_cjk_falls_back_to_pan_cjk_super_font():
+    """When only the full-coverage pan-CJK font exists, it serves any CJK lang."""
+    fonts = {
+        'NotoSansCJK-Regular': _FakeFontManager('NotoSansCJK.ttc', '中こ안'),
+    }
+    manager = MultiFontManager(font_provider=_FakeFontProvider(fonts))
+    assert manager.select_font_for_word('こ', 'jpn').font_path.name == 'NotoSansCJK.ttc'
+
+
+def test_missing_cjk_font_warning_names_language_font(font_dir, caplog):
+    """The missing-font warning names the language-specific CJK family (#1652)."""
+    manager = MultiFontManager(font_provider=BuiltinFontProvider(font_dir))
+    with caplog.at_level(logging.WARNING):
+        manager.select_font_for_word("こんにちは", "jpn")
+    assert 'NotoSansJP' in caplog.text
+
+
+def test_missing_font_warning_explains_consequences(font_dir, caplog):
+    """The glyphless-fallback warning should be actionable, not cryptic (#1652).
+
+    With only builtin fonts available, Arabic text cannot be covered, so the
+    manager falls back to glyphless Occulta and must warn helpfully.
+    """
+    # Builtin-only provider: NotoSansArabic is never available, forcing fallback.
+    manager = MultiFontManager(font_provider=BuiltinFontProvider(font_dir))
+
+    with caplog.at_level(logging.WARNING):
+        manager.select_font_for_word("سلام", "fas")
+
+    msg = caplog.text
+    # Identifies the affected language and the font family to install.
+    assert 'fas' in msg
+    assert 'NotoSansArabic' in msg
+    # Explains the user-visible consequence so the message is not cryptic:
+    # the text stays searchable but renders blank when highlighted.
+    assert 'searchable' in msg.lower()
+    assert 'highlight' in msg.lower() or 'select' in msg.lower()
+
+
+# --- Coverage-driven last-resort font search (#1722) ---
+
+
+class _FakeProviderWithSearch(_FakeFontProvider):
+    """FontProvider that can also search unlisted fonts by glyph coverage."""
+
+    def __init__(self, fonts, searchable):
+        super().__init__(fonts)
+        self._searchable = searchable
+        self.search_calls: list[str] = []
+
+    def find_font_with_glyphs(self, text):
+        self.search_calls.append(text)
+        for name, font in self._searchable.items():
+            hb = font.get_hb_font()
+            if all(hb.get_nominal_glyph(ord(c)) for c in text):
+                self._fonts[name] = font  # discovered fonts become resolvable
+                return name, font
+        return None
+
+
+def test_unlisted_font_found_by_coverage_search():
+    """A script outside FALLBACK_FONTS is rendered if the font is installed."""
+    searchable = {'NotoSansCherokee-Regular': _FakeFontManager('Cherokee.ttf', 'ᏣᎳᎩ')}
+    provider = _FakeProviderWithSearch({}, searchable)
+    manager = MultiFontManager(font_provider=provider)
+
+    font = manager.select_font_for_word('ᏣᎳᎩ', None)
+
+    assert font.font_path.name == 'Cherokee.ttf'
+    assert provider.search_calls == ['ᏣᎳᎩ']
+
+
+def test_coverage_search_result_is_cached():
+    """The expensive coverage search runs once per distinct word."""
+    searchable = {'NotoSansCherokee-Regular': _FakeFontManager('Cherokee.ttf', 'ᏣᎳᎩ')}
+    provider = _FakeProviderWithSearch({}, searchable)
+    manager = MultiFontManager(font_provider=provider)
+
+    manager.select_font_for_word('ᏣᎳᎩ', None)
+    manager.select_font_for_word('ᏣᎳᎩ', None)
+
+    assert len(provider.search_calls) == 1
+
+
+def test_named_fonts_take_precedence_over_coverage_search():
+    """The coverage search is a last resort, not a substitute for named fonts."""
+    fonts = {'NotoSans-Regular': _FakeFontManager('NotoSans.ttf', 'abc')}
+    searchable = {'NotoSansMono-Regular': _FakeFontManager('NotoSansMono.ttf', 'abc')}
+    provider = _FakeProviderWithSearch(fonts, searchable)
+    manager = MultiFontManager(font_provider=provider)
+
+    font = manager.select_font_for_word('abc', None)
+
+    assert font.font_path.name == 'NotoSans.ttf'
+    assert provider.search_calls == []
+
+
+def test_provider_without_coverage_search_still_falls_back():
+    """Providers predating find_font_with_glyphs() keep working (duck-typed)."""
+    manager = MultiFontManager(font_provider=_FakeFontProvider({}))
+    font = manager.select_font_for_word('ᏣᎳᎩ', None)
+    assert font.font_path.name == 'Occulta.ttf'
+
+
+def test_missing_font_warning_names_the_missing_characters(font_dir, caplog):
+    """The warning must identify what could not be rendered (#1722).
+
+    The user's real question is "which font package do I install?" — naming the
+    offending codepoints and their Unicode names answers it even for scripts
+    OCRmyPDF has no language mapping for.
+    """
+    manager = MultiFontManager(font_provider=BuiltinFontProvider(font_dir))
+
+    with caplog.at_level(logging.WARNING):
+        manager.select_font_for_word('ᏣᎳᎩ', None)
+
+    msg = caplog.text
+    assert 'U+13E3' in msg  # CHEROKEE LETTER TSA
+    assert 'CHEROKEE' in msg.upper()
+
+
+def test_missing_character_warning_ignores_covered_characters(font_dir, caplog):
+    """Only the uncoverable characters are reported, not the whole word."""
+    manager = MultiFontManager(font_provider=BuiltinFontProvider(font_dir))
+
+    with caplog.at_level(logging.WARNING):
+        manager.select_font_for_word('aᏣb', None)
+
+    msg = caplog.text
+    assert 'U+13E3' in msg
+    assert 'U+0061' not in msg  # 'a' is covered by the builtin Latin font
+
+
+def test_mixed_script_word_warning_does_not_advise_installing_fonts(caplog):
+    """A word no single font covers is reported as such, not as a missing font.
+
+    Every character here has an installed font; telling the user to install
+    more would be wrong advice and is exactly the confusion behind #1722.
+    """
+    fonts = {'NotoSans-Regular': _FakeFontManager('NotoSans.ttf', 'ab')}
+    searchable = {'NotoSansCherokee-Regular': _FakeFontManager('Cherokee.ttf', 'Ꮳ')}
+    manager = MultiFontManager(font_provider=_FakeProviderWithSearch(fonts, searchable))
+
+    with caplog.at_level(logging.WARNING):
+        font = manager.select_font_for_word('aᏣb', None)
+
+    assert font.font_path.name == 'Occulta.ttf'
+    msg = caplog.text
+    assert 'mixing scripts' in msg
+    assert 'will not help' in msg
+    assert 'U+' not in msg  # no codepoints to blame; nothing to install

@@ -1,0 +1,124 @@
+% SPDX-FileCopyrightText: 2025 James R. Barlow
+% SPDX-License-Identifier: CC-BY-SA-4.0
+
+# Contributing guidelines
+
+Contributions are welcome!
+
+## Big changes
+
+Please open a new issue to discuss or propose a major change. Not only
+is it fun to discuss big ideas, but we might save each other\'s time
+too. Perhaps some of the work you\'re contemplating is already half-done
+in a development branch.
+
+## Code style
+
+We use `ruff` for code formatting.
+The settings for these programs are in `pyproject.toml`. Pull requests
+should follow the style guide. One difference we use from \"black\"
+style is that strings shown to the user are always in double quotes
+(`"`) and strings for internal uses are in single quotes (`'`).
+
+## Tests
+
+New features should come with tests that confirm their correctness.
+
+### Tesseract OCR cache
+
+Running Tesseract on every test would make the test suite far too slow, so
+the results of most Tesseract invocations are recorded in `tests/cache/`
+and replayed by the `tests/plugins/tesseract_cache.py` plugin. The cache is
+committed to the repository, so a contributor with a different (or no)
+Tesseract still gets the same OCR output.
+
+Entries live at
+`tests/cache/v<CACHE_VERSION>/<key>/<argv-slug>/{stdout,stderr,hocr,pdf,txt}.bin`.
+The key for a file in `tests/resources/` is its stem plus the first 8 hex
+digits of the SHA-256 of its contents; inputs generated during a test run
+are keyed by stem alone, because their bytes vary from run to run.
+`CACHE_INFO.json` records the Tesseract version that produced the tree and
+`manifest.jsonl` logs each entry as it is created. Neither is touched on a
+cache hit, so a normal test run leaves the working tree clean.
+
+There are three ways the cache can go stale, and only one of them needs
+your attention:
+
+- **A test resource changed.** Nothing to do. The digest in the cache key
+  changes with the file, so affected entries are regenerated automatically
+  and the old ones can be deleted. `tests/test_tesseract_cache.py` fails if
+  a digest-keyed folder no longer matches any resource, which is your cue
+  to delete the orphaned folder.
+- **OCRmyPDF changed the images it sends to Tesseract** (preprocessing,
+  rasterization, DPI selection, image optimization on the OCR path). The
+  cached answers now belong to different questions, and the cache would
+  silently replay them. Bump `CACHE_VERSION` in
+  `tests/plugins/tesseract_cache.py`, delete the old `tests/cache/v<N>/`
+  tree, and regenerate.
+- **Tesseract itself changed.** `pytest_sessionstart` in `tests/conftest.py`
+  compares the installed Tesseract's major.minor version against
+  `CACHE_INFO.json` and warns on a mismatch. Set
+  `OCRMYPDF_TEST_CACHE_STRICT=1` to turn that warning into an immediate
+  session abort, which is useful in CI. A mismatch is not automatically a
+  problem — it means the cache no longer reflects what your Tesseract would
+  produce, so regenerate before trusting or updating it.
+
+To regenerate the cache:
+
+```bash
+rm -rf tests/cache/v1  # or whatever the current CACHE_VERSION is
+pytest                 # with the reference Tesseract installed
+pytest tests/test_tesseract_cache.py  # integrity check must pass
+git add tests/cache
+git commit -m "Regenerate Tesseract cache (tesseract 5.5.1)"
+```
+
+Always name the Tesseract version in the commit message, and regenerate the
+whole tree with one Tesseract version rather than mixing versions.
+
+## New dependencies
+
+If you are proposing a change that will require a new dependency, we
+prefer dependencies that are already packaged by Debian or Red Hat. This
+makes life much easier for our downstream package maintainers. A package
+that is only available on PyPI or GitHub, and not more widely packaged,
+may not be accepted.
+
+We are unlikely to accept a dependency on CUDA or other GPU-based
+libraries, because these are still difficult to package and install on
+many systems. We recommend implementing these changes as plugins.
+
+Python dependencies must also be license-compatible. GPLv3 or AGPLv3 are
+likely incompatible with the project\'s license, but LGPLv3 is
+compatible.
+
+## New non-Python dependencies
+
+OCRmyPDF uses several external programs (Tesseract, Ghostscript and
+others) for its functionality. In general we prefer to avoid adding new
+external programs, and if we are to add external programs, we prefer
+those that are already packaged by Debian or Red Hat.
+
+## Plugins
+
+Some new features may be a good fit for a plugin. Plugins are a way to
+add features to OCRmyPDF without adding them to the core program.
+Plugins are installed separately from OCRmyPDF. They are written in
+Python and can be installed from PyPI. See the [plugin
+documentation](https://ocrmypdf.readthedocs.io/en/latest/plugins.html).
+
+We are happy to link users to your plugin from the documentation.
+
+## Style guide: Is it OCRmyPDF or ocrmypdf?
+
+The program/project is OCRmyPDF and the name of the executable or
+library is ocrmypdf.
+
+## Copyright and license
+
+For contributions over 10 lines of code, please add your name to list of
+copyright holders for that file. The core program is licensed under
+MPL-2.0, test files and documentation under CC-BY-SA 4.0, and
+miscellaneous files under MIT, with a few minor exceptions. Please
+contribute only content that you own or have the right to contribute
+under these licenses.

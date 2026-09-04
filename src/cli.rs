@@ -134,8 +134,7 @@ async fn run_analyze(
         .map(|p| p.conclusion.coord)
         .collect();
 
-    let mc = crate::engine::MonteCarloEngine::new(mc_iterations);
-    let probabilities = mc.simulate_with_deductions(&view, &known_mines, &known_safe);
+    let probabilities = crate::engine::ProbabilityEngine::compute(&view, &known_mines, &known_safe);
     let regions = crate::engine::RegionAnalyzer::analyze(&view, &probabilities);
 
     let ir = crate::model::InferenceIR {

@@ -1,0 +1,1512 @@
+# SPDX-FileCopyrightText: 2022 James R. Barlow
+# SPDX-License-Identifier: MPL-2.0
+
+from __future__ import annotations
+
+import logging
+import secrets
+import subprocess
+import sys
+import zlib
+from decimal import Decimal
+from io import BytesIO
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import pikepdf
+import pytest
+from packaging.version import Version
+from PIL import Image, UnidentifiedImageError
+
+from ocrmypdf import _validation as vd
+from ocrmypdf._exec import ghostscript
+from ocrmypdf._exec.ghostscript import (
+    GS_GENERATED_PDFA,
+    DuplicateFilter,
+    rasterize_pdf,
+)
+from ocrmypdf.builtin_plugins import ghostscript as gs_plugin
+from ocrmypdf.builtin_plugins.ghostscript import (
+    PdfaImageCompression,
+    _collect_dctdecode_images,
+    _repair_gs106_jpeg_corruption,
+    _resolve_auto_compression,
+)
+from ocrmypdf.cli import get_options_and_plugins
+from ocrmypdf.exceptions import (
+    ColorConversionNeededError,
+    ExitCode,
+    InputFileError,
+    MissingDependencyError,
+)
+from ocrmypdf.helpers import Resolution
+from ocrmypdf.pluginspec import GhostscriptRasterDevice
+
+from .conftest import check_ocrmypdf, run_ocrmypdf_api
+from .test_validation import make_opts_pm
+
+# pylint: disable=redefined-outer-name
+
+
+@pytest.fixture
+def francais(resources):
+    path = resources / 'francais.pdf'
+    return path, pikepdf.open(path)
+
+
+def test_rasterize_size(francais, outdir):
+    path, pdf = francais
+    page_size_pts = (pdf.pages[0].mediabox[2], pdf.pages[0].mediabox[3])
+    assert pdf.pages[0].mediabox[0] == pdf.pages[0].mediabox[1] == 0
+    page_size = (page_size_pts[0] / Decimal(72), page_size_pts[1] / Decimal(72))
+    target_size = Decimal('50.0'), Decimal('30.0')
+    forced_dpi = Resolution(42.0, 4242.0)
+
+    rasterize_pdf(
+        path,
+        outdir / 'out.png',
+        raster_device=GhostscriptRasterDevice.PNGMONO,
+        raster_dpi=Resolution(
+            target_size[0] / page_size[0], target_size[1] / page_size[1]
+        ),
+        page_dpi=forced_dpi,
+    )
+
+    with Image.open(outdir / 'out.png') as im:
+        assert im.size == target_size
+        assert im.info['dpi'] == forced_dpi
+
+
+def test_rasterize_rotated(francais, outdir, caplog):
+    path, pdf = francais
+    page_size_pts = (pdf.pages[0].mediabox[2], pdf.pages[0].mediabox[3])
+    assert pdf.pages[0].mediabox[0] == pdf.pages[0].mediabox[1] == 0
+    page_size = (page_size_pts[0] / Decimal(72), page_size_pts[1] / Decimal(72))
+    target_size = Decimal('50.0'), Decimal('30.0')
+    forced_dpi = Resolution(42.0, 4242.0)
+
+    caplog.set_level(logging.DEBUG)
+    rasterize_pdf(
+        path,
+        outdir / 'out.png',
+        raster_device=GhostscriptRasterDevice.PNGMONO,
+        raster_dpi=Resolution(
+            target_size[0] / page_size[0], target_size[1] / page_size[1]
+        ),
+        page_dpi=forced_dpi,
+        rotation=90,
+    )
+
+    with Image.open(outdir / 'out.png') as im:
+        assert im.size == (target_size[1], target_size[0])
+        assert im.info['dpi'] == forced_dpi.flip_axis()
+
+
+def test_rasterize_low_dpi(francais, outdir):
+    """Test that very low DPI values (below 10) produce correctly sized output.
+
+    Ghostscript may fail with DPI values below 10. The workaround renders at
+    a minimum of 10 DPI and resizes the output to match the expected dimensions.
+    """
+    path, pdf = francais
+    page_size_pts = (pdf.pages[0].mediabox[2], pdf.pages[0].mediabox[3])
+    assert pdf.pages[0].mediabox[0] == pdf.pages[0].mediabox[1] == 0
+    page_size = (float(page_size_pts[0]) / 72, float(page_size_pts[1]) / 72)
+
+    # Request a very small output (DPI below 10 on both axes)
+    target_size = (5, 3)
+    forced_dpi = Resolution(72.0, 72.0)
+
+    rasterize_pdf(
+        path,
+        outdir / 'out_low_dpi.png',
+        raster_device=GhostscriptRasterDevice.PNGMONO,
+        raster_dpi=Resolution(
+            target_size[0] / page_size[0], target_size[1] / page_size[1]
+        ),
+        page_dpi=forced_dpi,
+    )
+
+    with Image.open(outdir / 'out_low_dpi.png') as im:
+        assert im.size == target_size
+        assert im.info['dpi'] == forced_dpi
+
+
+def test_rasterize_low_dpi_one_axis(francais, outdir):
+    """Test low DPI on only one axis produces correctly sized output."""
+    path, pdf = francais
+    page_size_pts = (pdf.pages[0].mediabox[2], pdf.pages[0].mediabox[3])
+    assert pdf.pages[0].mediabox[0] == pdf.pages[0].mediabox[1] == 0
+    page_size = (float(page_size_pts[0]) / 72, float(page_size_pts[1]) / 72)
+
+    # Request low DPI on X axis only (below 10), normal on Y axis
+    target_size = (5, 50)
+    forced_dpi = Resolution(72.0, 72.0)
+
+    rasterize_pdf(
+        path,
+        outdir / 'out_low_dpi_x.png',
+        raster_device=GhostscriptRasterDevice.PNGMONO,
+        raster_dpi=Resolution(
+            target_size[0] / page_size[0], target_size[1] / page_size[1]
+        ),
+        page_dpi=forced_dpi,
+    )
+
+    with Image.open(outdir / 'out_low_dpi_x.png') as im:
+        assert im.size == target_size
+        assert im.info['dpi'] == forced_dpi
+
+
+def _capture_rasterize_args(resources, outdir, raster_device):
+    """Run rasterize_pdf with the gs subprocess mocked; return the gs argv."""
+    out = outdir / 'out.png'
+    captured = {}
+
+    def fake_run(args, **kwargs):
+        captured['args'] = list(args)
+        # Produce a valid PNG so rasterize_pdf's post-processing succeeds.
+        Image.new('RGB', (2, 2)).save(out)
+        return subprocess.CompletedProcess(args, returncode=0, stdout=b'', stderr=b'')
+
+    with patch('ocrmypdf._exec.ghostscript.run', side_effect=fake_run):
+        rasterize_pdf(
+            resources / 'francais.pdf',
+            out,
+            raster_device=raster_device,
+            raster_dpi=Resolution(150.0, 150.0),
+        )
+    return captured['args']
+
+
+@pytest.mark.parametrize(
+    'raster_device',
+    [
+        GhostscriptRasterDevice.PNGGRAY,
+        GhostscriptRasterDevice.PNG256,
+        GhostscriptRasterDevice.PNG16M,
+    ],
+)
+def test_rasterize_antialiases_contone_devices(resources, outdir, raster_device):
+    """Contone raster devices receive anti-aliasing flags to aid OCR.
+
+    Ghostscript 10.x renders aliased glyphs that OCR misreads as extra word
+    breaks; -dTextAlphaBits/-dGraphicsAlphaBits markedly improve accuracy,
+    especially for small fonts at moderate DPI (see issue #1439).
+    """
+    args = _capture_rasterize_args(resources, outdir, raster_device)
+    assert '-dTextAlphaBits=4' in args
+    assert '-dGraphicsAlphaBits=4' in args
+
+
+@pytest.mark.parametrize(
+    'raster_device',
+    [GhostscriptRasterDevice.PNGMONO, GhostscriptRasterDevice.PNGMONOD],
+)
+def test_rasterize_no_antialias_on_mono_devices(resources, outdir, raster_device):
+    """1-bit mono devices must not receive alpha-bit flags.
+
+    Older Ghostscript versions reject -dTextAlphaBits on 1-bit devices, and
+    pngmonod performs its own anti-aliased downscaling.
+    """
+    args = _capture_rasterize_args(resources, outdir, raster_device)
+    assert not any(a.startswith('-dTextAlphaBits') for a in args)
+    assert not any(a.startswith('-dGraphicsAlphaBits') for a in args)
+
+
+def test_generate_pdfa_default_jpeg_quality(outdir):
+    """When jpeg_quality is None, Ghostscript receives -dJPEGQ=95 (default)."""
+    with (
+        patch('ocrmypdf._exec.ghostscript.version', return_value=Version('10.05.1')),
+        patch('ocrmypdf._exec.ghostscript.run_polling_stderr') as run_mock,
+    ):
+        run_mock.return_value = subprocess.CompletedProcess(
+            ['gs'], returncode=0, stdout='', stderr=''
+        )
+        ghostscript.generate_pdfa(
+            pdf_pages=[outdir / 'input.pdf'],
+            output_file=outdir / 'out.pdf',
+            compression='auto',
+            color_conversion_strategy='LeaveColorUnchanged',
+        )
+
+    args = run_mock.call_args.args[0]
+    assert '-dJPEGQ=95' in args
+    # No downsample switches when jpeg_maxdpi is not set
+    assert not any(a.startswith('-dDownsampleColorImages') for a in args)
+    assert not any(a.startswith('-dColorImageResolution') for a in args)
+
+
+def test_generate_pdfa_uses_user_jpeg_quality(outdir):
+    with (
+        patch('ocrmypdf._exec.ghostscript.version', return_value=Version('10.05.1')),
+        patch('ocrmypdf._exec.ghostscript.run_polling_stderr') as run_mock,
+    ):
+        run_mock.return_value = subprocess.CompletedProcess(
+            ['gs'], returncode=0, stdout='', stderr=''
+        )
+        ghostscript.generate_pdfa(
+            pdf_pages=[outdir / 'input.pdf'],
+            output_file=outdir / 'out.pdf',
+            compression='jpeg',
+            color_conversion_strategy='RGB',
+            jpeg_quality=72,
+        )
+
+    args = run_mock.call_args.args[0]
+    assert '-dJPEGQ=72' in args
+    assert '-dJPEGQ=95' not in args
+
+
+def test_generate_pdfa_jpeg_quality_zero_is_max_compression(outdir):
+    """Explicit jpeg_quality=0 must reach Ghostscript as -dJPEGQ=0.
+
+    Ghostscript accepts 0 as a valid quality value (maximum compression);
+    it must not be silently replaced by the default 95.
+    """
+    with (
+        patch('ocrmypdf._exec.ghostscript.version', return_value=Version('10.05.1')),
+        patch('ocrmypdf._exec.ghostscript.run_polling_stderr') as run_mock,
+    ):
+        run_mock.return_value = subprocess.CompletedProcess(
+            ['gs'], returncode=0, stdout='', stderr=''
+        )
+        ghostscript.generate_pdfa(
+            pdf_pages=[outdir / 'input.pdf'],
+            output_file=outdir / 'out.pdf',
+            compression='jpeg',
+            color_conversion_strategy='RGB',
+            jpeg_quality=0,
+        )
+
+    args = run_mock.call_args.args[0]
+    assert '-dJPEGQ=0' in args
+    assert '-dJPEGQ=95' not in args
+
+
+def test_generate_pdfa_honors_jpeg_maxdpi(outdir):
+    with (
+        patch('ocrmypdf._exec.ghostscript.version', return_value=Version('10.05.1')),
+        patch('ocrmypdf._exec.ghostscript.run_polling_stderr') as run_mock,
+    ):
+        run_mock.return_value = subprocess.CompletedProcess(
+            ['gs'], returncode=0, stdout='', stderr=''
+        )
+        ghostscript.generate_pdfa(
+            pdf_pages=[outdir / 'input.pdf'],
+            output_file=outdir / 'out.pdf',
+            compression='auto',
+            color_conversion_strategy='LeaveColorUnchanged',
+            jpeg_maxdpi=300,
+        )
+
+    args = run_mock.call_args.args[0]
+    assert '-dJPEGQ=95' in args
+    assert '-dDownsampleColorImages=true' in args
+    assert '-dColorImageDownsampleThreshold=1.0' in args
+    assert '-dDownsampleGrayImages=true' in args
+    assert '-dGrayImageDownsampleThreshold=1.0' in args
+    assert '-dDownsampleMonoImages=true' in args
+    assert '-dMonoImageDownsampleThreshold=1.0' in args
+    assert '-dColorImageResolution=300' in args
+    assert '-dGrayImageResolution=300' in args
+    assert '-dMonoImageResolution=300' in args
+
+
+def test_ghostscript_jpeg_options_via_cli(resources, outpdf):
+    """End-to-end: CLI flags reach the ghostscript plugin namespace."""
+    with patch(
+        'ocrmypdf._exec.ghostscript.generate_pdfa',
+        wraps=ghostscript.generate_pdfa,
+    ) as gen_mock:
+        run_ocrmypdf_api(
+            resources / 'francais.pdf',
+            outpdf,
+            '--output-type',
+            'pdfa',
+            '--ghostscript-jpeg-quality',
+            '60',
+            '--ghostscript-jpeg-maxdpi',
+            '150',
+            '--plugin',
+            'tests/plugins/tesseract_noop.py',
+        )
+    assert gen_mock.called
+    call_kwargs = gen_mock.call_args.kwargs
+    assert call_kwargs['jpeg_quality'] == 60
+    assert call_kwargs['jpeg_maxdpi'] == 150
+
+
+def test_gs_render_failure(resources, outpdf, caplog):
+    exitcode = run_ocrmypdf_api(
+        resources / 'blank.pdf',
+        outpdf,
+        '--output-type',
+        'pdfa',  # Required to trigger Ghostscript PDF/A generation
+        '--plugin',
+        'tests/plugins/tesseract_noop.py',
+        '--plugin',
+        'tests/plugins/gs_render_failure.py',
+    )
+    assert 'TEST ERROR: gs_render_failure.py' in caplog.text
+    assert exitcode == ExitCode.child_process_error
+
+
+def test_gs_raster_failure(resources, outpdf, caplog):
+    exitcode = run_ocrmypdf_api(
+        resources / 'francais.pdf',
+        outpdf,
+        '--plugin',
+        'tests/plugins/tesseract_noop.py',
+        '--plugin',
+        'tests/plugins/gs_raster_failure.py',
+    )
+    assert 'TEST ERROR: gs_raster_failure.py' in caplog.text
+    assert exitcode == ExitCode.child_process_error
+
+
+def test_ghostscript_pdfa_failure(resources, outpdf, caplog):
+    exitcode = run_ocrmypdf_api(
+        resources / 'francais.pdf',
+        outpdf,
+        '--output-type',
+        'pdfa',  # Required to trigger Ghostscript PDF/A generation
+        '--plugin',
+        'tests/plugins/tesseract_noop.py',
+        '--plugin',
+        'tests/plugins/gs_pdfa_failure.py',
+    )
+    assert exitcode == ExitCode.pdfa_conversion_failed, (
+        "Unexpected return when PDF/A fails"
+    )
+
+
+def test_ghostscript_feature_elision(resources, outpdf):
+    check_ocrmypdf(
+        resources / 'francais.pdf',
+        outpdf,
+        '--plugin',
+        'tests/plugins/tesseract_noop.py',
+        '--plugin',
+        'tests/plugins/gs_feature_elision.py',
+    )
+
+
+def test_ghostscript_mandatory_color_conversion(resources, outpdf):
+    with pytest.raises(ColorConversionNeededError):
+        check_ocrmypdf(
+            resources / 'jbig2_baddevicen.pdf',
+            outpdf,
+            '--output-type',
+            'pdfa',  # Required to trigger Ghostscript PDF/A generation
+            '--plugin',
+            'tests/plugins/tesseract_noop.py',
+        )
+
+
+def _run_generate_pdfa_with_devicen_warning(outdir, color_conversion_strategy):
+    """Invoke generate_pdfa with Ghostscript mocked to emit the DeviceN warning.
+
+    Ghostscript emits this warning when it writes a DeviceN colorspace with an
+    inappropriate alternate, i.e. when it could not normalize the colorspace for
+    PDF/A. The output is then liable to render blank in viewers such as Adobe
+    Reader (see issue #1187), regardless of which conversion strategy was
+    requested.
+    """
+    (outdir / 'input.pdf').write_bytes(b'%PDF-1.5\n%fake\n')
+    with (
+        patch('ocrmypdf._exec.ghostscript.version', return_value=Version('10.05.1')),
+        patch('ocrmypdf._exec.ghostscript.run_polling_stderr') as run_mock,
+    ):
+        run_mock.return_value = subprocess.CompletedProcess(
+            ['gs'],
+            returncode=0,
+            stdout='',
+            stderr='Attempting to write a DeviceN space with an inappropriate '
+            'alternate, reverting to the alternate color space.',
+        )
+        ghostscript.generate_pdfa(
+            pdf_pages=[outdir / 'input.pdf'],
+            output_file=outdir / 'out.pdf',
+            compression='auto',
+            color_conversion_strategy=color_conversion_strategy,
+        )
+
+
+def test_devicen_warning_default_strategy_raises_with_guidance(outdir):
+    """Default (no conversion): raise and tell the user to pick a strategy."""
+    with pytest.raises(ColorConversionNeededError) as exc_info:
+        _run_generate_pdfa_with_devicen_warning(outdir, 'LeaveColorUnchanged')
+    message = str(exc_info.value)
+    assert '--color-conversion-strategy' in message
+    assert 'RGB' in message
+
+
+@pytest.mark.parametrize(
+    'strategy',
+    [
+        # A strategy that genuinely cannot fix the colorspace; confirmed in #1187.
+        'UseDeviceIndependentColor',
+        # A normally-effective strategy that nonetheless failed on this input:
+        # if Ghostscript still warns, the output is still broken and we must not
+        # silently pass it through (the behaviour PR #1692 would have introduced).
+        'RGB',
+    ],
+)
+def test_devicen_warning_persists_despite_strategy_still_raises(outdir, strategy):
+    """If the warning survives the requested conversion, the output is broken.
+
+    We must still raise rather than silently emit a PDF/A that may render blank.
+    The guidance should acknowledge that the chosen strategy did not work and
+    point at strategies that do (or --output-type pdf).
+    """
+    with pytest.raises(ColorConversionNeededError) as exc_info:
+        _run_generate_pdfa_with_devicen_warning(outdir, strategy)
+    message = str(exc_info.value)
+    assert strategy in message
+    assert '--output-type pdf' in message
+
+
+def test_no_devicen_warning_does_not_raise(outdir):
+    """When Ghostscript does not warn, conversion succeeded; never raise."""
+    (outdir / 'input.pdf').write_bytes(b'%PDF-1.5\n%fake\n')
+    with (
+        patch('ocrmypdf._exec.ghostscript.version', return_value=Version('10.05.1')),
+        patch('ocrmypdf._exec.ghostscript.run_polling_stderr') as run_mock,
+    ):
+        run_mock.return_value = subprocess.CompletedProcess(
+            ['gs'], returncode=0, stdout='', stderr=''
+        )
+        # Must not raise for any strategy when there is no DeviceN warning.
+        ghostscript.generate_pdfa(
+            pdf_pages=[outdir / 'input.pdf'],
+            output_file=outdir / 'out.pdf',
+            compression='auto',
+            color_conversion_strategy='RGB',
+        )
+
+
+def test_rasterize_pdf_errors(resources, no_outpdf, caplog):
+    with patch('ocrmypdf._exec.ghostscript.run') as mock:
+        # ghostscript can produce empty files with return code 0
+        mock.return_value = subprocess.CompletedProcess(
+            ['fakegs'], returncode=0, stdout=b'', stderr=b'error this is an error'
+        )
+        with pytest.raises(UnidentifiedImageError):
+            rasterize_pdf(
+                resources / 'francais.pdf',
+                no_outpdf,
+                raster_device=GhostscriptRasterDevice.PNGMONO,
+                raster_dpi=Resolution(100, 100),
+            )
+        assert "this is an error" in caplog.text
+        assert "invalid page image file" in caplog.text
+
+
+class TestDuplicateFilter:
+    @pytest.fixture(scope='function')
+    def duplicate_filter_logger(self):
+        # token_urlsafe: ensure the logger has a unique name so tests are isolated
+        logger = logging.getLogger(__name__ + secrets.token_urlsafe(8))
+        logger.setLevel(logging.DEBUG)
+        logger.addFilter(DuplicateFilter(logger))
+        return logger
+
+    @pytest.mark.xfail(
+        (3, 13, 3) <= sys.version_info[:3] <= (3, 13, 5),
+        reason="https://github.com/python/cpython/pull/135858",
+    )
+    def test_filter_duplicate_messages(self, duplicate_filter_logger, caplog):
+        log = duplicate_filter_logger
+        log.error("test error message")
+        log.error("test error message")
+        log.error("test error message")
+        log.error("another error message")
+        log.error("another error message")
+        log.error("yet another error message")
+
+        assert len(caplog.records) == 5
+        assert caplog.records[0].msg == "test error message"
+        assert caplog.records[1].msg == "(suppressed 2 repeated lines)"
+        assert caplog.records[2].msg == "another error message"
+        assert caplog.records[3].msg == "(suppressed 1 repeated lines)"
+        assert caplog.records[4].msg == "yet another error message"
+
+    def test_filter_does_not_affect_unique_messages(
+        self, duplicate_filter_logger, caplog
+    ):
+        log = duplicate_filter_logger
+        log.error("test error message")
+        log.error("another error message")
+        log.error("yet another error message")
+
+        assert len(caplog.records) == 3
+        assert caplog.records[0].msg == "test error message"
+        assert caplog.records[1].msg == "another error message"
+        assert caplog.records[2].msg == "yet another error message"
+
+    @pytest.mark.xfail(
+        (3, 13, 3) <= sys.version_info[:3] <= (3, 13, 5),
+        reason="https://github.com/python/cpython/pull/135858",
+    )
+    def test_filter_alt_messages(self, duplicate_filter_logger, caplog):
+        log = duplicate_filter_logger
+        log.error("test error message")
+        log.error("another error message")
+        log.error("test error message")
+        log.error("another error message")
+        log.error("test error message")
+        log.error("test error message")
+        log.error("another error message")
+        log.error("yet another error message")
+
+        assert len(caplog.records) == 4
+        assert caplog.records[0].msg == "test error message"
+        assert caplog.records[1].msg == "another error message"
+        assert caplog.records[2].msg == "(suppressed 5 repeated lines)"
+        assert caplog.records[3].msg == "yet another error message"
+
+
+@pytest.fixture
+def pdf_with_invalid_image(outdir):
+    # issue 1451
+    Name = pikepdf.Name
+    pdf = pikepdf.new()
+    pdf.add_blank_page()
+    pdf.pages[0].Contents = pdf.make_stream(b'612 0 0 612 0 0 cm /Image Do')
+    # Create an invalid image object that has both ColorSpace and ImageMask set
+    pdf.pages[0].Resources = pikepdf.Dictionary(
+        XObject=pdf.make_indirect(
+            pikepdf.Dictionary(
+                Image=pdf.make_stream(
+                    b"\xf0\x0f" * 8,
+                    ColorSpace=Name.DeviceGray,
+                    BitsPerComponent=1,
+                    Width=8,
+                    Height=8,
+                    ImageMask=True,
+                    Subtype=Name.Image,
+                    Type=Name.XObject,
+                )
+            )
+        )
+    )
+    pdf.save(outdir / 'invalid_image.pdf')
+    pdf.save('invalid_image.pdf')
+    return outdir / 'invalid_image.pdf'
+
+
+@pytest.mark.xfail(
+    ghostscript.version() < Version('10.04.0'),
+    reason="Older Ghostscript behavior is different",
+)
+def test_recoverable_image_error(pdf_with_invalid_image, outdir, caplog):
+    # When stop_on_error is False, we expect Ghostscript to print an error
+    # but continue
+    rasterize_pdf(
+        outdir / 'invalid_image.pdf',
+        outdir / 'out.png',
+        raster_device=GhostscriptRasterDevice.PNGMONO,
+        raster_dpi=Resolution(10, 10),
+        stop_on_error=False,
+    )
+    assert 'Image has both ImageMask and ColorSpace' in caplog.text
+
+
+@pytest.mark.xfail(
+    ghostscript.version() < Version('10.04.0'),
+    reason="Older Ghostscript behavior is different",
+)
+def test_recoverable_image_error_with_stop(pdf_with_invalid_image, outdir, caplog):
+    # When stop_on_error is True, Ghostscript will print an error and exit
+    # but still produce a viable image. We intercept this case and raise
+    # InputFileError because it will contain an image of the whole page minus
+    # the image we are rendering.
+    with pytest.raises(
+        InputFileError, match="Try using --continue-on-soft-render-error"
+    ):
+        rasterize_pdf(
+            outdir / 'invalid_image.pdf',
+            outdir / 'out.png',
+            raster_device=GhostscriptRasterDevice.PNGMONO,
+            raster_dpi=Resolution(100, 100),
+            stop_on_error=True,
+        )
+    # out2.png will not be created; if it were it would be blank.
+
+
+class TestGs106JpegCorruptionRepair:
+    """Test the Ghostscript 10.6 JPEG corruption repair function."""
+
+    @pytest.fixture
+    def create_damaged_pdf(self, resources, outdir):
+        """Create a damaged PDF by truncating JPEG data by 2 bytes."""
+
+        def _create_damaged(source_pdf_name='francais.pdf', truncate_bytes=2):
+            source_path = resources / source_pdf_name
+            damaged_path = outdir / 'damaged.pdf'
+
+            with pikepdf.open(source_path) as pdf:
+                # Find and truncate DCTDecode images
+                Name = pikepdf.Name
+                damaged_count = 0
+                for page in pdf.pages:
+                    if Name.Resources not in page:
+                        continue
+                    resources_dict = page[Name.Resources]
+                    if Name.XObject not in resources_dict:
+                        continue
+                    for key in resources_dict[Name.XObject].keys():
+                        obj = resources_dict[Name.XObject][key]
+                        if obj.get(Name.Subtype) != Name.Image:
+                            continue
+                        if obj.get(Name.Filter) != Name.DCTDecode:
+                            continue
+                        # Truncate the JPEG data
+                        original_bytes = obj.read_raw_bytes()
+                        truncated_bytes = original_bytes[:-truncate_bytes]
+                        obj.write(truncated_bytes, filter=Name.DCTDecode)
+                        damaged_count += 1
+
+                pdf.save(damaged_path)
+                return source_path, damaged_path, damaged_count
+
+        return _create_damaged
+
+    def test_repair_truncated_jpeg(self, create_damaged_pdf, caplog):
+        """Test that truncated JPEG images are repaired."""
+        caplog.set_level(logging.DEBUG)
+        source_path, damaged_path, damaged_count = create_damaged_pdf()
+
+        assert damaged_count > 0, "Test PDF should have DCTDecode images"
+
+        # Get original image bytes for comparison
+        with pikepdf.open(source_path) as pdf:
+            Name = pikepdf.Name
+            original_bytes_list = []
+            for page in pdf.pages:
+                if Name.Resources not in page:
+                    continue
+                resources_dict = page[Name.Resources]
+                if Name.XObject not in resources_dict:
+                    continue
+                for key in resources_dict[Name.XObject].keys():
+                    obj = resources_dict[Name.XObject][key]
+                    if obj.get(Name.Subtype) != Name.Image:
+                        continue
+                    if obj.get(Name.Filter) != Name.DCTDecode:
+                        continue
+                    original_bytes_list.append(obj.read_raw_bytes())
+
+        # Run the repair function
+        repaired = _repair_gs106_jpeg_corruption(source_path, damaged_path)
+        assert repaired is True, "Repair should have been performed"
+
+        # Verify the repaired PDF has correct image bytes
+        with pikepdf.open(damaged_path) as pdf:
+            Name = pikepdf.Name
+            repaired_bytes_list = []
+            for page in pdf.pages:
+                if Name.Resources not in page:
+                    continue
+                resources_dict = page[Name.Resources]
+                if Name.XObject not in resources_dict:
+                    continue
+                for key in resources_dict[Name.XObject].keys():
+                    obj = resources_dict[Name.XObject][key]
+                    if obj.get(Name.Subtype) != Name.Image:
+                        continue
+                    if obj.get(Name.Filter) != Name.DCTDecode:
+                        continue
+                    repaired_bytes_list.append(obj.read_raw_bytes())
+
+        assert len(repaired_bytes_list) == len(original_bytes_list)
+        for orig, repaired_bytes in zip(
+            original_bytes_list, repaired_bytes_list, strict=False
+        ):
+            assert orig == repaired_bytes, "Repaired bytes should match original"
+
+        # Check that error/warning was logged
+        assert "JPEG corruption detected" in caplog.text
+
+    def test_no_repair_when_not_truncated(self, resources, outdir, caplog):
+        """Test that no repair is done when images are not truncated."""
+        caplog.set_level(logging.DEBUG)
+        source_path = resources / 'francais.pdf'
+
+        # Copy source to output (no damage)
+        output_path = outdir / 'undamaged.pdf'
+        with pikepdf.open(source_path) as pdf:
+            pdf.save(output_path)
+
+        # Run the repair function - should not repair anything
+        repaired = _repair_gs106_jpeg_corruption(source_path, output_path)
+        assert repaired is False, "No repair should have been performed"
+        assert "JPEG corruption detected" not in caplog.text
+
+    def test_no_repair_when_truncation_too_large(self, create_damaged_pdf, caplog):
+        """Test that images truncated by more than 15 bytes are not repaired."""
+        caplog.set_level(logging.DEBUG)
+        source_path, damaged_path, _ = create_damaged_pdf(truncate_bytes=20)
+
+        repaired = _repair_gs106_jpeg_corruption(source_path, damaged_path)
+        assert repaired is False, "Should not repair truncation > 15 bytes"
+        assert "JPEG corruption detected" not in caplog.text
+
+
+def _dctdecode_streams(pdf_path) -> list[bytes]:
+    """Return the raw JPEG bytes of every DCTDecode image in a PDF.
+
+    Ghostscript and the optimizer may wrap a JPEG in Flate, so undo that first to
+    compare the JPEG payloads themselves. Ghostscript releases before 10.6
+    (observed in 9.55 through 10.02) append a redundant EOI marker to JPEG
+    passthrough data; decoders stop at the first EOI, so strip the harmless
+    duplicates before comparing.
+    """
+    jpegs = []
+    with pikepdf.open(pdf_path) as pdf:
+        for obj in pdf.objects:
+            if not isinstance(obj, pikepdf.Stream):
+                continue
+            if obj.stream_dict.get(pikepdf.Name.Subtype) != pikepdf.Name.Image:
+                continue
+            filters = obj.stream_dict.get(pikepdf.Name.Filter)
+            if isinstance(filters, pikepdf.Name):
+                filters = [filters]
+            filters = list(filters or [])
+            if pikepdf.Name.DCTDecode not in filters:
+                continue
+            data = obj.read_raw_bytes()
+            if filters[0] == pikepdf.Name.FlateDecode:
+                data = zlib.decompress(data)
+            while data.endswith(b'\xff\xd9\xff\xd9'):
+                data = data[:-2]
+            jpegs.append(data)
+    return jpegs
+
+
+class TestJpegTruncationBugVersions:
+    """The JPEG passthrough truncation bug is confined to Ghostscript 10.6.x.
+
+    Ghostscript bug 708956, fixed by ghostpdl commit eaada7d1 (2025-12-05) and
+    released in 10.07.0. Before this range was bounded above, every Ghostscript
+    from 10.6.0 onward triggered the mitigations, so 10.7+ users silently paid a
+    lossy JPEG re-encode for a bug their Ghostscript did not have (#1726).
+    """
+
+    @pytest.mark.parametrize(
+        ('gs_version', 'affected'),
+        [
+            ('10.5.1', False),
+            ('10.6.0', True),
+            ('10.6.1', True),
+            ('10.7.0', False),
+            ('10.7.1', False),
+            ('10.8.0', False),
+        ],
+    )
+    def test_version_range(self, gs_version, affected):
+        assert ghostscript.jpeg_truncation_bug(Version(gs_version)) is affected
+
+    @pytest.mark.parametrize(
+        ('gs_version', 'warns'),
+        [('10.5.1', False), ('10.6.0', True), ('10.7.1', False)],
+    )
+    def test_warning_only_for_affected_versions(self, gs_version, warns, caplog):
+        caplog.set_level(logging.WARNING)
+        opts, pm = make_opts_pm(output_type='pdfa')
+        with patch.object(ghostscript, 'version', return_value=Version(gs_version)):
+            vd.check_options(opts, pm)
+        assert ("contains JPEG encoding errors" in caplog.text) is warns
+
+    def test_installed_ghostscript_agrees_with_version_range(self, resources, outdir):
+        """Measure the installed Ghostscript instead of trusting the version range.
+
+        The bug was never covered by a test against real Ghostscript output - the
+        repair tests above feed artificially truncated PDFs to the repair function
+        - so nothing noticed when upstream fixed it. This asserts that whichever
+        Ghostscript is installed behaves the way jpeg_truncation_bug() claims.
+        """
+        source = resources / 'francais.pdf'
+        output = outdir / 'passthrough.pdf'
+        ghostscript.generate_pdfa(
+            pdf_pages=[source],
+            output_file=output,
+            compression='lossless',  # implies -dPassThroughJPEGImages=true
+            color_conversion_strategy='LeaveColorUnchanged',
+        )
+
+        before = _dctdecode_streams(source)
+        after = _dctdecode_streams(output)
+        assert before, "test fixture should contain JPEG images"
+        assert len(after) == len(before)
+
+        truncated = [
+            len(orig) - len(new)
+            for orig, new in zip(before, after, strict=True)
+            if new != orig and new == orig[: len(new)]
+        ]
+        if ghostscript.jpeg_truncation_bug():
+            assert truncated, (
+                f"Ghostscript {ghostscript.version()} is inside the affected range "
+                "but did not truncate JPEG passthrough data. If upstream fixed the "
+                "bug, narrow GS_JPEG_TRUNCATION_FIXED."
+            )
+        else:
+            assert after == before, (
+                f"Ghostscript {ghostscript.version()} damaged JPEG passthrough data "
+                f"(truncations: {truncated}) but is outside the affected range. "
+                "Widen the range in ocrmypdf._exec.ghostscript."
+            )
+
+
+@pytest.mark.parametrize(
+    ('compression', 'optimize', 'expected'),
+    [
+        # auto coerces to lossless only at -O0; -O1 is a historical exception
+        # that keeps Ghostscript's (possibly lossy) heuristic, as do -O2/-O3
+        (PdfaImageCompression.AUTO, 0, PdfaImageCompression.LOSSLESS),
+        (PdfaImageCompression.AUTO, 1, PdfaImageCompression.AUTO),
+        (PdfaImageCompression.AUTO, 2, PdfaImageCompression.AUTO),
+        (PdfaImageCompression.AUTO, 3, PdfaImageCompression.AUTO),
+        # explicit choices are always respected, regardless of optimize level
+        (PdfaImageCompression.JPEG, 0, PdfaImageCompression.JPEG),
+        (PdfaImageCompression.JPEG, 1, PdfaImageCompression.JPEG),
+        (PdfaImageCompression.LOSSLESS, 1, PdfaImageCompression.LOSSLESS),
+        (PdfaImageCompression.LOSSLESS, 3, PdfaImageCompression.LOSSLESS),
+    ],
+)
+def test_resolve_auto_compression(compression, optimize, expected):
+    assert _resolve_auto_compression(compression, optimize) == expected
+
+
+def _capture_generate_pdfa_args(tmp_path, compression):
+    """Run generate_pdfa with a mocked Ghostscript and return the argv it built."""
+    from subprocess import CompletedProcess
+
+    captured = {}
+
+    def fake_run(args, **kwargs):
+        captured['args'] = list(args)
+        return CompletedProcess(args, 0, None, stderr='')
+
+    out = tmp_path / 'out.pdf'
+    with patch('ocrmypdf._exec.ghostscript.run_polling_stderr', side_effect=fake_run):
+        ghostscript.generate_pdfa(
+            pdf_pages=['dummy.pdf'],
+            output_file=out,
+            compression=compression,
+            color_conversion_strategy='RGB',
+        )
+    return captured['args']
+
+
+def test_lossless_compression_passes_through_jpegs(tmp_path):
+    # Re-encoding an existing JPEG losslessly only bloats it (the lossy data is
+    # already baked in), so lossless mode must let Ghostscript pass JPEGs through
+    # untouched while still keeping lossless images lossless.
+    args = _capture_generate_pdfa_args(tmp_path, 'lossless')
+    assert '-dPassThroughJPEGImages=true' in args
+    assert '-dColorImageFilter=/FlateEncode' in args
+
+
+def test_jpeg_compression_does_not_force_passthrough(tmp_path):
+    args = _capture_generate_pdfa_args(tmp_path, 'jpeg')
+    assert '-dPassThroughJPEGImages=true' not in args
+
+
+def _gs_plugin_opts(*args):
+    """Build options with the Ghostscript plugin's own option group populated."""
+    options, _pm = get_options_and_plugins([*args, 'a.pdf', 'b.pdf'])
+    return options
+
+
+class TestGhostscriptPluginCheckOptions:
+    """Version gating and option consistency checks for the Ghostscript plugin."""
+
+    def test_blacklisted_version_is_rejected(self):
+        with (
+            patch.object(ghostscript, 'version', return_value=Version('10.03.0')),
+            patch.object(
+                gs_plugin, 'BLACKLISTED_GS_VERSIONS', frozenset({Version('10.03.0')})
+            ),
+            pytest.raises(MissingDependencyError, match='serious regressions'),
+        ):
+            gs_plugin.check_options(_gs_plugin_opts('--output-type', 'pdfa'))
+
+    @pytest.mark.parametrize('mode', ['skip', 'redo'])
+    @pytest.mark.parametrize('gs_version', ['10.0.0', '10.01.2', '10.02.0'])
+    def test_text_corrupting_versions_rejected_for_text_preserving_modes(
+        self, mode, gs_version
+    ):
+        with (
+            patch.object(ghostscript, 'version', return_value=Version(gs_version)),
+            pytest.raises(MissingDependencyError, match='--skip-text or --redo-ocr'),
+        ):
+            gs_plugin.check_options(
+                _gs_plugin_opts('--output-type', 'pdfa', '--mode', mode)
+            )
+
+    @pytest.mark.parametrize('mode', ['force', 'default'])
+    def test_text_corrupting_versions_allowed_for_other_modes(self, mode):
+        """Modes that discard existing text are unaffected by the regression."""
+        with patch.object(ghostscript, 'version', return_value=Version('10.01.2')):
+            gs_plugin.check_options(
+                _gs_plugin_opts('--output-type', 'pdfa', '--mode', mode)
+            )
+
+    @pytest.mark.parametrize('gs_version', ['9.55', '10.02.1', '10.05.1'])
+    def test_unaffected_versions_accepted_in_skip_mode(self, gs_version):
+        with patch.object(ghostscript, 'version', return_value=Version(gs_version)):
+            gs_plugin.check_options(
+                _gs_plugin_opts('--output-type', 'pdfa', '--mode', 'skip')
+            )
+
+    def test_too_old_version_is_rejected(self):
+        with (
+            patch.object(ghostscript, 'version', return_value=Version('9.20')),
+            pytest.raises(MissingDependencyError, match='gs'),
+        ):
+            gs_plugin.check_options(_gs_plugin_opts('--output-type', 'pdfa'))
+
+    def test_pdfa_is_normalized_to_pdfa_2(self):
+        options = _gs_plugin_opts('--output-type', 'pdfa')
+        with patch.object(ghostscript, 'version', return_value=Version('10.05.1')):
+            gs_plugin.check_options(options)
+        assert options.output_type == 'pdfa-2'
+
+    @pytest.mark.parametrize('output_type', ['pdfa-1', 'pdfa-2', 'pdfa-3'])
+    def test_explicit_pdfa_part_is_preserved(self, output_type):
+        options = _gs_plugin_opts('--output-type', output_type)
+        with patch.object(ghostscript, 'version', return_value=Version('10.05.1')):
+            gs_plugin.check_options(options)
+        assert options.output_type == output_type
+
+    def test_ghostscript_not_required_for_pdf_output(self):
+        """--output-type pdf bypasses Ghostscript, so do not check its version."""
+        options = _gs_plugin_opts('--output-type', 'pdf')
+        with patch.object(
+            ghostscript, 'version', side_effect=FileNotFoundError('gs')
+        ) as version_mock:
+            gs_plugin.check_options(options)
+        assert not version_mock.called
+
+    def test_invalid_color_conversion_strategy(self):
+        options = _gs_plugin_opts('--output-type', 'pdf')
+        options.ghostscript.color_conversion_strategy = 'Sepia'
+        with pytest.raises(ValueError, match='Invalid color conversion strategy'):
+            gs_plugin.check_options(options)
+
+    @pytest.mark.parametrize(
+        'strategy', sorted(ghostscript.COLOR_CONVERSION_STRATEGIES)
+    )
+    def test_valid_color_conversion_strategies(self, strategy):
+        options = _gs_plugin_opts('--color-conversion-strategy', strategy)
+        options.output_type = 'pdf'
+        gs_plugin.check_options(options)
+
+    @pytest.mark.parametrize('compression', ['jpeg', 'lossless'])
+    def test_image_compression_warns_for_non_pdfa_output(self, caplog, compression):
+        caplog.set_level(logging.WARNING)
+        options = _gs_plugin_opts(
+            '--output-type', 'pdf', '--pdfa-image-compression', compression
+        )
+        gs_plugin.check_options(options)
+        assert '--pdfa-image-compression argument only applies' in caplog.text
+
+    @pytest.mark.parametrize('output_type', ['auto', 'pdfa', 'pdfa-3'])
+    def test_image_compression_silent_for_pdfa_output(self, caplog, output_type):
+        caplog.set_level(logging.WARNING)
+        options = _gs_plugin_opts(
+            '--output-type', output_type, '--pdfa-image-compression', 'jpeg'
+        )
+        with patch.object(ghostscript, 'version', return_value=Version('10.05.1')):
+            gs_plugin.check_options(options)
+        assert '--pdfa-image-compression argument only applies' not in caplog.text
+
+    def test_auto_compression_never_warns(self, caplog):
+        caplog.set_level(logging.WARNING)
+        gs_plugin.check_options(_gs_plugin_opts('--output-type', 'pdf'))
+        assert '--pdfa-image-compression' not in caplog.text
+
+
+def test_ghostscript_rasterizer_defers_to_pypdfium(resources, outdir):
+    """The Ghostscript hook opts out when the user asked for pypdfium."""
+    out = outdir / 'out.png'
+    result = gs_plugin.rasterize_pdf_page(
+        input_file=resources / 'trivial.pdf',
+        output_file=out,
+        raster_device=GhostscriptRasterDevice.PNGMONO,
+        raster_dpi=Resolution(72.0, 72.0),
+        pageno=1,
+        page_dpi=None,
+        rotation=None,
+        filter_vector=False,
+        stop_on_soft_error=True,
+        options=_gs_plugin_opts('--rasterizer', 'pypdfium'),
+        use_cropbox=False,
+    )
+    assert result is None
+    assert not out.exists()
+
+
+def test_ghostscript_rasterizer_renders_page(resources, outdir):
+    """With no rasterizer preference, the Ghostscript hook does the work."""
+    out = outdir / 'out.png'
+    result = gs_plugin.rasterize_pdf_page(
+        input_file=resources / 'francais.pdf',
+        output_file=out,
+        raster_device=GhostscriptRasterDevice.PNGGRAY,
+        raster_dpi=Resolution(20.0, 20.0),
+        pageno=1,
+        page_dpi=Resolution(20.0, 20.0),
+        rotation=None,
+        filter_vector=False,
+        stop_on_soft_error=True,
+        options=_gs_plugin_opts('--rasterizer', 'auto'),
+        use_cropbox=False,
+    )
+    assert result == out
+    with Image.open(out) as im:
+        assert im.mode == 'L'
+
+
+def test_generate_pdfa_disables_newpdf_on_ghostscript_9_56_0(outdir):
+    """Ghostscript 9.56.0's new PDF interpreter breaks OCR (gs bug 705187)."""
+    with (
+        patch('ocrmypdf._exec.ghostscript.version', return_value=Version('9.56.0')),
+        patch('ocrmypdf._exec.ghostscript.run_polling_stderr') as run_mock,
+    ):
+        run_mock.return_value = subprocess.CompletedProcess(
+            ['gs'], returncode=0, stdout='', stderr=''
+        )
+        ghostscript.generate_pdfa(
+            pdf_pages=[outdir / 'input.pdf'],
+            output_file=outdir / 'out.pdf',
+            compression='auto',
+            color_conversion_strategy='LeaveColorUnchanged',
+        )
+    assert '-dNEWPDF=false' in run_mock.call_args.args[0]
+
+
+def test_generate_pdfa_keeps_newpdf_on_other_versions(outdir):
+    with (
+        patch('ocrmypdf._exec.ghostscript.version', return_value=Version('9.56.1')),
+        patch('ocrmypdf._exec.ghostscript.run_polling_stderr') as run_mock,
+    ):
+        run_mock.return_value = subprocess.CompletedProcess(
+            ['gs'], returncode=0, stdout='', stderr=''
+        )
+        ghostscript.generate_pdfa(
+            pdf_pages=[outdir / 'input.pdf'],
+            output_file=outdir / 'out.pdf',
+            compression='auto',
+            color_conversion_strategy='LeaveColorUnchanged',
+        )
+    assert '-dNEWPDF=false' not in run_mock.call_args.args[0]
+
+
+def make_jpeg(size=(8, 8), color=(255, 0, 0)) -> bytes:
+    bio = BytesIO()
+    Image.new('RGB', size, color).save(bio, format='JPEG')
+    return bio.getvalue()
+
+
+def make_image_stream(pdf, data=None, *, width=8, height=8, **kwargs):
+    kwargs.setdefault('ColorSpace', pikepdf.Name.DeviceRGB)
+    kwargs.setdefault('Filter', pikepdf.Name.DCTDecode)
+    return pdf.make_stream(
+        make_jpeg() if data is None else data,
+        Type=pikepdf.Name.XObject,
+        Subtype=pikepdf.Name.Image,
+        Width=width,
+        Height=height,
+        BitsPerComponent=8,
+        **kwargs,
+    )
+
+
+def make_form_xobject(pdf, xobjects=None):
+    kwargs = {}
+    if xobjects is not None:
+        kwargs['Resources'] = pikepdf.Dictionary(XObject=pikepdf.Dictionary(**xobjects))
+    return pdf.make_stream(
+        b'', Type=pikepdf.Name.XObject, Subtype=pikepdf.Name.Form, **kwargs
+    )
+
+
+def make_pdf(page_dict_kwargs=None):
+    """Make a one page PDF; page_dict_kwargs replaces the page dictionary body."""
+    pdf = pikepdf.new()
+    page = pikepdf.Page(
+        pdf.make_indirect(
+            pikepdf.Dictionary(
+                Type=pikepdf.Name.Page,
+                MediaBox=[0, 0, 100, 100],
+                Contents=pdf.make_stream(b''),
+                **(page_dict_kwargs or {}),
+            )
+        )
+    )
+    pdf.pages.append(page)
+    return pdf
+
+
+def make_pdf_with_xobjects(**xobjects):
+    pdf = make_pdf()
+    pdf.pages[0].Resources = pikepdf.Dictionary(XObject=pikepdf.Dictionary(**xobjects))
+    return pdf
+
+
+class TestCollectDctdecodeImages:
+    """The JPEG index built for the Ghostscript 10.6 corruption repair."""
+
+    def test_image_on_page(self):
+        jpeg = make_jpeg()
+        pdf = make_pdf_with_xobjects(Im0=None)
+        pdf.pages[0].Resources.XObject.Im0 = make_image_stream(pdf, jpeg)
+
+        images = _collect_dctdecode_images(pdf)
+        assert list(images) == [(8, 8, '/DCTDecode', 8, '/DeviceRGB')]
+        ((_stream, raw_bytes),) = images[(8, 8, '/DCTDecode', 8, '/DeviceRGB')]
+        assert raw_bytes == jpeg
+
+    def test_image_inside_nested_form_xobjects(self):
+        pdf = make_pdf()
+        image = make_image_stream(pdf)
+        inner = make_form_xobject(pdf, {'Im0': image})
+        outer = make_form_xobject(pdf, {'Fm1': inner})
+        pdf.pages[0].Resources = pikepdf.Dictionary(
+            XObject=pikepdf.Dictionary(Fm0=outer)
+        )
+        images = _collect_dctdecode_images(pdf)
+        assert len(images) == 1
+        assert next(iter(images.values()))[0][1] == image.read_raw_bytes()
+
+    def test_form_without_resources_is_skipped(self):
+        pdf = make_pdf_with_xobjects(Fm0=None)
+        pdf.pages[0].Resources.XObject.Fm0 = make_form_xobject(pdf)
+        assert _collect_dctdecode_images(pdf) == {}
+
+    def test_form_resources_without_xobject_is_skipped(self):
+        pdf = make_pdf()
+        form = pdf.make_stream(
+            b'',
+            Type=pikepdf.Name.XObject,
+            Subtype=pikepdf.Name.Form,
+            Resources=pikepdf.Dictionary(ProcSet=[pikepdf.Name.PDF]),
+        )
+        pdf.pages[0].Resources = pikepdf.Dictionary(
+            XObject=pikepdf.Dictionary(Fm0=form)
+        )
+        assert _collect_dctdecode_images(pdf) == {}
+
+    def test_page_without_resources(self):
+        pdf = make_pdf()
+        assert pikepdf.Name.Resources not in pdf.pages[0]
+        assert _collect_dctdecode_images(pdf) == {}
+
+    def test_resources_without_xobject(self):
+        pdf = make_pdf()
+        pdf.pages[0].Resources = pikepdf.Dictionary(ProcSet=[pikepdf.Name.PDF])
+        assert _collect_dctdecode_images(pdf) == {}
+
+    def test_xobject_that_is_neither_image_nor_form_ignored(self):
+        pdf = make_pdf_with_xobjects(Ps0=None)
+        pdf.pages[0].Resources.XObject.Ps0 = pdf.make_stream(
+            b'', Type=pikepdf.Name.XObject, Subtype=pikepdf.Name.PS
+        )
+        assert _collect_dctdecode_images(pdf) == {}
+
+    def test_non_jpeg_image_ignored(self):
+        pdf = make_pdf_with_xobjects(Im0=None)
+        pdf.pages[0].Resources.XObject.Im0 = make_image_stream(
+            pdf, b'\x00' * 192, Filter=pikepdf.Name.FlateDecode
+        )
+        assert _collect_dctdecode_images(pdf) == {}
+
+    @pytest.mark.parametrize(
+        ('colorspace', 'expected_key'),
+        [
+            (pikepdf.Name.DeviceRGB, '/DeviceRGB'),
+            (pikepdf.Name.DeviceGray, '/DeviceGray'),
+            (None, None),
+            (42, '42'),  # malformed: not a name and has no length
+        ],
+        ids=['name', 'name-gray', 'absent', 'malformed'],
+    )
+    def test_colorspace_key(self, colorspace, expected_key):
+        pdf = make_pdf_with_xobjects(Im0=None)
+        kwargs = {} if colorspace is None else {'ColorSpace': colorspace}
+        if colorspace is None:
+            stream = pdf.make_stream(
+                make_jpeg(),
+                Type=pikepdf.Name.XObject,
+                Subtype=pikepdf.Name.Image,
+                Filter=pikepdf.Name.DCTDecode,
+                Width=8,
+                Height=8,
+                BitsPerComponent=8,
+            )
+        else:
+            stream = make_image_stream(pdf, **kwargs)
+        pdf.pages[0].Resources.XObject.Im0 = stream
+
+        images = _collect_dctdecode_images(pdf)
+        assert next(iter(images))[4] == expected_key
+
+    def test_iccbased_colorspace_key_uses_family(self):
+        pdf = make_pdf_with_xobjects(Im0=None)
+        icc = pdf.make_stream(b'\x00' * 8, N=3)
+        pdf.pages[0].Resources.XObject.Im0 = make_image_stream(
+            pdf, ColorSpace=pikepdf.Array([pikepdf.Name.ICCBased, icc])
+        )
+        images = _collect_dctdecode_images(pdf)
+        assert next(iter(images))[4] == '/ICCBased'
+
+    def test_empty_array_colorspace(self):
+        pdf = make_pdf_with_xobjects(Im0=None)
+        pdf.pages[0].Resources.XObject.Im0 = make_image_stream(
+            pdf, ColorSpace=pikepdf.Array([])
+        )
+        images = _collect_dctdecode_images(pdf)
+        assert next(iter(images))[4] == str(pikepdf.Array([]))
+
+    def test_identical_images_are_grouped_by_signature(self):
+        pdf = make_pdf_with_xobjects(Im0=None, Im1=None)
+        pdf.pages[0].Resources.XObject.Im0 = make_image_stream(pdf)
+        pdf.pages[0].Resources.XObject.Im1 = make_image_stream(pdf)
+        images = _collect_dctdecode_images(pdf)
+        assert len(images) == 1
+        assert len(next(iter(images.values()))) == 2
+
+    def test_recursion_depth_guard(self, caplog):
+        """A Form XObject cycle must terminate instead of recursing forever."""
+        caplog.set_level(logging.WARNING)
+        pdf = make_pdf()
+        form = make_form_xobject(pdf, {'Im0': make_image_stream(pdf)})
+        form.Resources.XObject.Fm0 = form  # self-reference
+        pdf.pages[0].Resources = pikepdf.Dictionary(
+            XObject=pikepdf.Dictionary(Fm0=form)
+        )
+
+        images = _collect_dctdecode_images(pdf)
+        assert 'Recursion depth exceeded' in caplog.text
+        # The image is found once per level of recursion, until the guard fires
+        assert len(next(iter(images.values()))) == 10
+
+
+class TestRepairGs106JpegCorruptionSynthetic:
+    """Byte-level rules the Ghostscript 10.6 repair applies to JPEG streams."""
+
+    @pytest.fixture
+    def make_pair(self, outdir):
+        def _make(output_bytes, *, output_kwargs=None, input_bytes=None):
+            jpeg = make_jpeg(size=(16, 16))
+            input_pdf = make_pdf_with_xobjects(Im0=None)
+            input_pdf.pages[0].Resources.XObject.Im0 = make_image_stream(
+                input_pdf,
+                jpeg if input_bytes is None else input_bytes,
+                width=16,
+                height=16,
+            )
+            input_path = outdir / 'input.pdf'
+            input_pdf.save(input_path)
+
+            output_pdf = make_pdf_with_xobjects(Im0=None)
+            output_pdf.pages[0].Resources.XObject.Im0 = make_image_stream(
+                output_pdf,
+                output_bytes(jpeg),
+                width=16,
+                height=16,
+                **(output_kwargs or {}),
+            )
+            output_path = outdir / 'output.pdf'
+            output_pdf.save(output_path)
+            return jpeg, input_path, output_path
+
+        return _make
+
+    @staticmethod
+    def read_image_bytes(path):
+        with pikepdf.open(path) as pdf:
+            return pdf.pages[0].Resources.XObject.Im0.read_raw_bytes()
+
+    @pytest.mark.parametrize('truncation', [1, 2, 8, 15])
+    def test_truncation_within_range_is_repaired(self, make_pair, truncation, caplog):
+        caplog.set_level(logging.WARNING)
+        jpeg, input_path, output_path = make_pair(lambda b: b[:-truncation])
+        assert _repair_gs106_jpeg_corruption(input_path, output_path) is True
+        assert self.read_image_bytes(output_path) == jpeg
+        assert f'{truncation} bytes truncated' in caplog.text
+
+    @pytest.mark.parametrize('truncation', [16, 20, 100])
+    def test_truncation_beyond_range_is_left_alone(self, make_pair, truncation):
+        _jpeg, input_path, output_path = make_pair(lambda b: b[:-truncation])
+        before = self.read_image_bytes(output_path)
+        assert _repair_gs106_jpeg_corruption(input_path, output_path) is False
+        assert self.read_image_bytes(output_path) == before
+
+    def test_identical_streams_are_left_alone(self, make_pair):
+        assert _repair_gs106_jpeg_corruption(*make_pair(lambda b: b)[1:]) is False
+
+    def test_longer_output_is_left_alone(self, make_pair):
+        """A longer stream is not a truncation, so do not touch it."""
+        _jpeg, input_path, output_path = make_pair(lambda b: b + b'\x00\x00')
+        assert _repair_gs106_jpeg_corruption(input_path, output_path) is False
+
+    def test_prefix_mismatch_is_not_a_truncation(self, make_pair):
+        """Right length difference, wrong content: this is a re-encode, not damage."""
+
+        def mangle(b):
+            shortened = bytearray(b[:-4])
+            shortened[len(shortened) // 2] ^= 0xFF
+            return bytes(shortened)
+
+        _jpeg, input_path, output_path = make_pair(mangle)
+        before = self.read_image_bytes(output_path)
+        assert _repair_gs106_jpeg_corruption(input_path, output_path) is False
+        assert self.read_image_bytes(output_path) == before
+
+    def test_signature_mismatch_prevents_repair(self, make_pair):
+        """Images that differ in colorspace are different images, not damage."""
+        _jpeg, input_path, output_path = make_pair(
+            lambda b: b[:-2], output_kwargs={'ColorSpace': pikepdf.Name.DeviceGray}
+        )
+        assert _repair_gs106_jpeg_corruption(input_path, output_path) is False
+
+    def test_multiple_damaged_images(self, outdir, caplog):
+        """The alarming error is logged once, but every image is repaired."""
+        caplog.set_level(logging.WARNING)
+        jpegs = [make_jpeg(size=(16, 16), color=c) for c in ((255, 0, 0), (0, 128, 0))]
+
+        input_pdf = make_pdf_with_xobjects(Im0=None, Im1=None)
+        output_pdf = make_pdf_with_xobjects(Im0=None, Im1=None)
+        for n, jpeg in enumerate(jpegs):
+            input_pdf.pages[0].Resources.XObject[f'/Im{n}'] = make_image_stream(
+                input_pdf, jpeg, width=16, height=16
+            )
+            output_pdf.pages[0].Resources.XObject[f'/Im{n}'] = make_image_stream(
+                output_pdf, jpeg[:-2], width=16, height=16
+            )
+        input_path, output_path = outdir / 'input.pdf', outdir / 'output.pdf'
+        input_pdf.save(input_path)
+        output_pdf.save(output_path)
+
+        assert _repair_gs106_jpeg_corruption(input_path, output_path) is True
+        with pikepdf.open(output_path) as pdf:
+            repaired = [
+                pdf.pages[0].Resources.XObject[f'/Im{n}'].read_raw_bytes()
+                for n in range(2)
+            ]
+        assert sorted(repaired) == sorted(jpegs)
+        assert sum(r.levelno == logging.ERROR for r in caplog.records) == 1
+        assert sum('bytes truncated' in r.getMessage() for r in caplog.records) == 2
+
+    def test_no_images_at_all(self, outdir):
+        for name in ('input.pdf', 'output.pdf'):
+            make_pdf().save(outdir / name)
+        assert (
+            _repair_gs106_jpeg_corruption(outdir / 'input.pdf', outdir / 'output.pdf')
+            is False
+        )
+
+
+class TestGeneratePdfaHook:
+    """The plugin hook that wraps Ghostscript PDF/A generation."""
+
+    @pytest.fixture
+    def run_hook(self, outdir):
+        def _run(*, gs_output_bytes, truncation_bug, output_type='pdfa'):
+            jpeg = make_jpeg(size=(16, 16))
+            input_pdf = make_pdf_with_xobjects(Im0=None)
+            input_pdf.pages[0].Resources.XObject.Im0 = make_image_stream(
+                input_pdf, jpeg, width=16, height=16
+            )
+            input_path = outdir / 'page.pdf'
+            input_pdf.save(input_path)
+
+            output_path = outdir / 'out.pdf'
+
+            def fake_generate_pdfa(*, pdf_pages, output_file, **kwargs):
+                gs_output = make_pdf_with_xobjects(Im0=None)
+                gs_output.pages[0].Resources.XObject.Im0 = make_image_stream(
+                    gs_output, gs_output_bytes(jpeg), width=16, height=16
+                )
+                gs_output.save(output_file)
+
+            options = _gs_plugin_opts('--output-type', output_type)
+            context = SimpleNamespace(options=options)
+            with (
+                patch.object(
+                    ghostscript, 'generate_pdfa', side_effect=fake_generate_pdfa
+                ) as gs_mock,
+                patch.object(
+                    ghostscript, 'jpeg_truncation_bug', return_value=truncation_bug
+                ),
+            ):
+                result = gs_plugin.generate_pdfa(
+                    pdf_pages=[input_path],
+                    pdfmark=outdir / 'pdfmark.pdf',
+                    output_file=output_path,
+                    context=context,
+                    pdf_version='1.7',
+                    pdfa_part='2',
+                    progressbar_class=None,
+                    stop_on_soft_error=True,
+                )
+            return jpeg, result, gs_mock, options
+
+        return _run
+
+    def test_repairs_truncated_jpeg_when_ghostscript_is_affected(self, run_hook):
+        jpeg, result, _gs_mock, _options = run_hook(
+            gs_output_bytes=lambda b: b[:-3], truncation_bug=True
+        )
+        with pikepdf.open(result) as pdf:
+            assert pdf.pages[0].Resources.XObject.Im0.read_raw_bytes() == jpeg
+
+    def test_no_repair_when_ghostscript_is_unaffected(self, run_hook):
+        jpeg, result, _gs_mock, _options = run_hook(
+            gs_output_bytes=lambda b: b[:-3], truncation_bug=False
+        )
+        with pikepdf.open(result) as pdf:
+            assert pdf.pages[0].Resources.XObject.Im0.read_raw_bytes() == jpeg[:-3]
+
+    def test_records_that_ghostscript_produced_the_file(self, run_hook):
+        _jpeg, _result, _gs_mock, options = run_hook(
+            gs_output_bytes=lambda b: b, truncation_bug=False
+        )
+        assert options.extra_attrs[GS_GENERATED_PDFA] is True
+
+    def test_pdfmark_is_prepended_to_the_page_list(self, run_hook, outdir):
+        _jpeg, result, gs_mock, _options = run_hook(
+            gs_output_bytes=lambda b: b, truncation_bug=False
+        )
+        assert result == outdir / 'out.pdf'
+        assert gs_mock.call_args.kwargs['pdf_pages'][0] == outdir / 'pdfmark.pdf'
+
+    @pytest.mark.parametrize(
+        ('optimize_level', 'expected'),
+        [(0, 'lossless'), (1, 'auto')],
+    )
+    def test_auto_compression_resolved_before_calling_ghostscript(
+        self, outdir, optimize_level, expected
+    ):
+        options = _gs_plugin_opts('--output-type', 'pdfa', '-O', str(optimize_level))
+        context = SimpleNamespace(options=options)
+        with (
+            patch.object(ghostscript, 'generate_pdfa') as gs_mock,
+            patch.object(ghostscript, 'jpeg_truncation_bug', return_value=False),
+        ):
+            gs_plugin.generate_pdfa(
+                pdf_pages=[outdir / 'page.pdf'],
+                pdfmark=outdir / 'pdfmark.pdf',
+                output_file=outdir / 'out.pdf',
+                context=context,
+                pdf_version='1.7',
+                pdfa_part='2',
+                progressbar_class=None,
+                stop_on_soft_error=True,
+            )
+        assert gs_mock.call_args.kwargs['compression'] == expected

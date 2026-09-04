@@ -623,6 +623,16 @@
 
         function loadBoard(newBoard, mines) {
             board = newBoard;
+            // 参考 minesweeper_solver 标准: 9×9=10, 16×16=40, 30×16=99
+            // OCR 未识别到雷数时, 按棋盘尺寸推断 (总雷数 - 已标旗数)
+            if (mines == null && board.length && board[0].length) {
+                const stdMines = { '9,9': 10, '16,16': 40, '30,16': 99, '16,30': 99 };
+                const key = board.length + ',' + board[0].length;
+                if (key in stdMines) {
+                    const flags = board.flat().filter(v => v === -2).length;
+                    mines = Math.max(0, stdMines[key] - flags);
+                }
+            }
             if (mines != null) document.getElementById('mineCount').value = mines;
             clearAnalysis();
             drawBoard();
@@ -640,7 +650,7 @@
         function drawBoard() {
             if (!board.length) return;
             const h = board.length, w = board[0].length;
-            const maxW = 580, maxH = 470;
+            const maxW = 760, maxH = 560;
             cellSize = Math.max(16, Math.min(34, maxW / w, maxH / h));
             const pad = cellSize >= 24 ? 18 : 0; // 坐标轴留白
             const dpr = window.devicePixelRatio || 1;
@@ -727,11 +737,12 @@
                             ctx.fillStyle = '#2ECC71';
                             ctx.font = 'bold ' + (cellSize * 0.5) + 'px monospace';
                             ctx.fillText('✓', px + cellSize / 2, py + cellSize / 2 + 1);
-                        } else if (prob && cellSize >= 22) {           // 待定: 蓝色概率
+                        } else if (prob && cellSize >= 18) {           // 待定: 蓝色概率
                             ctx.fillStyle = 'rgba(74, 144, 217, 0.15)';
                             ctx.fillRect(px + 1, py + 1, cellSize - 2, cellSize - 2);
                             ctx.fillStyle = '#4A90D9';
-                            ctx.font = 'bold ' + Math.max(9, cellSize * 0.3) + 'px monospace';
+                            const fs = cellSize >= 26 ? Math.max(11, cellSize * 0.3) : Math.max(8, cellSize * 0.28);
+                            ctx.font = 'bold ' + fs + 'px monospace';
                             ctx.fillText(Math.round(prob.mine_probability * 100) + '%', px + cellSize / 2, py + cellSize / 2 + 1);
                         }
                     }

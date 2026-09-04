@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tower_http::services::ServeDir;
 
-use crate::engine::{DeterministicEngine, MonteCarloEngine, RegionAnalyzer};
+use crate::engine::{DeterministicEngine, ProbabilityEngine, RegionAnalyzer};
 use crate::llm::{LLMClient, LLMMode, Translator};
 use crate::model::{InferenceIR, PlayerView};
 
@@ -113,8 +113,7 @@ async fn analyze(
         .map(|p| p.conclusion.coord)
         .collect();
 
-    let mc = MonteCarloEngine::new(state.mc_iterations);
-    let probabilities = mc.simulate_with_deductions(&view, &known_mines, &known_safe);
+    let probabilities = ProbabilityEngine::compute(&view, &known_mines, &known_safe);
 
     // 区域分析
     let regions = RegionAnalyzer::analyze(&view, &probabilities);

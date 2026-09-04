@@ -1,0 +1,51 @@
+# SPDX-FileCopyrightText: 2022 James R. Barlow
+# SPDX-License-Identifier: CC-BY-SA-4.0
+
+# dotfiles
+.coverage
+.venv*/
+.tox/
+.vscode/
+.hypothesis/
+.ipynb_checkpoints/
+.mypy_cache/
+.pytest_cache/
+
+# Dev scratch
+*.ipynb
+**/*.pyc
+/*.pdf
+/*.qdf
+/*.png
+/scratch.py
+IDEAS
+log/
+tests/resources/private/
+tmp/
+venv*/
+/debug_tests.py
+*.traineddata
+/private
+/coverage.xml
+/issuepdf
+
+# Package building
+*.egg-info/
+build/
+dist/
+wheelhouse/
+pip-wheel-metadata/
+
+# Code coverage
+htmlcov/
+
+# Automatically generated files
+docs/_build/
+docs/_static/
+docs/_templates/
+docs/Makefile
+
+.idea/
+.aider*
+CLAUDE.md
+.claude/

@@ -1,0 +1,741 @@
+% SPDX-FileCopyrightText: 2022 James R. Barlow
+% SPDX-License-Identifier: CC-BY-SA-4.0
+
+# Advanced features
+
+## Control of unpaper
+
+OCRmyPDF uses `unpaper` to provide the implementation of the
+`--clean` and `--clean-final` arguments.
+[unpaper](https://github.com/Flameeyes/unpaper/blob/main/doc/basic-concepts.md)
+provides a variety of image processing filters to improve images.
+
+By default, OCRmyPDF uses only `unpaper` arguments that were found to
+be safe to use on almost all files without having to inspect every page
+of the file afterwards. This is particularly true when only `--clean`
+is used, since that instructs OCRmyPDF to only clean the image before
+OCR and not the final image.
+
+However, if you wish to use the more aggressive options in `unpaper`,
+you may use `--unpaper-args '...'` to override the OCRmyPDF's defaults
+and forward other arguments to unpaper. This option will forward
+arguments to `unpaper` without any knowledge of what that program
+considers to be valid arguments. The string of arguments must be quoted
+as shown in the examples below. No filename arguments may be included.
+OCRmyPDF will assume it can append input and output filename of
+intermediate images to the `--unpaper-args` string.
+
+In this example, we tell `unpaper` to expect two pages of text on a
+sheet (image), such as occurs when two facing pages of a book are
+scanned. `unpaper` uses this information to deskew each independently
+and clean up the margins of both.
+
+```bash
+ocrmypdf --clean --clean-final --unpaper-args '--layout double' input.pdf output.pdf
+ocrmypdf --clean --clean-final --unpaper-args '--layout double --no-noisefilter' input.pdf output.pdf
+```
+
+:::{warning}
+Some `unpaper` features will reposition text within the image.
+`--clean-final` is recommended to avoid this issue.
+:::
+
+:::{warning}
+Some `unpaper` features cause multiple input or output files to be
+consumed or produced. OCRmyPDF requires `unpaper` to consume one
+file and produce one file; errors will result if this assumption is not
+met.
+:::
+
+:::{note}
+`unpaper` uses uncompressed PBM/PGM/PPM files for its intermediate
+files. For large images or documents, it can take a lot of temporary
+disk space.
+:::
+
+## Control of OCR options
+
+OCRmyPDF provides many features to control the behavior of the OCR
+engine, Tesseract.
+
+### OCR processing mode
+
+:::{versionadded} 17.0.0
+The `--mode` (`-m`) argument consolidates OCR processing options.
+:::
+
+OCRmyPDF provides a unified `--mode` argument to control how pages with
+existing text are handled:
+
+| Mode | Behavior | Legacy equivalent |
+|------|----------|-------------------|
+| `default` | Error if text is found | (no flag) |
+| `force` | Rasterize all content and run OCR | `--force-ocr` |
+| `skip` | Skip pages with existing text | `--skip-text` |
+| `redo` | Re-OCR pages, stripping old OCR layer | `--redo-ocr` |
+
+```bash
+# Skip pages that already have text
+ocrmypdf --mode skip input.pdf output.pdf
+# or equivalently:
+ocrmypdf -m skip input.pdf output.pdf
+
+# Force OCR on all pages (rasterizes everything)
+ocrmypdf --mode force input.pdf output.pdf
+
+# Re-do OCR, replacing old invisible text
+ocrmypdf --mode redo input.pdf output.pdf
+```
+
+The legacy flags (`--force-ocr`, `--skip-text`, `--redo-ocr`) remain as
+silent aliases for backward compatibility.
+
+### When OCR is skipped
+
+If a page in a PDF seems to have text, by default OCRmyPDF will exit
+without modifying the PDF. This is to ensure that PDFs that were
+previously OCRed or were "born digital" rather than scanned are not
+processed.
+
+If `--mode skip` (or `--skip-text`) is issued, then no image processing or OCR will be
+performed on pages that already have text. The page will be copied to
+the output. This may be useful for documents that contain both "born
+digital" and scanned content, or to use OCRmyPDF to normalize and
+convert to PDF/A regardless of their contents.
+
+If `--mode redo` (or `--redo-ocr`) is issued, then a detailed text analysis is performed.
+Text is categorized as either visible or invisible. Invisible text (OCR)
+is stripped out. Then an image of each page is created with visible text
+masked out. The page image is sent for OCR, and any additional text is
+inserted as OCR. If a file contains a mix of text and bitmap images that
+contain text, OCRmyPDF will locate the additional text in images without
+disrupting the existing text. Some PDF OCR solutions render text as
+technically printable or visible in some way, perhaps by drawing it and
+then painting over it. OCRmyPDF cannot distinguish this type of OCR
+text from real text, so it will not be "redone".
+
+If `--mode force` (or `--force-ocr`) is issued, then all pages will be rasterized to
+images, discarding any hidden OCR text, rasterizing any printable
+text, and flattening form fields or interactive objects into their visual
+representation. This is useful for redoing OCR, for fixing OCR text
+with a damaged character map (text is selectable but not searchable),
+and destroying redacted information.
+
+### Tagged PDFs and structural markup
+
+Some PDFs carry a logical structure tree (`/StructTreeRoot`), the markup that
+makes a "Tagged PDF" — typically the result of layout analysis or a born-digital
+export. By default OCRmyPDF treats this as a signal that the document may not need
+OCR and exits, in the same way it stops on PDFs that already contain text. Use
+`--tagged-pdf-mode ignore`, or one of `--mode skip`/`redo`/`force`, to process
+such a file anyway.
+
+OCRmyPDF cannot rebuild a structure tree to match newly recognized text. When
+`--force-ocr` rasterizes pages, or `--redo-ocr` strips and rewrites the text layer,
+the structure tree no longer corresponds to the page content, so it is discarded.
+`--mode skip` leaves text pages untouched, so their structural markup is preserved.
+
+:::{note}
+Preservation under `--mode skip` only holds when the output is not converted to
+PDF/A. PDF/A conversion is performed by Ghostscript, and Ghostscript 10.x discards
+the structure tree during conversion (Ghostscript 9.x preserved it). Because the
+default `--output-type auto` may fall back to Ghostscript, use
+`--output-type pdf` if you need to guarantee that a Tagged PDF's structural markup
+survives. For best results, install veraPDF so that speculative PDF/A
+conversion can sidestep this issue entirely in most real cases.
+:::
+
+### Time and image size limits
+
+By default, OCRmyPDF permits tesseract to run for three minutes (180
+seconds) per page. This is usually more than enough time to find all
+text on a reasonably sized page with modern hardware.
+
+If a page is skipped, it will be inserted without OCR. If preprocessing
+was requested, the preprocessed image layer will be inserted.
+
+If you want to adjust the amount of time spent on OCR, change
+`--tesseract-timeout`. You can also automatically skip images that
+exceed a certain number of megapixels with `--skip-big`. (A 300 DPI,
+8.5×11" page image is 8.4 megapixels.)
+
+```bash
+# Allow 300 seconds for OCR; skip any page larger than 50 megapixels
+ocrmypdf --tesseract-timeout 300 --skip-big 50 bigfile.pdf output.pdf
+```
+
+### OCR for huge images
+
+Tesseract has internal limits on the size
+of images it will process. By default,
+`--tesseract-downsample-large-images` is enabled, and OCRmyPDF will
+downsample images to fit Tesseract limits. (The limits are usually encountered
+only for scanned images of oversized media, such as large maps or blueprints exceeding
+110 cm or 43 inches in either dimension, and at high DPI.) This feature can disabled
+using `--no-tesseract-downsample-large-images`.
+
+`--tesseract-downsample-above Npixels` adjusts the threshold at which images
+will be downsampled. By default, only images that exceed any of Tesseract's
+internal limits are downsampled (32767 pixels on either dimension).
+
+You will also need to set `--tesseract-timeout` high enough to allow
+for processing.
+
+Only the image sent for OCR is downsampled. The original image is
+preserved.
+
+```bash
+# Allow 600 seconds for OCR on huge images
+ocrmypdf --tesseract-timeout 600 \
+    --tesseract-downsample-large-images \
+    bigfile.pdf output.pdf
+
+# Downsample images above 5000 pixels on the longest dimension to
+# 5000 pixels
+ocrmypdf --tesseract-timeout 120 \
+    --tesseract-downsample-large-images \
+    --tesseract-downsample-above 5000 \
+    bigfile.pdf output_downsampled_ocr.pdf
+```
+
+### Overriding default tesseract
+
+OCRmyPDF checks the system `PATH` for the `tesseract` binary.
+
+Some relevant environment variables that influence Tesseract's behavior
+include:
+
+```{eval-rst}
+.. envvar:: TESSDATA_PREFIX
+
+   Overrides the path to Tesseract's data files. This can allow
+   simultaneous installation of the "best" and "fast" training data
+   sets. OCRmyPDF does not manage this environment variable.
+
+   If you point ``TESSDATA_PREFIX`` at a hand-assembled ``tessdata``
+   folder (for example, individual ``.traineddata`` files downloaded
+   from tessdata_best), make sure it also contains the ``configs/``
+   subdirectory with the ``hocr`` and ``txt`` files. OCRmyPDF requires
+   these; without them Tesseract produces no output. See
+   :ref:`Tesseract cannot open its config file <tesseract-config-missing>`.
+```
+
+```{eval-rst}
+.. envvar:: OMP_THREAD_LIMIT
+
+   Controls the number of threads Tesseract will use. OCRmyPDF will
+   manage this environment variable if it is not already set.
+```
+
+For example, if you have a development build of Tesseract don't wish to
+use the system installation, you can launch OCRmyPDF as follows:
+
+```bash
+env \
+    PATH=/home/user/src/tesseract/api:$PATH \
+    TESSDATA_PREFIX=/home/user/src/tesseract \
+    ocrmypdf input.pdf output.pdf
+```
+
+In this example `TESSDATA_PREFIX` is required to redirect Tesseract to
+an alternate folder for its "tessdata" files.
+
+### Overriding other support programs
+
+In addition to tesseract, OCRmyPDF uses the following external binaries:
+
+- `gs` (Ghostscript)
+- `unpaper`
+- `pngquant`
+- `jbig2`
+
+In each case OCRmyPDF will search the `PATH` environment variable to
+locate the binaries. By modifying the `PATH` environment variable, you
+can override the binaries that OCRmyPDF uses.
+
+### Changing Tesseract configuration variables
+
+You can override Tesseract's default [control
+parameters](https://tesseract-ocr.github.io/tessdoc/tess3/ControlParams.html)
+with a configuration file.
+
+As an example, this configuration will disable Tesseract's dictionary
+for current language. Normally the dictionary is helpful for
+interpolating words that are unclear, but it may interfere with OCR if
+the document does not contain many words (for example, a list of part
+numbers).
+
+Create a file named "no-dict.cfg" with these contents:
+
+```
+load_system_dawg 0
+language_model_penalty_non_dict_word 0
+language_model_penalty_non_freq_dict_word 0
+```
+
+then run ocrmypdf as follows (along with any other desired arguments):
+
+```bash
+ocrmypdf --tesseract-config no-dict.cfg input.pdf output.pdf
+```
+
+:::{warning}
+Some combinations of control parameters will break Tesseract or break
+assumptions that OCRmyPDF makes about Tesseract's output.
+:::
+
+### Changing page segmentation mode
+
+The directive `--tesseract-pagesegmode Nmode` forwards the desired page segmentation
+mode to Tesseract OCR. The default is 3.
+
+Page segmentation can improve OCR results when you know that a PDF ought to be
+analyzed a particular way, such as PDFs whose pages contain only a single line of
+text. For the vast majority of users, changing the page segmentation mode will only
+make things worse.
+
+As of June 2024, the Tesseract page segmentation modes are:
+
+| ID  | Description                                                                                   |
+| --- | --------------------------------------------------------------------------------------------- |
+| 0   | Orientation and script detection (OSD) only.                                                  |
+| 1   | Automatic page segmentation with OSD.                                                         |
+| 2   | Automatic page segmentation, but no OSD, or OCR. (not implemented)                            |
+| 3   | Fully automatic page segmentation, but no OSD. (Default)                                      |
+| 4   | Assume a single column of text of variable sizes.                                             |
+| 5   | Assume a single uniform block of vertically aligned text.                                     |
+| 6   | Assume a single uniform block of text.                                                        |
+| 7   | Treat the image as a single text line.                                                        |
+| 8   | Treat the image as a single word.                                                             |
+| 9   | Treat the image as a single word in a circle.                                                 |
+| 10  | Treat the image as a single character.                                                        |
+| 11  | Sparse text. Find as much text as possible in no particular order.                            |
+| 12  | Sparse text with OSD.                                                                         |
+| 13  | Raw line. Treat the image as a single text line, bypassing hacks that are Tesseract-specific. |
+
+Modes 0, 1, 2, and 12 (all of those that enable orientation and script detection)
+are not compatible with OCRmyPDF, which performs OSD in a separate step from OCR.
+Their use may interfere with `--rotate-pages` and other features.
+
+It is currently not possible to use advanced Tesseract OCR features, such as creating
+OCR information, when using Tesseract through OCRmyPDF.
+
+## Choosing a PDF rasterizer
+
+:::{versionadded} 17.0.0
+:::
+
+rasterizing
+
+: Converting a PDF page to an image for OCR processing.
+
+OCRmyPDF supports two PDF rasterizers:
+
+| Rasterizer | Package | Advantages | Disadvantages |
+|------------|---------|------------|---------------|
+| pypdfium2 | Python package | Faster, fewer version issues | Requires pypdfium2 package |
+| Ghostscript | System binary | More widely packaged | Version consistency issues, restrictive AGPLv3 |
+
+The `--rasterizer` argument controls which rasterizer is used:
+
+```bash
+# Automatic selection (default) - prefers pypdfium when available
+ocrmypdf --rasterizer auto input.pdf output.pdf
+
+# Force pypdfium2
+ocrmypdf --rasterizer pypdfium input.pdf output.pdf
+
+# Force Ghostscript
+ocrmypdf --rasterizer ghostscript input.pdf output.pdf
+```
+
+pypdfium2 is a Python binding for pdfium, the PDF rendering library used
+by Google Chrome and Chromium. It generally produces output identical to
+Ghostscript but with better performance.
+
+:::{note}
+If pypdfium2 is not installed and `--rasterizer pypdfium` is requested,
+OCRmyPDF will exit with an error. Install it with: `pip install pypdfium2`
+:::
+
+## Changing the PDF renderer
+
+rendering
+
+: Creating a new PDF from other data (such as an existing PDF).
+
+:::{versionchanged} 17.0.0
+The fpdf2 renderer is now the default, replacing the legacy hOCR renderer.
+:::
+
+OCRmyPDF uses PDF renderers to create the invisible text layer. The
+renderer may be selected using `--pdf-renderer`. The default is
+`auto` which selects `fpdf2`.
+
+### The `fpdf2` renderer (default)
+
+:::{versionadded} 17.0.0
+:::
+
+The fpdf2 renderer creates text layers using the fpdf2 library. It provides:
+
+- Full multilingual support including RTL languages (Arabic, Hebrew, Persian)
+- Accurate text positioning aligned with OCR bounding boxes
+- Improved "Occulta" glyphless font handling:
+  - Zero-width markers are properly handled
+  - Double-width CJK characters are properly sized
+- Direct OcrElement tree input (no hOCR intermediate format required)
+
+The fpdf2 renderer is the recommended choice for all installations.
+
+:::{note}
+The fpdf2 renderer may be slightly slower than the legacy hocrtransform
+renderer for some workloads. This is an area of ongoing optimization.
+:::
+
+In both renderers, a text-only layer is rendered and sandwiched (overlaid)
+on to either the original PDF page, or newly rasterized version of the
+original PDF page (when `--mode force` is used). In this way, loss
+of PDF information is generally avoided. (You may need to disable PDF/A
+conversion and optimization to eliminate all lossy transformations.)
+
+### The `sandwich` renderer
+
+The `sandwich` renderer uses Tesseract's text-only PDF feature,
+which produces a PDF page that lays out the OCR in invisible text.
+
+Currently some problematic PDF viewers like Mozilla PDF.js and macOS
+Preview have problems with segmenting its text output, and
+mightrunseveralwordstogether. It also does not implement right to left
+fonts (Arabic, Hebrew, Persian). The output of this renderer cannot
+be edited. The sandwich renderer is retained for testing.
+
+When image preprocessing features like `--deskew` are used, the
+original PDF will be rendered as a full page and the OCR layer will be
+placed on top.
+
+### Legacy renderer options
+
+The `hocr` and `hocrdebug` renderer options are deprecated and
+automatically redirect to `fpdf2`. They will be removed in a future version.
+
+## Rendering and rasterizing options
+
+:::{versionadded} 14.3.0
+:::
+
+The `--continue-on-soft-render-error` option allows OCRmyPDF to
+proceed if a page cannot be rasterized/rendered. This is useful if you are
+trying to get the best possible OCR from a PDF that is not well-formed,
+and you are willing to accept some pages that may not visually match the
+input, and that may not OCR well.
+
+## Color conversion strategy
+
+:::{versionadded} 15.0.0
+:::
+
+OCRmyPDF uses Ghostscript to convert PDF to PDF/A. In some cases, this
+conversion requires color conversion. The default strategy is to convert
+using the `LeaveColorUnchanged` strategy, which preserves the original
+color space wherever possible (some rare color spaces might still be
+converted).
+
+Usually document scanners produce PDFs in the sRGB color space, and do
+not need to be converted, so the default strategy is appropriate.
+
+Suppose that you have a document that was prepared for professional
+printing in a Separation or CMYK color space, and text was converted to
+curves. In this case, you may want to use a different color conversion
+strategy. The `--color-conversion-strategy` option allows you to select a
+different strategy, such as `RGB`.
+
+## Advanced Ghostscript tuning
+
+:::{versionadded} 17.5.0
+:::
+
+OCRmyPDF intentionally hides most Ghostscript controls because Ghostscript
+is a legacy code path. The preferred PDF/A pipeline in v17+ uses pypdfium2
+as the rasterizer and verapdf to validate speculative PDF/A output, with
+Ghostscript reserved as a fallback for PDFs that cannot be made compliant
+without it. OCRmyPDF's separate optimizer (controlled by `--optimize`,
+`--jpeg-quality`, `--png-quality`, etc.) is the supported way to shrink
+output PDFs: it gives consistent results across input files, and isolates
+Ghostscript so it can focus on producing a PDF/A with as few image
+transformations as possible.
+
+The two options below are exposed for advanced users who want to tune
+Ghostscript's intermediate PDF/A output directly. Most users will get
+more predictable results from the optimizer.
+
+### `--ghostscript-jpeg-quality Q`
+
+Sets Ghostscript's `-dJPEGQ` switch for images that Ghostscript chooses
+to recompress to JPEG while building a PDF/A. `Q=0` requests maximum
+compression and `Q=100` requests best quality; if the flag is omitted,
+OCRmyPDF passes `95` (the historical default). This only affects images
+Ghostscript transcodes — existing JPEGs pass through unchanged on modern
+Ghostscript releases. For end-to-end JPEG quality tuning, prefer
+`--jpeg-quality`, which is implemented by the OCRmyPDF optimizer and is
+applied independently of whatever Ghostscript decides to do.
+
+Note: setting both `--ghostscript-jpeg-quality` and `--jpeg-quality` can
+result in double JPEG recompression, since the optimizer may re-encode
+images that Ghostscript already recompressed. This can degrade quality
+in subtle ways.
+
+### `--ghostscript-jpeg-maxdpi DPI`
+
+Enables Ghostscript's image downsampling and caps color, grayscale, and
+monochrome image resolution to `DPI`. The downsample threshold is set to
+`1.0`, so any image whose effective DPI exceeds the cap will be
+downsampled.
+
+Reducing JPEG quality is almost always a better trade than downsampling
+at the same compression budget: a 400 DPI JPEG at modest quality usually
+looks much better than a 200 DPI JPEG, because the JPEG codec can spend
+bits where they count. Downsampling is also dangerous for PDFs that
+combine a low-resolution color image with a high-resolution monochrome
+mask — capping the mask resolution can produce visible quality loss.
+For these reasons, prefer `--jpeg-quality` over `--ghostscript-jpeg-maxdpi`
+unless you specifically want to force a hard DPI cap.
+
+Example:
+
+```bash
+ocrmypdf --output-type pdfa \
+    --ghostscript-jpeg-quality 80 \
+    --ghostscript-jpeg-maxdpi 150 \
+    in.pdf out.pdf
+```
+
+These options only take effect when Ghostscript is invoked for PDF/A
+conversion (`--output-type pdfa`, `pdfa-1`, `pdfa-2`, or `pdfa-3`, or
+when `--output-type auto` falls back to Ghostscript).
+
+## PDF/A output modes
+
+:::{versionchanged} 17.0.0
+The default `--output-type` is now `auto` instead of `pdfa`.
+:::
+
+OCRmyPDF can produce PDF/A compliant output for long-term archival. The
+`--output-type` argument controls PDF/A conversion:
+
+| Output type | Behavior |
+|-------------|----------|
+| `auto` | Best-effort PDF/A without requiring Ghostscript (default) |
+| `pdfa` | PDF/A-2b via Ghostscript |
+| `pdfa-1` | PDF/A-1b via Ghostscript |
+| `pdfa-2` | PDF/A-2b via Ghostscript (same as `pdfa`) |
+| `pdfa-3` | PDF/A-3b via Ghostscript |
+| `pdf` | Standard PDF, no PDF/A conversion |
+| `none` | No output file (useful with `--sidecar`) |
+
+### Non-embedded fonts and PDF/A
+
+:::{versionadded} 17.8.0
+OCRmyPDF now refuses to corrupt non-embedded CID text layers during PDF/A
+conversion.
+:::
+
+PDF/A requires every font to be embedded. If your input already has a text
+layer that uses *non-embedded* CID fonts — most commonly a CJK
+(Chinese-Japanese-Korean) OCR layer
+produced by Adobe Acrobat, which relies on the reader's system fonts —
+Ghostscript would have to substitute and re-embed a replacement font to make
+the file PDF/A. For CID-keyed (CJK) fonts this routinely corrupts the
+character-to-Unicode mapping, so the text silently becomes garbage or stops
+being searchable even though the page still *looks* correct.
+
+Rather than emit corrupted output, OCRmyPDF detects this situation and:
+
+- with `--output-type auto` (the default), produces a regular PDF instead of
+  PDF/A, preserving the existing text layer exactly;
+- with an explicit `--output-type pdfa` (or `pdfa-1`/`pdfa-2`/`pdfa-3`), stops
+  with an error.
+
+This is a Ghostscript limitation that OCRmyPDF cannot repair, because a
+non-embedded font cannot be made PDF/A-compliant without re-embedding it. To
+keep the existing text layer, use `--output-type pdf`. To produce PDF/A anyway,
+re-run OCR with `--force-ocr`, which discards the original text layer and
+rebuilds it with embedded fonts. Text layers whose fonts are *already embedded*
+are converted to PDF/A normally.
+
+### Speculative PDF/A conversion
+
+:::{versionadded} 17.0.0
+:::
+
+When `--output-type auto` is used (the default), OCRmyPDF attempts a
+fast "speculative" PDF/A conversion that avoids Ghostscript when possible:
+
+1. OCRmyPDF adds an sRGB ICC profile and PDF/A XMP metadata using pikepdf
+2. If verapdf is available, it validates the result
+3. If validation passes, Ghostscript is skipped entirely
+4. If validation fails or verapdf is unavailable, falls back to Ghostscript
+
+This fast path avoids some Ghostscript limitations (such as image
+transcoding) and is used whenever it can produce valid PDF/A. When it
+cannot — for example when veraPDF is not installed, or the input needs real
+conversion — `auto` falls back to Ghostscript so that it still produces
+PDF/A by default, matching OCRmyPDF 16 and earlier. If even Ghostscript
+cannot safely produce PDF/A, `auto` outputs a regular PDF instead of failing.
+
+### PDF/A conversion flow
+
+The following diagram illustrates the PDF/A conversion decision tree:
+
+```{mermaid}
+flowchart TD
+    A[Start] --> B{--output-type?}
+    B -->|pdf| C[Output standard PDF]
+    B -->|pdfa/pdfa-N| D[Use Ghostscript]
+    B -->|auto| E[Attempt speculative conversion]
+
+    E --> F["Add sRGB ICC + XMP metadata (pikepdf)"]
+    F --> G{verapdf available?}
+
+    G -->|No| H{Ghostscript available?}
+    G -->|Yes| I[Validate with verapdf]
+
+    I --> J{Validation passed?}
+    J -->|Yes| K[Output PDF/A - Ghostscript skipped]
+    J -->|No| H
+
+    H -->|Yes| D
+    H -->|No| L[Output standard PDF + WARNING]
+
+    D --> M[Ghostscript PDF/A conversion]
+    M --> N[Output PDF/A]
+
+    style K fill:#90EE90
+    style N fill:#90EE90
+    style L fill:#FFB6C1
+```
+
+:::{warning}
+**Breaking change:** If neither Ghostscript nor verapdf is installed,
+`--output-type auto` will produce a standard PDF instead of PDF/A.
+This is a change from previous versions where Ghostscript was required
+and PDF/A was always produced.
+:::
+
+## Return code policy
+
+OCRmyPDF writes all messages to `stderr`. `stdout` is reserved for
+piping output files. `stdin` is reserved for piping input files.
+
+The return codes generated by the OCRmyPDF are considered part of the
+stable user interface. They may be imported from
+`ocrmypdf.exceptions`.
+
+```{eval-rst}
+.. list-table:: Return codes
+    :widths: 5 35 60
+    :header-rows: 1
+
+    *   - Code
+        - Name
+        - Interpretation
+    *   - 0
+        - ``ExitCode.ok``
+        - Everything worked as expected.
+    *   - 1
+        - ``ExitCode.bad_args``
+        - Invalid arguments, exited with an error.
+    *   - 2
+        - ``ExitCode.input_file``
+        - The input file does not seem to be a valid PDF.
+    *   - 3
+        - ``ExitCode.missing_dependency``
+        - An external program required by OCRmyPDF is missing.
+    *   - 4
+        - ``ExitCode.invalid_output_pdf``
+        - An output file was created, but it does not seem to be a valid PDF. The file will be available.
+    *   - 5
+        - ``ExitCode.file_access_error``
+        - The user running OCRmyPDF does not have sufficient permissions to read the input file and write the output file.
+    *   - 6
+        - ``ExitCode.already_done_ocr``
+        - The file already appears to contain text so it may not need OCR. See output message.
+    *   - 7
+        - ``ExitCode.child_process_error``
+        - An error occurred in an external program (child process) and OCRmyPDF cannot continue.
+    *   - 8
+        - ``ExitCode.encrypted_pdf``
+        - The input PDF is encrypted. OCRmyPDF does not read encrypted PDFs. Use another program such as ``qpdf`` to remove encryption.
+    *   - 9
+        - ``ExitCode.invalid_config``
+        - A custom configuration file was forwarded to Tesseract using ``--tesseract-config``, and Tesseract rejected this file.
+    *   - 10
+        - ``ExitCode.pdfa_conversion_failed``
+        - A valid PDF was created, PDF/A conversion failed. The file will be available.
+    *   - 15
+        - ``ExitCode.other_error``
+        - Some other error occurred.
+    *   - 130
+        - ``ExitCode.ctrl_c``
+        - The program was interrupted by pressing Ctrl+C.
+
+```
+
+(tmpdir)=
+## Changing temporary storage location
+
+OCRmyPDF generates many temporary files during processing.
+
+To change where temporary files are stored, change the `TMPDIR`
+environment variable for ocrmypdf's environment. (Python's
+`tempfile.gettempdir()` returns the root directory in which temporary
+files will be stored.) For example, one could redirect `TMPDIR` to a
+large RAM disk to avoid wear on HDD/SSD and potentially improve
+performance.
+
+On Windows, the `TEMP` environment variable is used instead.
+
+## Debugging the intermediate files
+
+OCRmyPDF normally saves its intermediate results to a temporary folder
+and deletes this folder when it exits, whether it succeeded or failed.
+
+If the `--keep-temporary-files` (`-k`) argument is issued on the
+command line, OCRmyPDF will keep the temporary folder and print the location,
+whether it succeeded or failed. An example message is:
+
+```none
+Temporary working files retained at:
+/tmp/ocrmypdf.io.u20wpz07
+```
+
+When OCRmyPDF is launched as a snap, this corresponds to the snap filesystem, for instance:
+
+> /tmp/snap-private-tmp/snap.ocrmypdf/tmp/ocrmypdf.io.u20wpz07
+
+The organization of this folder is an implementation detail and subject
+to change between releases. However the general organization is that
+working files on a per page basis have the page number as a prefix
+(starting with page 1), an infix indicates the processing stage, and a
+suffix indicates the file type. Some important files include:
+
+- `_rasterize.png` - what the input page looks like
+- `_ocr.png` - the file that is sent to Tesseract for OCR; depending
+  on arguments this may differ from the presentation image
+- `_pp_deskew.png` - the image, after deskewing
+- `_pp_clean.png` - the image, after cleaning with unpaper
+- `_ocr_hocr.pdf` - the OCR file; appears as a blank page with invisible
+  text embedded
+- `_ocr_hocr.txt` - the OCR text (not necessarily all text on the page,
+  if the page is mixed format)
+- `fix_docinfo.pdf` - a temporary file created to fix the PDF DocumentInfo
+  data structure
+- `graft_layers.pdf` - the rendered PDF with OCR layers grafted on
+- `pdfa.pdf` - `graft_layers.pdf` after conversion to PDF/A
+- `pdfa.ps` - a PostScript file used by Ghostscript for PDF/A conversion
+- `optimize.pdf` - the PDF generated before optimization
+- `optimize.out.pdf` - the PDF generated by optimization
+- `origin` - the input file
+- `origin.pdf` - the input file or the input image converted to PDF
+- `images/*` - images extracted during the optimization process; here
+  the prefix indicates a PDF object ID not a page number

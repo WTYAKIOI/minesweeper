@@ -1,0 +1,83 @@
+name: Problem with third party app that uses OCRmyPDF
+description: |
+  For PDF generation issues with third party software such as Paperless-ngx that
+  uses OCRmyPDF to perform OCR or generate PDFs.
+title: "[3rdparty]: "
+labels: ["triage"]
+assignees:
+  - jbarlow83
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to describe this issue with a particular file
+        and third party app.
+
+        If you are comfortable using OCRmyPDF, please trying to install OCRmyPDF,
+        run it on your file, and see if it works. It's easier for everyone
+        if you can confirm that the issue occurs with OCRmyPDF and not with
+        the third party app.
+  - type: checkboxes
+    attributes:
+      label: Simple sanity checks
+      description: Select all that apply
+      options:
+        - label: This is an issue with an app that uses OCRmyPDF for OCR
+        - label: I am using a recent version of the third party app
+        - label: I will include a file that reproduces the issuse
+  - type: input
+    id: thirdparty-app-name-version
+    attributes:
+      label: Third party app name and version
+      description: e.g. Paperless-ngx 2.9.0
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: Describe the bug
+      description: A clear and concise description of what the bug is.
+      placeholder: Tell us what you see!
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Please include steps to reproduce.
+      value: |
+        1. Import attached file into Paperless-ngx
+        2. Trigger OCR
+        3. Check log file
+        4. ...
+      render: plain text
+  - type: textarea
+    id: files
+    attributes:
+      label: Files
+      description: |
+        Please attach the input and output files, or any screenshots that may be helpful.
+
+        If you cannot provide a test file, we probably won't be able to help with the issue.
+        PDF is a complex file format, and there may be technical details in the PDF that are
+        causing the issue. There's really no substitute for a test file.
+
+        We understand files may contain personal or sensitive information. Here are some options:
+        - Try reproducing the issue with a file from the test suite. (See tests/resources)
+        - Try to create another file in the same way as your private file.
+        - Encrypt the file to OCRmyPDF's private GPG key, and then zip the GPG file.
+        - Use ``qpdf --json yourfile.pdf`` to produce a JSON representation of your file that
+          omits personal information.
+      placeholder: |
+        Drag and drop files here.
+  - type: input
+    id: version
+    attributes:
+      label: OCRmyPDF version
+      description: Paste "ocrmypdf --version" here
+      placeholder: ocrmypdf --version
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log output
+      description: Please copy and paste any relevant log output. This will be automatically formatted into code, so no need for backticks.
+      placeholder: Run OCRmyPDF with verbosity `-v1` to get more detailed logging output.
+      render: plain text

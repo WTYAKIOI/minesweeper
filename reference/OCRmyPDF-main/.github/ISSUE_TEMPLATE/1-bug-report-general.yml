@@ -1,0 +1,72 @@
+name: Installation, packaging, dependencies
+description: Installation, packages, dependencies, "nothing works", test suite failures...
+title: "[Bug]: "
+labels: ["triage"]
+assignees:
+  - jbarlow83
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to fill out this bug report!
+
+        If your issue involves using OCRmyPDF on specific file(s) and not getting
+        good results, this is the *wrong* issue template. Please use the recommended
+        template to ensure we have enough information to help.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What were you trying to do?
+      description: Also tell us, what did you expect to happen?
+      placeholder: Tell us what you see!
+    validations:
+      required: true
+  - type: dropdown
+    id: packaging-system
+    attributes:
+      label: Where are you installing/running from?
+      multiple: true
+      options:
+        - PyPI (pip, poetry, pipx, etc.)
+        - Linux package manager (apt, dnf, etc.)
+        - Wndows package manager (chocolatey, etc.)
+        - Homebrew
+        - Docker container
+        - Ubuntu snap
+        - Conda
+        - source build
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: OCRmyPDF version
+      description: Paste "ocrmypdf --version" here
+  - type: dropdown
+    id: operating-system
+    attributes:
+      label: What operating system are you working on?
+      multiple: true
+      options:
+        - Linux
+        - Windows
+        - macOS
+        - BSD
+  - type: input
+    id: os_version
+    attributes:
+      label: Operating system details and version
+  - type: checkboxes
+    attributes:
+      label: Simple sanity checks
+      description: Select all that apply
+      options:
+        - label: Operating system is currently supported by its vendor (not end of life)
+        - label: Python version is compatible with OCRmyPDF
+        - label: This issue is not about a specific input file
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log output
+      description: Please copy and paste any relevant log output. This will be automatically formatted into code, so no need for backticks.
+      render: plain text

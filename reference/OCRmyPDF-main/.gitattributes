@@ -1,0 +1,18 @@
+# SPDX-FileCopyrightText: 2022 James R. Barlow
+# SPDX-License-Identifier: MPL-2.0
+
+# Always use Unix convention for new lines
+* text eol=lf
+
+# These files are binary and should be left untouched
+# (binary is a macro for -text -diff)
+*.jar	binary
+*.pdf	binary
+*.PDF	binary
+*.png	binary
+*.jpg	binary
+*.bin   binary
+*.afdesign  binary
+*.ttf   binary
+
+.git_archival.txt  export-subst

@@ -1,0 +1,133 @@
+# SPDX-FileCopyrightText: 2022 James R. Barlow
+# SPDX-License-Identifier: MPL-2.0
+
+from __future__ import annotations
+
+import re
+import sys
+from io import StringIO
+from pathlib import Path
+
+import pytest
+from pdfminer.converter import TextConverter
+from pdfminer.layout import LAParams
+from pdfminer.pdfdocument import PDFDocument
+from pdfminer.pdfinterp import PDFPageInterpreter, PDFResourceManager
+from pdfminer.pdfpage import PDFPage
+from pdfminer.pdfparser import PDFParser
+from PIL import Image
+
+from ocrmypdf._exec.tesseract import generate_hocr
+from ocrmypdf.font import MultiFontManager
+from ocrmypdf.fpdf_renderer import Fpdf2PdfRenderer
+from ocrmypdf.helpers import check_pdf
+from ocrmypdf.hocrtransform import HocrParser
+
+from .conftest import check_ocrmypdf
+
+
+def text_from_pdf(filename):
+    output_string = StringIO()
+    with filename.open('rb') as in_file:
+        parser = PDFParser(in_file)
+        doc = PDFDocument(parser)
+        rsrcmgr = PDFResourceManager()
+        device = TextConverter(rsrcmgr, output_string, laparams=LAParams())
+        interpreter = PDFPageInterpreter(rsrcmgr, device)
+        for page in PDFPage.create_pages(doc):
+            interpreter.process_page(page)
+    return output_string.getvalue()
+
+
+# pylint: disable=redefined-outer-name
+
+
+@pytest.fixture
+def font_dir():
+    """Get the font directory."""
+    return Path(__file__).parent.parent / "src" / "ocrmypdf" / "data"
+
+
+@pytest.fixture
+def multi_font_manager(font_dir):
+    """Create a MultiFontManager for tests."""
+    return MultiFontManager(font_dir)
+
+
+@pytest.fixture
+def blank_hocr(tmp_path):
+    im = Image.new('1', (8, 8), 0)
+    im.save(tmp_path / 'blank.tif', format='TIFF')
+    generate_hocr(
+        input_file=tmp_path / 'blank.tif',
+        output_hocr=tmp_path / 'blank.hocr',
+        output_text=tmp_path / 'blank.txt',
+        languages=['eng'],
+        engine_mode=1,
+        tessconfig=[],
+        pagesegmode=3,
+        thresholding=0,
+        user_words=None,
+        user_patterns=None,
+        timeout=None,
+    )
+    return tmp_path / 'blank.hocr'
+
+
+def test_mono_image(blank_hocr, outdir, multi_font_manager):
+    im = Image.new('1', (8, 8), 0)
+    for n in range(8):
+        im.putpixel((n, n), 1)
+    im.save(outdir / 'mono.tif', format='TIFF')
+
+    # Parse hOCR file
+    parser = HocrParser(str(blank_hocr))
+    ocr_page = parser.parse()
+
+    # Use DPI from hOCR or default
+    dpi = ocr_page.dpi or 8
+
+    # Render to PDF using fpdf2
+    renderer = Fpdf2PdfRenderer(
+        page=ocr_page,
+        dpi=dpi,
+        multi_font_manager=multi_font_manager,
+        invisible_text=True,
+    )
+    renderer.render(outdir / 'mono.pdf')
+
+    check_pdf(outdir / 'mono.pdf')
+
+
+@pytest.mark.slow
+def test_fpdf2_matches_sandwich(resources, outdir):
+    """Test that fpdf2 renderer produces similar output to sandwich renderer."""
+    # Note: hocr renderer now redirects to fpdf2
+    check_ocrmypdf(
+        resources / 'ccitt.pdf', outdir / 'fpdf2.pdf', '--pdf-renderer=fpdf2'
+    )
+    check_ocrmypdf(
+        resources / 'ccitt.pdf', outdir / 'tess.pdf', '--pdf-renderer=sandwich'
+    )
+
+    # Slight differences in spacing and word order can appear, so at least ensure
+    # that we get all of the same words...
+    def clean(s):
+        s = re.sub(r'\s+', ' ', s)
+        words = s.split(' ')
+        return set(words)
+
+    fpdf2_words = clean(text_from_pdf(outdir / 'fpdf2.pdf'))
+    tess_words = clean(text_from_pdf(outdir / 'tess.pdf'))
+
+    similarity = len(fpdf2_words & tess_words) / len(fpdf2_words | tess_words)
+
+    # The Windows Tesseract build (UB Mannheim) emits slightly different
+    # hOCR/PDF coordinates than Linux/macOS builds, flipping a few borderline
+    # pdfminer word-merge decisions, so allow it more slack.
+    threshold = 0.95 if sys.platform == 'win32' else 0.99
+    assert similarity > threshold, (
+        f"similarity {similarity} <= {threshold}\n"
+        f"fpdf2 only: {sorted(fpdf2_words - tess_words)}\n"
+        f"sandwich only: {sorted(tess_words - fpdf2_words)}"
+    )

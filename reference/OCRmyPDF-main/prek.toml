@@ -1,0 +1,64 @@
+# prek pre-commit configuration — https://prek.j178.dev
+#
+# The local/system hooks below invoke the project's OWN pinned tools (ruff/mypy
+# from uv.lock) and mirror .github/workflows/build.yml's lint job exactly, so
+# they can never drift from CI's versions or rules. prek installs nothing of
+# its own for them — "system" language just execs whatever `uv run` resolves.
+#
+# The pre-commit/pre-commit-hooks repo hooks below are generic file checks with
+# no project-local tool equivalent, so they're kept as a normal (non-local) repo.
+#
+# Run all checks manually: `uv run prek run --all-files`
+# Install the git hooks:   `uv run prek install`
+
+default_install_hook_types = ["pre-commit", "pre-push"]
+default_stages = ["pre-commit"]
+
+[[repos]]
+repo = "https://github.com/pre-commit/pre-commit-hooks"
+rev = "v4.4.0"
+
+[[repos.hooks]]
+id = "check-case-conflict"
+
+[[repos.hooks]]
+id = "check-merge-conflict"
+
+[[repos.hooks]]
+id = "check-toml"
+
+[[repos.hooks]]
+id = "check-yaml"
+
+[[repos.hooks]]
+id = "debug-statements"
+
+[[repos]]
+repo = "local"
+
+[[repos.hooks]]
+id = "ruff-format"
+name = "ruff format (check)"
+language = "system"
+entry = "uv run ruff format --check ."
+types = ["python"]
+pass_filenames = false
+require_serial = true
+
+[[repos.hooks]]
+id = "ruff-check"
+name = "ruff check"
+language = "system"
+entry = "uv run ruff check ."
+types = ["python"]
+pass_filenames = false
+require_serial = true
+
+[[repos.hooks]]
+id = "mypy"
+name = "mypy"
+language = "system"
+entry = "uv run mypy src/ocrmypdf"
+types = ["python"]
+pass_filenames = false
+require_serial = true
