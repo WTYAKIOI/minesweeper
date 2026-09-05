@@ -117,12 +117,29 @@ async fn run_analyze(
         .collect();
     let remaining_mines = request["remaining_mines"].as_u64().unwrap_or(0) as u32;
 
-    let view = crate::model::PlayerView::from_2d(&board, remaining_mines);
-    if !view.validate() {
-        return Err("棋盘不合法".into());
+    // 旗帜正确性判定 (容错视图: 矛盾旗降级为未知, 推理不再信任误标旗)
+    let (view, flag_verification, flag_proofs) = crate::engine::verify_board_full(&board, remaining_mines);
+    if flag_verification.has_contradiction {
+        println!("[旗帜验证] {}", flag_verification.summary);
+        for f in flag_verification
+            .flags
+            .iter()
+            .filter(|f| f.status == crate::model::FlagVerifyStatus::Contradicted)
+        {
+            println!("  [矛盾旗] {} — {}", f.coord, f.reason);
+        }
     }
 
-    let deterministic = crate::engine::DeterministicEngine::solve_with_subset_rule(&view);
+    let mut deterministic = crate::engine::DeterministicEngine::solve_with_subset_rule(&view);
+    let has_coord = |c: &crate::model::Coord, proofs: &[crate::model::Proof]| proofs.iter().any(|p| &p.conclusion.coord == c);
+    for p in flag_proofs
+        .iter()
+        .chain(crate::engine::derive_local_forced_proofs(&view).iter())
+    {
+        if !has_coord(&p.conclusion.coord, &deterministic) {
+            deterministic.push(p.clone());
+        }
+    }
 
     let known_mines: std::collections::HashSet<_> = deterministic
         .iter()
@@ -135,13 +152,48 @@ async fn run_analyze(
         .map(|p| p.conclusion.coord)
         .collect();
 
-    let probabilities = crate::engine::ProbabilityEngine::compute(&view, &known_mines, &known_safe);
+    // 剩余雷数已为 0: 所有未知格必为安全
+    if view.remaining_mines == 0 {
+        for c in &view.unknown {
+            let covered = deterministic.iter().any(|p| p.conclusion.coord == *c);
+            if !covered {
+                deterministic.push(crate::model::Proof {
+                    conclusion: crate::model::Conclusion { coord: *c, is_mine: false },
+                    depends_on: Vec::new(),
+                    rule: "剩余雷数已为 0, 该格必为安全".to_string(),
+                });
+            }
+        }
+    }
+    let mut probabilities = crate::engine::ProbabilityEngine::compute(&view, &known_mines, &known_safe);
+    // 雷概率 = 0 的格 → 判定为安全并给出理由 (与 Web 管道一致)
+    let mut zero_safe: std::collections::HashSet<crate::model::Coord> = std::collections::HashSet::new();
+    for p in &probabilities {
+        if p.mine_probability > 0.0 || known_mines.contains(&p.coord) || known_safe.contains(&p.coord) {
+            continue;
+        }
+        zero_safe.insert(p.coord);
+        let reason = if view.remaining_mines == 0 {
+            "剩余雷数已为 0, 该格必为安全".to_string()
+        } else {
+            "约束解析下该格雷概率为 0%, 判定为安全".to_string()
+        };
+        deterministic.push(crate::model::Proof {
+            conclusion: crate::model::Conclusion { coord: p.coord, is_mine: false },
+            depends_on: view.revealed.iter()
+                .filter(|rv| rv.coord.neighbors(view.width, view.height).contains(&p.coord))
+                .map(|rv| rv.coord).take(8).collect(),
+            rule: reason,
+        });
+    }
+    probabilities.retain(|p| !zero_safe.contains(&p.coord));
     let regions = crate::engine::RegionAnalyzer::analyze(&view, &probabilities);
 
     let ir = crate::model::InferenceIR {
         deterministic,
         probabilities,
         regions,
+        flag_verification,
     };
 
     let llm_mode = match mode.as_str() {

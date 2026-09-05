@@ -69,7 +69,7 @@ impl ProbabilityEngine {
         let unknown_set: HashSet<Coord> = unknowns.iter().copied().collect();
 
         // 1. 构建约束 (参考 minesweeper_solver._apply_direct_constraints)
-        let constraints = Self::build_constraints(view, &state, known_mines);
+        let constraints = Self::build_constraints(view, &state, known_mines, known_safe);
 
         // 2. 初始化概率 (参考 minesweeper_solver._initialize_probabilities)
         let mut probs: HashMap<Coord, f64> = HashMap::new();
@@ -144,10 +144,14 @@ impl ProbabilityEngine {
     }
 
     /// 构建约束列表: (未知邻居, 剩余雷数)
+    /// 注意: 已知安全格 (known_safe) 不得作为变量参与约束 —— 否则采样空间会把
+    /// 已被证明必安全的格当"可放雷"处理, 破坏链式结论 (如 3 的 1/2 分组瓜分后
+    /// 相邻格本应恒安全, 却因组内混入已知安全格而算出非零概率)。
     fn build_constraints(
         view: &PlayerView,
         state: &HashMap<Coord, CellState>,
         known_mines: &HashSet<Coord>,
+        known_safe: &HashSet<Coord>,
     ) -> Vec<Constraint> {
         view.revealed.iter().filter_map(|cell| {
             let neighbors = cell.coord.neighbors(view.width, view.height);
@@ -155,6 +159,7 @@ impl ProbabilityEngine {
                 .filter(|n| {
                     matches!(state.get(n), Some(CellState::Unknown))
                         && !known_mines.contains(n)
+                        && !known_safe.contains(n)
                 })
                 .copied()
                 .collect();
@@ -366,5 +371,28 @@ impl ProbabilityEngine {
                 break;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// known_safe 格不得作为约束变量泄漏: 若泄漏, 其余候选格概率会被稀释。
+    #[test]
+    fn test_known_safe_not_leaked_into_constraints() {
+        // 两个 1 与两个未知格构成 2 选 1 约束组
+        // 若 (1,0) 被证明必安全, (0,1) 应成为唯一候选 → 概率 1.0
+        let board = vec![vec![1, -1], vec![-1, 1]];
+        let view = PlayerView::from_2d(&board, 1);
+        let safe: HashSet<Coord> = HashSet::from([Coord::new(1, 0)]);
+        let probs = ProbabilityEngine::compute(&view, &HashSet::new(), &safe);
+        let p01 = probs.iter().find(|p| p.coord == Coord::new(0, 1)).map(|p| p.mine_probability);
+        assert!(
+            probs.iter().all(|p| p.coord != Coord::new(1, 0)),
+            "known_safe 格不应出现在结果中"
+        );
+        let expected = p01.unwrap_or(0.0);
+        assert!((expected - 1.0).abs() < 1e-6, "唯一候选应为必雷, got {}", expected);
     }
 }

@@ -212,6 +212,24 @@
 
         .empty-tip { color: var(--text-sub); font-size: 13px; text-align: center; padding: 30px 0; }
 
+        /* ============ 旗帜验证区块 ============ */
+        .bad-flag {
+            display: flex;
+            gap: 8px;
+            align-items: flex-start;
+            background: rgba(155, 89, 182, 0.08);
+            border: 1px solid rgba(155, 89, 182, 0.35);
+            color: #9B59B6;
+            border-radius: 6px;
+            padding: 7px 10px;
+            margin-bottom: 6px;
+            font-size: 12px;
+            line-height: 1.6;
+            cursor: pointer;
+        }
+        .bad-flag:hover { background: rgba(155, 89, 182, 0.16); }
+        .bad-flag b { color: #8E44AD; }
+
         /* ============ 对话区 ============ */
         #chatLog {
             height: 240px;
@@ -526,6 +544,34 @@
             padding: 20px;
         }
         #usageOverlay.show { display: flex; }
+        /* ============ 编辑确认弹窗 (分析后锁定棋盘) ============ */
+        #editConfirmOverlay {
+            position: fixed;
+            inset: 0;
+            background: rgba(0, 0, 0, 0.45);
+            display: none;
+            align-items: center;
+            justify-content: center;
+            z-index: 210;
+            padding: 20px;
+        }
+        #editConfirmOverlay.show { display: flex; }
+        #editConfirmOverlay .edit-box {
+            background: var(--card-bg);
+            border-radius: 8px;
+            box-shadow: var(--shadow);
+            max-width: 420px;
+            width: 100%;
+            padding: 22px;
+        }
+        #editConfirmOverlay h3 { font-size: 16px; margin-bottom: 10px; }
+        #editConfirmOverlay p { font-size: 13px; line-height: 1.7; color: var(--text); margin-bottom: 6px; }
+        #editConfirmOverlay .edit-actions {
+            display: flex;
+            gap: 10px;
+            justify-content: flex-end;
+            margin-top: 18px;
+        }
         .usage-box {
             background: var(--card-bg);
             border-radius: 8px;
@@ -765,6 +811,17 @@
                     <div class="card-title" style="font-size:14px;"><span>推理链</span></div>
                     <ol id="proofList"></ol>
                 </div>
+                <div id="flagSection" class="hidden" style="margin-top:14px;">
+                    <div class="card-title" style="font-size:14px;">
+                        <span>🚩 旗帜验证</span>
+                        <span class="sub" id="flagSummary"></span>
+                    </div>
+                    <div id="flagBadList"></div>
+                    <div id="flagOkLine" style="font-size:12px;color:var(--text-sub);margin-top:6px;line-height:1.6;"></div>
+                    <div style="margin-top:10px;display:none;" id="flagRemoveWrap">
+                        <button class="secondary small" onclick="removeContradictedFlags()">🧹 移除矛盾旗并重新分析</button>
+                    </div>
+                </div>
                 <div id="probSection" class="hidden" style="margin-top:14px;">
                     <div class="card-title" style="font-size:14px;"><span>待定格雷概率（由低到高）</span></div>
                     <div class="prob-list" id="probList"></div>
@@ -859,6 +916,20 @@
         </div>
     </div>
 
+    <!-- ============ 编辑确认弹窗 (分析后棋盘锁定) ============ -->
+    <div id="editConfirmOverlay" onclick="if(event.target===this) closeEditConfirm(false)">
+        <div class="edit-box">
+            <h3>✏️ 编辑棋盘？</h3>
+            <p>当前已有分析结果（必雷/必安全高亮与解读）。</p>
+            <p>继续编辑将<b style="color:#E74C3C;">清除当前分析结果</b>，棋盘将恢复为普通编辑态。</p>
+            <p class="sub" style="color:var(--text-sub);">提示：编辑完成后可随时点击「⚡ 分析局面」重新分析。</p>
+            <div class="edit-actions">
+                <button class="secondary" onclick="closeEditConfirm(false)">取消</button>
+                <button onclick="closeEditConfirm(true)">✏️ 继续编辑</button>
+            </div>
+        </div>
+    </div>
+
     <!-- 帮助弹窗 -->
     <div id="helpOverlay" onclick="if(event.target===this) toggleHelp(false)">
         <div class="help-box">
@@ -874,6 +945,8 @@
                 <li><b>左键</b>：未知 → 数字 1→2→…→8 → 回到未知</li>
                 <li><b>右键</b>：插旗 🚩 / 取消旗帜</li>
                 <li><b>Shift + 左键</b>：清除为已翻开的 0</li>
+                <li><b>分析后棋盘锁定</b>：点击棋盘会先弹窗确认，确认后清除分析结果进入编辑</li>
+                <li><b>悬停提示</b>：鼠标指向任意格子显示其坐标与状态；有分析结果时附带必雷/必安全/雷概率</li>
             </ul>
             <h4>文本棋盘格式</h4>
             <p><code>? / -1</code> = 未知，<code>F / 🚩 / -2</code> = 旗帜，<code>0-8</code> = 已翻开数字，支持空格或逗号分隔，每行一排。</p>
@@ -1509,7 +1582,24 @@
         }
 
         // 文本棋盘解析: ? / F / 🚩 / 0-8 (AGENT-UI.md §4.1)
-        function parseTextBoard(text) {
+        // 文本棋盘解析的"语义核心"在 Rust agent 模块 (POST /api/board/parse),
+        // 含剩余雷数推断; 本地 parseTextBoard / loadBoard 推断仅作离线镜像。
+        async function parseTextBoardRust(text) {
+            try {
+                const resp = await fetch('/api/board/parse', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ text })
+                });
+                const data = await resp.json();
+                if (data.success && Array.isArray(data.board) && data.board.length) {
+                    return { board: data.board, mines: data.inferred_mines };
+                }
+            } catch (e) { /* 离线回退 */ }
+            return null;
+        }
+
+        function parseTextBoard(text) {       // 离线镜像 (语义同 Rust parse_text_board)
             const lines = text.trim().split(/\r?\n/).map(l => l.trim()).filter(l => l.length);
             if (lines.length < 2) return null;
             const board = [];
@@ -1518,7 +1608,7 @@
                 if (!tokens.length) return null;
                 const row = tokens.map(tok => {
                     const t = tok.replace(/[,;]/g, '');
-                    if (t === '?' || t === '？' || t === '-1' || t === '·' || t === 'x' || t === 'X') return -1;
+                    if (t === '?' || t === '？' || t === '-1' || t === '·' || t === 'x' || t === 'X' || t === 'U' || t === 'u') return -1;
                     if (t === 'F' || t === 'f' || t === '🚩' || t === 'P' || t === 'p' || t === '-2') return -2;
                     if (/^[0-8]$/.test(t)) return parseInt(t, 10);
                     return NaN;
@@ -1531,10 +1621,22 @@
             return board;
         }
 
+        // 载入文本棋盘: 优先 Rust 解析 (含雷数推断), 失败回退本地
+        async function loadTextBoard(text) {
+            const r = await parseTextBoardRust(text);
+            if (r) {
+                loadBoard(r.board, r.mines);
+                return r.board;
+            }
+            const parsed = parseTextBoard(text);
+            if (!parsed) return null;
+            loadBoard(parsed, null);
+            return parsed;
+        }
+
         function loadBoard(newBoard, mines) {
             board = newBoard;
-            // 参考 minesweeper_solver 标准: 9×9=10, 16×16=40, 30×16=99
-            // OCR 未识别到雷数时, 按棋盘尺寸推断 (总雷数 - 已标旗数)
+            // 离线镜像: OCR/本地解析未带雷数时按标准尺寸推断 (总雷数 - 已标旗数)
             if (mines == null && board.length && board[0].length) {
                 const stdMines = { '9,9': 10, '16,16': 40, '30,16': 99, '16,30': 99 };
                 const key = board.length + ',' + board[0].length;
@@ -1590,6 +1692,9 @@
             }
             const mineSet = new Set(lastIR ? lastIR.deterministic.filter(p => p.conclusion.is_mine).map(p => p.conclusion.coord.y * 100000 + p.conclusion.coord.x) : []);
             const safeSet = new Set(lastIR ? lastIR.deterministic.filter(p => !p.conclusion.is_mine).map(p => p.conclusion.coord.y * 100000 + p.conclusion.coord.x) : []);
+            const badFlagSet = new Set(lastIR && lastIR.flag_verification
+                ? lastIR.flag_verification.flags.filter(f => f.status === 'Contradicted').map(f => f.coord.y * 100000 + f.coord.x)
+                : []);
             const hlSet = new Set(highlightedStep ? highlightedStep.map(c => c.y * 100000 + c.x) : []);
 
             // 坐标标签
@@ -1635,6 +1740,18 @@
                     if (val === -2) {
                         ctx.font = (cellSize * 0.55) + 'px sans-serif';
                         ctx.fillText('🚩', px + cellSize / 2, py + cellSize / 2 + 1);
+                        if (badFlagSet.has(key)) {
+                            ctx.strokeStyle = '#9B59B6';
+                            ctx.lineWidth = Math.max(2, cellSize / 9);
+                            ctx.strokeRect(px + 1.5, py + 1.5, cellSize - 3, cellSize - 3);
+                            ctx.fillStyle = '#E74C3C';
+                            ctx.font = 'bold ' + Math.max(10, cellSize * 0.4) + 'px sans-serif';
+                            ctx.textAlign = 'right';
+                            ctx.textBaseline = 'top';
+                            ctx.fillText('❓', px + cellSize - 2, py + 1);
+                            ctx.textAlign = 'center';
+                            ctx.textBaseline = 'middle';
+                        }
                     } else if (val >= 0 && val <= 8) {
                         if (val > 0) {
                             ctx.fillStyle = DIGIT_COLORS[val];
@@ -1689,56 +1806,118 @@
             return { x, y };
         }
 
+        /* ============ 编辑状态机: 语义由 Rust agent 模块裁决 ============
+           前端把 (board, x, y, op) 发给 POST /api/board/op, 以返回棋盘为准;
+           仅当后端不可达(离线)时回退到本地镜像, 保证 UI 可用。 */
+        function localBoardOp(x, y, op) {
+            const out = board.map(r => r.slice());
+            const cur = out[y][x];
+            if (op === 'flag') {
+                out[y][x] = cur === -2 ? -1 : cur === -1 ? -2 : cur;
+            } else if (op === 'clear') {
+                out[y][x] = 0;
+            } else {
+                if (cur === -1 || cur === -2) out[y][x] = 1;
+                else if (cur >= 1 && cur < 8) out[y][x] = cur + 1;
+                else if (cur === 8) out[y][x] = -1;
+            }
+            return out;
+        }
+
+        async function serverBoardOp(x, y, op) {
+            try {
+                const resp = await fetch('/api/board/op', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ board, x, y, op })
+                });
+                const data = await resp.json();
+                if (data.success && Array.isArray(data.board) && data.board.length === board.length) {
+                    board = data.board;
+                    return true;
+                }
+            } catch (e) { /* 离线回退 */ }
+            return false;
+        }
+
+        /* ============ 编辑确认 (分析后棋盘锁定) ============ */
+        let editConfirmResolve = null;
+
+        function closeEditConfirm(allow) {
+            document.getElementById('editConfirmOverlay').classList.remove('show');
+            if (editConfirmResolve) {
+                const r = editConfirmResolve;
+                editConfirmResolve = null;
+                r(allow);
+            }
+        }
+
+        // 棋盘已有分析结果时锁定编辑: 需弹窗确认 (确认后清除分析, 恢复编辑)
+        function requestEditUnlock() {
+            if (!lastIR) return Promise.resolve(true);
+            return new Promise((resolve) => {
+                editConfirmResolve = resolve;
+                document.getElementById('editConfirmOverlay').classList.add('show');
+            });
+        }
+
+        // 统一入口: 校验锁 → (Rust 裁决) 编辑 → 清除分析 → 重绘
+        async function performBoardEdit(c, opLabel) {
+            const allow = await requestEditUnlock();
+            if (!allow) return;
+            if (!(await serverBoardOp(c.x, c.y, opLabel))) {
+                board = localBoardOp(c.x, c.y, opLabel);   // 离线镜像
+            }
+            clearAnalysis();
+            drawBoard();
+            updateMeta();
+        }
+
         canvas.addEventListener('click', (e) => {
             const c = cellFromEvent(e);
             if (!c) return;
-            const cur = board[c.y][c.x];
-            if (e.shiftKey) {
-                board[c.y][c.x] = 0;                          // Shift+左键 → 快速设 0
-            } else if (cur === -1 || cur === -2) {
-                board[c.y][c.x] = 1;                          // 未知/旗帜 → 1
-            } else if (cur >= 0 && cur < 8) {
-                board[c.y][c.x] = cur + 1;                    // 数字递增
-            } else {
-                board[c.y][c.x] = -1;                         // 8 → 未知
-            }
-            clearAnalysis();
-            drawBoard();
-            updateMeta();
+            performBoardEdit(c, e.shiftKey ? 'clear' : 'cycle');
         });
 
-        canvas.addEventListener('contextmenu', (e) => {        // 右键: 插旗切换
+        canvas.addEventListener('contextmenu', (e) => {        // 右键: 插旗切换 (Rust 裁决)
             e.preventDefault();
             const c = cellFromEvent(e);
             if (!c) return;
-            board[c.y][c.x] = board[c.y][c.x] === -2 ? -1 : -2;
-            clearAnalysis();
-            drawBoard();
-            updateMeta();
+            performBoardEdit(c, 'flag');
         });
 
-        /* ==================== 悬停提示 (AGENT-UI.md §8.2) ==================== */
+        /* ==================== 悬停提示 (任意格子显示坐标 + 状态; 分析后附结论/概率) ==================== */
         canvas.addEventListener('mousemove', (e) => {
-            if (!lastIR) { cellTip.style.display = 'none'; return; }
             const c = cellFromEvent(e);
             if (!c) { cellTip.style.display = 'none'; return; }
-            const key = c.y * 100000 + c.x;
-            const proof = lastIR.deterministic.find(p => p.conclusion.coord.x === c.x && p.conclusion.coord.y === c.y);
-            const prob = lastIR.probabilities.find(p => p.coord.x === c.x && p.coord.y === c.y);
-            if (!proof && !prob) { cellTip.style.display = 'none'; return; }
 
-            let html = `<b>坐标 (${c.x}, ${c.y})</b><br>`;
-            if (proof) {
-                html += proof.conclusion.is_mine
-                    ? `<span style="color:#E74C3C;font-weight:700">必雷</span>`
-                    : `<span style="color:#2ECC71;font-weight:700">必安全</span>`;
-                html += ` — ${escapeHtml(proof.rule)}<br>`;
-                if (proof.depends_on.length) {
-                    html += `依据数字: ` + proof.depends_on.slice(0, 6).map(d => `(${d.x},${d.y})`).join(' ');
+            const v = board[c.y][c.x];
+            let state, stateColor = '';
+            if (v === -1) { state = '未知'; stateColor = '#95A5A6'; }
+            else if (v === -2) { state = '旗帜 🚩'; stateColor = '#E74C3C'; }
+            else if (v === 0) { state = '已翻开 · 空白'; }
+            else { state = '已翻开 · 数字 ' + v; }
+
+            let html = `<b>坐标 (${c.x}, ${c.y})</b> · ` +
+                `<span style="${stateColor ? 'color:' + stateColor + ';font-weight:600;' : ''}">${state}</span>`;
+
+            if (lastIR) {
+                const key = c.y * 100000 + c.x;
+                const proof = lastIR.deterministic.find(p => p.conclusion.coord.x === c.x && p.conclusion.coord.y === c.y);
+                const prob = lastIR.probabilities.find(p => p.coord.x === c.x && p.coord.y === c.y);
+                if (proof) {
+                    html += proof.conclusion.is_mine
+                        ? '<br><span style="color:#E74C3C;font-weight:700">必雷</span>'
+                        : '<br><span style="color:#2ECC71;font-weight:700">必安全</span>';
+                    html += ` — ${escapeHtml(proof.rule)}`;
+                    if (proof.depends_on.length) {
+                        html += '<br>依据数字: ' + proof.depends_on.slice(0, 6).map(d => `(${d.x},${d.y})`).join(' ');
+                    }
+                } else if (prob) {
+                    html += `<br>雷概率 <b>${(prob.mine_probability * 100).toFixed(1)}%</b> · 信息增益 ${prob.info_gain.toFixed(1)} 格`;
                 }
-            } else if (prob) {
-                html += `雷概率 <b>${(prob.mine_probability * 100).toFixed(1)}%</b> · 信息增益 ${prob.info_gain.toFixed(1)} 格`;
             }
+
             cellTip.innerHTML = html;
             cellTip.style.display = 'block';
             const tw = cellTip.offsetWidth, thh = cellTip.offsetHeight;
@@ -1830,7 +2009,7 @@
         }
 
         // 粘贴: 图像 → OCR, 文本棋盘 → 载入 (AGENT-UI.md §7.3)
-        chatInput.addEventListener('paste', (e) => {
+        chatInput.addEventListener('paste', async (e) => {
             const items = e.clipboardData.items;
             for (const item of items) {
                 if (item.type.startsWith('image/')) {
@@ -1842,12 +2021,11 @@
             }
             const text = e.clipboardData.getData('text/plain');
             if (text) {
-                const parsed = parseTextBoard(text);
-                if (parsed) {
+                const loaded = await loadTextBoard(text);   // Rust 解析优先
+                if (loaded) {
                     e.preventDefault();
-                    loadBoard(parsed);
                     addChat('user', text.split('\n').slice(0, 3).join('\n') + (text.split('\n').length > 3 ? '\n…' : ''));
-                    addChat('system', `✅ 已识别 ${parsed.length}×${parsed[0].length} 文本棋盘并载入。`);
+                    addChat('system', `✅ 已识别 ${loaded.length}×${loaded[0].length} 文本棋盘并载入。`);
                 }
             }
         });
@@ -1870,11 +2048,10 @@
             chatInput.value = '';
             chatInput.style.height = '66px';
 
-            const parsed = parseTextBoard(text);
-            if (parsed) {                                        // 文本棋盘
+            const loaded = await loadTextBoard(text);        // Rust 解析优先
+            if (loaded) {                                    // 文本棋盘
                 addChat('user', text);
-                loadBoard(parsed);
-                addChat('system', `✅ 已识别 ${parsed.length}×${parsed[0].length} 文本棋盘并载入，点击「分析局面」开始推理。`);
+                addChat('system', `✅ 已识别 ${loaded.length}×${loaded[0].length} 文本棋盘并载入，点击「分析局面」开始推理。`);
                 return;
             }
             addChat('user', text);                               // 普通提问 → 带着当前局面分析
@@ -1916,6 +2093,7 @@
             document.getElementById('proofSection').classList.add('hidden');
             document.getElementById('probSection').classList.add('hidden');
             document.getElementById('analysisSection').classList.add('hidden');
+            document.getElementById('flagSection').classList.add('hidden');
         }
 
         async function runAnalyze(opts = {}) {
@@ -1978,8 +2156,15 @@
             lastView = data.view;
             highlightedStep = null;
 
-            const mines = data.ir.deterministic.filter(p => p.conclusion.is_mine);
-            const safes = data.ir.deterministic.filter(p => !p.conclusion.is_mine);
+            // 旗帜格的结论已体现在棋盘上 (🚩/紫框) 与悬停提示中,
+            // 推理链/统计列表不再重复罗列旗帜格, 避免冗长。
+            const flagKey = new Set();
+            board.forEach((row, y) => row.forEach((v, x) => { if (v === -2) flagKey.add(y * 100000 + x); }));
+            const notFlagged = p => !flagKey.has(p.conclusion.coord.y * 100000 + p.conclusion.coord.x);
+            const actionable = data.ir.deterministic.filter(notFlagged);
+
+            const mines = actionable.filter(p => p.conclusion.is_mine);
+            const safes = actionable.filter(p => !p.conclusion.is_mine);
 
             // 统计
             document.getElementById('stats').innerHTML = `
@@ -1990,10 +2175,17 @@
                 <div class="stat-item">必安全<b style="color:#2ECC71">${safes.length}</b></div>
                 <div class="stat-item">LLM<b>${data.used_llm ? '已调用' : '本地'}</b></div>`;
 
-            // 推理链: 点击 → 高亮涉及格子
+            // 推理链: 点击 → 高亮涉及格子 (旗帜格已过滤, 其结论见棋盘悬停提示)
             const proofList = document.getElementById('proofList');
             proofList.innerHTML = '';
-            data.ir.deterministic.forEach((p, i) => {
+            if (!actionable.length && data.ir.deterministic.length) {
+                const note = document.createElement('div');
+                note.className = 'empty-tip';
+                note.style.padding = '8px 0';
+                note.textContent = '本步的确定性结论均针对已标旗帜的格子，悬停对应格子即可查看依据；此处仅列出面向未知格的推理。';
+                proofList.appendChild(note);
+            }
+            actionable.forEach((p, i) => {
                 const li = document.createElement('li');
                 const tag = p.conclusion.is_mine
                     ? '<span class="mine-tag">必雷</span>'
@@ -2009,7 +2201,10 @@
                 };
                 proofList.appendChild(li);
             });
-            document.getElementById('proofSection').classList.toggle('hidden', !data.ir.deterministic.length);
+            document.getElementById('proofSection').classList.toggle('hidden', !actionable.length);
+
+            // 旗帜验证 (Rust 端在推理前完成判定, 随 IR 返回)
+            renderFlagVerification(data.ir.flag_verification);
 
             // 待定格概率 (升序, 最多 12 个)
             const probs = [...data.ir.probabilities]
@@ -2030,32 +2225,118 @@
             document.getElementById('analysisSection').classList.remove('hidden');
         }
 
-        /* ==================== 导出 ==================== */
-        function exportResult() {
-            if (!lastIR || !lastView) {
-                addChat('system', '暂无可导出的结果，请先点击「分析局面」。');
+        /* ==================== 旗帜验证展示 ==================== */
+        const FLAG_STATUS_UI = {
+            Verified: '✅ 确认正确',
+            Contradicted: '❌ 矛盾旗',
+            Suspected: '❔ 无法确认',
+        };
+
+        function renderFlagVerification(fv) {
+            const sec = document.getElementById('flagSection');
+            const badList = document.getElementById('flagBadList');
+            const okLine = document.getElementById('flagOkLine');
+            const rmWrap = document.getElementById('flagRemoveWrap');
+            if (!fv || !fv.flags || !fv.flags.length) {      // 无旗帜 / 旧后端无此字段
+                sec.classList.add('hidden');
                 return;
             }
-            const mines = lastIR.deterministic.filter(p => p.conclusion.is_mine);
-            const safes = lastIR.deterministic.filter(p => !p.conclusion.is_mine);
-            const boardText = board.map(r => r.map(v => v === -1 ? '?' : v === -2 ? 'F' : String(v)).join(' ')).join('\n');
-            const md = [
-                '# 扫雷认知助手 · 分析结果', '',
-                `- 棋盘: ${lastView.width}×${lastView.height} · 剩余雷数: ${lastView.remaining_mines}`,
-                `- 必雷: ${mines.length} 格 · 必安全: ${safes.length} 格`, '',
-                '## 棋盘', '```', boardText, '```', '',
-                '## 推理链', ...lastIR.deterministic.map((p, i) =>
-                    `${i + 1}. ${p.conclusion.is_mine ? '必雷' : '必安全'} (${p.conclusion.coord.x}, ${p.conclusion.coord.y}) — ${p.rule}`),
-                '', '## 解读', '', lastAnalysis, '',
-                `> 导出时间: ${new Date().toLocaleString('zh-CN')}`
-            ].join('\n');
-            const blob = new Blob([md], { type: 'text/markdown;charset=utf-8' });
+            const contrad = fv.flags.filter(f => f.status === 'Contradicted');
+            const verified = fv.flags.filter(f => f.status === 'Verified');
+            const suspected = fv.flags.filter(f => f.status === 'Suspected');
+
+            document.getElementById('flagSummary').textContent = fv.summary || '';
+
+            // 矛盾旗列表 (点击 → 棋盘高亮该旗)
+            if (contrad.length) {
+                badList.innerHTML = contrad.map(f => `
+                    <div class="bad-flag" data-x="${f.coord.x}" data-y="${f.coord.y}">
+                        <span>❌</span>
+                        <span><b>(${f.coord.x}, ${f.coord.y})</b><br>${escapeHtml(f.reason)}</span>
+                    </div>`).join('');
+                badList.querySelectorAll('.bad-flag').forEach(el => {
+                    el.onclick = () => {
+                        const x = parseInt(el.dataset.x, 10), y = parseInt(el.dataset.y, 10);
+                        highlightedStep = [{ x, y }];
+                        drawBoard();
+                        canvas.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+                    };
+                });
+                badList.style.display = '';
+                rmWrap.style.display = '';
+            } else {
+                badList.innerHTML = '';
+                badList.style.display = 'none';
+                rmWrap.style.display = 'none';
+            }
+
+            const parts = [];
+            if (verified.length) {
+                const coords = verified.slice(0, 8).map(f => `(${f.coord.x},${f.coord.y})`).join(' ');
+                parts.push(`✅ 经推理确认必为雷: ${coords}${verified.length > 8 ? ' …' : ''}`);
+            }
+            if (suspected.length) {
+                parts.push(`❔ ${suspected.length} 面旗与当前数字约束无矛盾（但推理暂无法确认必为雷）`);
+            }
+            if (!contrad.length) {
+                parts.push('🎉 所有旗帜与当前棋盘约束自洽，推理未发现误标。');
+            }
+            okLine.innerHTML = parts.join('<br>');
+            sec.classList.remove('hidden');
+        }
+
+        // P2: 一键移除矛盾旗并重新分析 (显式操作, 不受棋盘锁定限制)
+        async function removeContradictedFlags() {
+            if (!lastIR || !lastIR.flag_verification) return;
+            const bad = lastIR.flag_verification.flags.filter(f => f.status === 'Contradicted');
+            if (!bad.length) return;
+            if (!confirm(`将移除 ${bad.length} 面矛盾旗并重新分析，继续？`)) return;
+            for (const f of bad) {
+                const y = f.coord.y, x = f.coord.x;
+                if (board[y] && board[y][x] === -2) board[y][x] = -1;
+            }
+            clearAnalysis();
+            drawBoard();
+            updateMeta();
+            addChat('system', `🧹 已移除 ${bad.length} 面矛盾旗，正在重新分析…`);
+            await runAnalyze();
+        }
+
+        /* ==================== 导出 ==================== */
+        // Markdown 报告由 Rust agent 模块构建 (POST /api/export), 前端只下载
+        async function exportResult() {
+            if (!board.length) {
+                addChat('system', '暂无可导出的棋盘，请先录入局面。');
+                return;
+            }
+            const remaining = parseInt(document.getElementById('mineCount').value, 10) || 0;
+            try {
+                const resp = await fetch('/api/export', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        board,
+                        remaining_mines: remaining,
+                        analysis: lastAnalysis || null,
+                    })
+                });
+                if (!resp.ok) throw new Error(await resp.text());
+                const data = await resp.json();
+                if (!data.success || !data.markdown) throw new Error(data.error || '导出失败');
+                downloadText(data.markdown, `minesweeper-analysis-${Date.now()}.md`, 'text/markdown;charset=utf-8');
+                addChat('system', '📤 已导出 Markdown 分析报告。');
+            } catch (e) {
+                addChat('system', '❌ 导出失败: ' + e.message);
+            }
+        }
+
+        function downloadText(text, filename, mime) {
+            const blob = new Blob([text], { type: mime });
             const a = document.createElement('a');
             a.href = URL.createObjectURL(blob);
-            a.download = `minesweeper-analysis-${Date.now()}.md`;
+            a.download = filename;
             a.click();
             URL.revokeObjectURL(a.href);
-            addChat('system', '📤 已导出 Markdown 分析报告。');
         }
 
         /* ==================== 工具 ==================== */

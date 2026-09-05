@@ -278,6 +278,44 @@ Output format:
                 ));
             }
         }
+
+        // 旗帜可信度上下文: 用户标注的旗帜未必正确, LLM 不得把"矛盾旗/未确认旗"
+        // 当作已知雷引用或断言, 必须把验证结论纳入推理解释 (flag_verification 在推理
+        // 前由 Rust 完成, 此处仅转述)
+        let intro = match self.language {
+            Language::Chinese => "【旗帜验证说明】用户标注的旗帜未必全部正确, 推理前已做旗帜验证:",
+            Language::English => "[Flag Verification] User-placed flags may be wrong; flags were verified before reasoning:",
+        };
+        let fv = &ir.flag_verification;
+        let contrad: Vec<_> = fv
+            .flags
+            .iter()
+            .filter(|f| f.status == crate::model::FlagVerifyStatus::Contradicted)
+            .collect();
+        let suspects: Vec<_> = fv
+            .flags
+            .iter()
+            .filter(|f| f.status == crate::model::FlagVerifyStatus::Suspected)
+            .collect();
+        if !fv.flags.is_empty() {
+            msg.push_str(&format!("\n\n{} {}", intro, fv.summary));
+            if !contrad.is_empty() {
+                msg.push_str("\n矛盾旗（该格必非雷, 严禁将其当作已知雷引用/推荐保持标旗）:");
+                for f in contrad.iter().take(12) {
+                    msg.push_str(&format!("\n- 坐标 {}: {}", f.coord, f.reason));
+                }
+            }
+            if !suspects.is_empty() {
+                let coords: Vec<String> = suspects.iter().take(15).map(|f| format!("{}", f.coord)).collect();
+                msg.push_str(&format!(
+                    "\n未确认旗（推理无法断定其是否为雷, 只能在概率意义上讨论, 不得断言）: {}",
+                    coords.join(", ")
+                ));
+            }
+            if contrad.is_empty() && suspects.is_empty() {
+                msg.push_str("\n结论: 所有旗帜均与数字约束自洽, 可当作已知雷使用。");
+            }
+        }
         msg
     }
 
@@ -511,6 +549,7 @@ mod tests {
                     },
                 },
             ],
+            flag_verification: crate::model::FlagVerificationResult::empty(),
         }
     }
 
@@ -620,14 +659,27 @@ mod tests {
             deterministic: vec![],
             probabilities: vec![],
             regions: vec![],
+            flag_verification: FlagVerificationResult {
+                flags: vec![FlagStatus {
+                    coord: Coord::new(1, 0),
+                    status: FlagVerifyStatus::Contradicted,
+                    reason: "数字1位于(0,0)周围旗数超限".into(),
+                }],
+                summary: "发现 1 面可能标错".into(),
+                has_contradiction: true,
+            },
         };
         let t = Translator::new(LLMMode::Teaching);
         let msg = t.build_user_message_with_question(&view, &ir, Some("目前的局面怎么进行解决"));
         assert!(msg.contains("【用户提问】"));
         assert!(msg.contains("目前的局面怎么进行解决"));
+        assert!(msg.contains("旗帜验证说明"));
+        assert!(msg.contains("矛盾旗"));
+        assert!(msg.contains("(1, 0)"));
         // 不带提问时不出现该块
         let plain = t.build_user_message(&view, &ir);
         assert!(!plain.contains("【用户提问】"));
+        assert!(plain.contains("旗帜验证说明"));
     }
 
     #[test]
@@ -652,7 +704,8 @@ mod tests {
             deterministic: vec![],
             probabilities: vec![],
             regions: vec![],
-        };
+        
+            flag_verification: crate::model::FlagVerificationResult::empty(),};
         let response = "坐标(1, 0)和(2, 1)需要分析";
         let (has_bad, bad) = Translator::validate_llm_output(&ir, &view, response);
         assert!(!has_bad, "unexpected hallucinated coords: {:?}", bad);
@@ -671,7 +724,8 @@ mod tests {
             deterministic: vec![],
             probabilities: vec![],
             regions: vec![],
-        };
+        
+            flag_verification: crate::model::FlagVerificationResult::empty(),};
         let response = "坐标(5, 5)是雷";
         let (has_bad, bad) = Translator::validate_llm_output(&ir, &view, response);
         assert!(has_bad);

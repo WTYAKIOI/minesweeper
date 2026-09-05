@@ -35,7 +35,8 @@ fn test_end_to_end_analysis() {
         deterministic,
         probabilities,
         regions,
-    };
+    
+        flag_verification: minesweeper_agent::FlagVerificationResult::empty(),};
 
     let translator = Translator::new(LLMMode::Answer);
     let analysis = translator.local_translate(&ir);
@@ -73,7 +74,8 @@ fn test_data_firewall() {
         deterministic,
         probabilities,
         regions,
-    };
+    
+        flag_verification: minesweeper_agent::FlagVerificationResult::empty(),};
 
     let ir_json = serde_json::to_string(&ir).unwrap();
     // IR JSON 不应包含 "mine" 作为真实雷藏 (只包含 "is_mine" 作为推理结论)
@@ -101,7 +103,8 @@ fn test_all_modes_produce_output() {
         deterministic,
         probabilities,
         regions,
-    };
+    
+        flag_verification: minesweeper_agent::FlagVerificationResult::empty(),};
 
     for mode in [LLMMode::Answer, LLMMode::Teaching, LLMMode::Strategy] {
         let translator = Translator::new(mode.clone());

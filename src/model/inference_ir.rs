@@ -53,6 +53,63 @@ pub struct Region {
     pub features: RegionFeature,
 }
 
+/// 旗帜验证状态
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FlagVerifyStatus {
+    /// 推理确认该旗正确 (该格必为雷)
+    Verified,
+    /// 与数字约束无矛盾, 但推理无法进一步确认
+    Suspected,
+    /// 与数字约束矛盾 (必为误标), 或推理证明该格必安全
+    Contradicted,
+}
+
+/// 单面旗帜的判定结果
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FlagStatus {
+    pub coord: Coord,
+    pub status: FlagVerifyStatus,
+    /// 判定理由 (中文, 含具体数字坐标与旗数)
+    pub reason: String,
+}
+
+/// 旗帜正确性判定结果 (在推理之前执行, 随 IR 返回)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FlagVerificationResult {
+    /// 全部旗帜的状态列表
+    pub flags: Vec<FlagStatus>,
+    /// 中文摘要, 如 "已检查 83 面旗, 发现 2 面可能标错, 1 面确认正确"
+    pub summary: String,
+    /// 是否存在矛盾旗 (前端快捷判断, 免去遍历)
+    pub has_contradiction: bool,
+}
+
+impl Default for FlagVerificationResult {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+impl FlagVerificationResult {
+    /// 空结果 (无旗帜 / 未执行验证时使用)
+    pub fn empty() -> Self {
+        Self {
+            flags: Vec::new(),
+            summary: "棋盘上没有旗帜, 无需验证".to_string(),
+            has_contradiction: false,
+        }
+    }
+
+    /// 矛盾旗坐标列表 (方便 UI 高亮与一键移除)
+    pub fn contradicted_coords(&self) -> Vec<Coord> {
+        self.flags
+            .iter()
+            .filter(|f| f.status == FlagVerifyStatus::Contradicted)
+            .map(|f| f.coord)
+            .collect()
+    }
+}
+
 /// 推理引擎输出中间语言 (IR)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InferenceIR {
@@ -62,6 +119,9 @@ pub struct InferenceIR {
     pub probabilities: Vec<CellProb>,
     /// 连通区域划分 (用于策略比较)
     pub regions: Vec<Region>,
+    /// 旗帜正确性判定 (推理前执行, 判定结果随 IR 返回前端)
+    #[serde(default)]
+    pub flag_verification: FlagVerificationResult,
 }
 
 impl InferenceIR {

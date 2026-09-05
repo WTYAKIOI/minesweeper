@@ -101,6 +101,9 @@ minesweeper-agent import -i tests/sample_board.json
 | `GET /api/usage/logs` | Token 用量明细日志（`?limit=&offset=`） |
 | `POST /api/debug` | OCR 调试：返回每格的颜色/形态分析细节，便于排查误识别 |
 | `POST /api/learn` | 用户反馈学习：`{ "image": "<base64>", "digit": n }` → 加入模板库 |
+| `POST /api/board/op` | 棋盘编辑操作（Rust 状态机裁决）：`{ board, x, y, op: "cycle|flag|clear" }` → 新棋盘 |
+| `POST /api/board/parse` | 文本棋盘解析（含剩余雷数推断）：`{ "text": "? ? 1\n? 2 ?" }` |
+| `POST /api/export` | 构建 Markdown 分析报告：`{ board, remaining_mines, analysis? }` |
 | `GET /api/health` | 健康检查 |
 
 **棋盘编码**：`-1` = 未知，`-2` = 旗帜，`0-8` = 已翻开数字（`board[行][列]`）。
@@ -170,6 +173,7 @@ Base URL: https://<你的网关>/v1      模型: glm-5     厂商前缀: thu-ai
 | `Insufficient Balance` / `quota` | 账户余额不足或额度用完 |
 | `Invalid API Key` / 401 | Key 错误或已过期 |
 | `rate limit` / 429 | 请求频率超限，稍后重试 |
+| `504 Gateway Time-out` | 网关/上游超时（nginx 等）：后端已自动重试最多 3 次；仍失败可调大环境变量 `LLM_TIMEOUT_SECS`（默认 120 秒）或稍后再试 |
 | 网络错误 | Base URL 不可达（本地 Ollama 未启动、代理未开等） |
 
 ### 对话语言与生成参数
@@ -212,6 +216,29 @@ LLM_MONTHLY_TOKEN_LIMIT=100000 USAGE_DB_PATH=/data/usage.jsonl cargo run --relea
 | `GET /api/usage/stats` | 用量统计（今日/近7日/本月/累计 + 模型分布 + 趋势 + 限额状态） |
 | `GET /api/usage/logs?limit=100&offset=0` | 用量明细（按时间倒序） |
 
+### 旗帜正确性判定（容错推理）
+
+用户可能标错旗。推理前由 `src/engine/flag_verifier.rs`（Rust）先做旗帜验证：
+
+- **单旗约束检查**：相邻数字已标旗数 > 数字值、或旗与数字 0 相邻 → **Contradicted**（矛盾旗）
+- **必要性检查**：移除该旗后相邻数字无法满足 → **Verified**（确认必为雷）
+- **容错重推**：矛盾旗降级为"未知"构造容错视图再跑确定性推理——
+  证明必安全 → 确系误标（矛盾旗）；证明必为雷 → 原旗纠正为 Verified
+- **概率求解一致性**：概率引擎将 `known_safe` 从约束变量中剔除（避免已证安全格泄漏为候选导致概率虚高）；推理管道对每个未知格运行"局部闭包组合枚举"，凡可证明恒为安全/恒为雷的格直接进入确定性证明链并从概率采样域移除（移旗后重新分析，(28,12) 不再是 33.3%，而显示为必安全）
+- **联合降级 + 局部组合枚举**：对仍无法判定的旗，把**全部未验证旗一次性降级**后：
+  (a) 确定性推理给出可证明的必雷/必安全结论；
+  (b) 概率引擎在"自洽空间"内求各格边际；
+  (c) **局部闭包组合枚举**——以旗相邻数字的未知邻居作变量集（仅纳入变量集内封闭的数字约束，保持结论 sound），枚举全部可行雷方案，
+  可证明**跨数字子集链式矛盾**（如 (27,10)/(26,11) 的 1/2 约束与 (27,11)=3 共同迫使相邻旗格 (28,12) 在所有方案中恒为安全 → 确系误标）
+- **概率辅助**（仍无法确认的旗）：给出自洽空间内的该格雷概率佐证（≈0 极可能误标，≈100% 极可能正确）
+- **结果随 IR 返回**：`ir.flag_verification = { flags: [{coord, status, reason}], summary, has_contradiction }`；同时注入 LLM 用户消息（旗帜验证说明），约束 LLM 不得把矛盾旗/未确认旗当作已知雷
+- 推理/概率模拟在**容错视图**上进行，不再盲目信任矛盾旗
+- **推理链展示规则**：推理链/统计列表自动过滤"已标旗帜的格子"（其结论已体现在棋盘与悬停提示中，避免 80+ 条旗帜证明刷屏）；悬停旗格仍可查看其必雷/必安全依据
+- **0% 概率 → 必安全**：雷概率为 0 的格自动判为必安全并入推理链并给出理由（剩余雷数已为 0 / 约束下无可行雷方案），同时从概率列表中移除
+- 前端「🚩 旗帜验证」区展示摘要与矛盾旗列表，矛盾旗在棋盘上以**紫色边框 + ❓**高亮；可一键「移除矛盾旗并重新分析」
+
+> 局限：当误标旗未使任何数字超限且相邻区域存在足够未知格时（"良性误标"），纯约束无法形式化证明——此类旗会标记为 Suspected 并附蒙特卡洛概率供人工判断。
+
 ### Rust ↔ LLM 交互流程
 
 ```
@@ -252,6 +279,24 @@ PlayerView (棋盘) → Rust 推理引擎 → InferenceIR (JSON)
 
 蒙特卡洛动态迭代：未知格 `< 50` → 50 000 次；`50~200` → 10 000 次；`> 200` → 1 000 次。
 
+## Agent 核心逻辑（Rust）
+
+**架构约定**：任务调度、状态管理、API 调用编排、规则判断均由 **Rust** 实现；
+前端（`static/index.html`）只保留 Canvas 渲染与交互输入，所有"语义"经 HTTP 端点回 Rust 裁决：
+
+| 职责 | Rust 实现 | HTTP 端点 |
+|------|-----------|-----------|
+| 推理任务编排（校验→推理→LLM→重试→用量） | `server/routes.rs` `analyze` | `POST /api/analyze` |
+| 棋盘编辑状态机（左键循环/插旗/清零） | `src/agent/core.rs` `apply_board_op` | `POST /api/board/op` |
+| 文本棋盘解析 + 剩余雷数推断 | `src/agent/core.rs` `parse_text_board` / `infer_mines_for_size` | `POST /api/board/parse` |
+| Markdown 报告构建 | `src/agent/core.rs` `render_markdown_report` | `POST /api/export` |
+| LLM 配置/模型列表/用量统计编排 | `src/llm` + `src/server/routes.rs` | `/api/llm/*`、`/api/usage/*` |
+| OCR 识别编排 | OCR 微服务 + `routes.rs` 代理 | `POST /api/ocr` |
+
+`src/agent/` 为纯逻辑模块（无 IO、无 axum 依赖），可独立单元测试；
+前端保留的 `parseTextBoard` / 编辑镜像等仅为**后端不可达时的离线回退**，
+语义以 Rust 为准（可编译为 WASM 供前端直调，或作为独立后端服务）。
+
 ## 项目结构
 
 ```
@@ -261,11 +306,12 @@ minesweeper/
 │   │   ├── deterministic.rs  # 确定性约束传播 + 子集推理
 │   │   ├── probabilistic.rs  # 蒙特卡洛模拟 (动态迭代)
 │   │   └── region.rs         # 连通区域分析 (并查集)
+│   ├── agent/            # Agent 核心 (纯逻辑): 棋盘状态机/文本解析/报告构建
 │   ├── model/            # PlayerView / Coord / InferenceIR
 │   ├── llm/              # LLM 转译 (translator + client + usage 用量统计)
-│   ├── server/           # Web 服务 (axum)
+│   ├── server/           # Web 服务 (axum) + 任务编排
 │   └── cli.rs            # CLI (clap)
-├── static/index.html     # 前端 (Canvas 棋盘 + 对话引导区)
+├── static/index.html     # 前端 (Canvas 渲染层, 语义全部回 Rust 裁决)
 ├── ocr/                  # OCR 微服务 (Flask + OpenCV + Tesseract)
 │   └── app.py            # 三层回退: 颜色投票 → 7段形态匹配 → Tesseract
 ├── tests/                # 集成测试

@@ -364,9 +364,18 @@ fn is_model_unavailable_error(msg: &str) -> bool {
 }
 
 impl LLMClient {
+    /// LLM HTTP 超时 (秒): 环境变量 LLM_TIMEOUT_SECS, 默认 120
+    pub fn timeout_secs() -> u64 {
+        std::env::var("LLM_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|v| *v >= 10)
+            .unwrap_or(120)
+    }
+
     pub fn new(config: LLMConfig) -> Self {
         let http_client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(120))
+            .timeout(std::time::Duration::from_secs(Self::timeout_secs()))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         Self { config, http_client }
