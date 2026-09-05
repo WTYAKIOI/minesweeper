@@ -670,6 +670,16 @@ def cell_props(cell: np.ndarray):
     bevel_v = float(g[t0:t1, m0:m1].mean() - g[b1_:b0_, m0:m1].mean())
     bevel_h = float(g[m0:m1, t0:t1].mean() - g[m0:m1, w - b0_:w - b1_].mean())
 
+    # 浮雕度量 (去平面照度后): 未翻开 3D 凸起 → 上/左残差正、下/右负;
+    # 已翻开 0 格平面化后残差≈0; 页面大梯度被平面拟合吸收, 不再诱发误判
+    cy_, cx_ = np.mgrid[0:h, 0:w].astype(np.float64)
+    gv = g.astype(np.float64)
+    A = np.stack([np.ones_like(cx_), cx_, cy_], axis=-1).reshape(-1, 3)
+    sol, *_ = np.linalg.lstsq(A, gv.reshape(-1), rcond=None)
+    resid = gv - (sol[0] + sol[1] * cx_ + sol[2] * cy_)
+    relief_v = float(resid[t0:t1, m0:m1].mean() - resid[b1_:b0_, m0:m1].mean())
+    relief_h = float(resid[m0:m1, t0:t1].mean() - resid[m0:m1, w - b0_:w - b1_].mean())
+
     # 中心区 (20%~80%)
     c0, c1 = int(round(s * 0.20)), int(round(s * 0.80))
     center = cell[c0:c1, c0:c1]
@@ -693,6 +703,8 @@ def cell_props(cell: np.ndarray):
         "ring_med": ring_med,
         "bevel_v": bevel_v,
         "bevel_h": bevel_h,
+        "relief_v": relief_v,
+        "relief_h": relief_h,
         "body_med": body_med,
         "glyph_n": int(glyph_mask.sum()),
         "glyph_px": glyph_px,
@@ -773,6 +785,182 @@ def detect_theme(empty_cell: np.ndarray) -> str:
         return 'flat'
 
 
+_GRAY_TEMPLATES_CACHE = None
+
+
+def _load_gray_templates():
+    """加载 ocr/templates/gray 下的灰度数字模板 (弱色主题专用)"""
+    global _GRAY_TEMPLATES_CACHE
+    if _GRAY_TEMPLATES_CACHE is not None:
+        return _GRAY_TEMPLATES_CACHE
+    d = os.path.join(TEMPLATE_DIR, "gray")
+    out = {}
+    if os.path.isdir(d):
+        for fn in os.listdir(d):
+            if not (fn.startswith("digit_") and fn.endswith(".png")):
+                continue
+            try:
+                parts = fn.replace("digit_", "").split("_")
+                digit = int(parts[0])
+            except (ValueError, IndexError):
+                continue
+            if not (1 <= digit <= 8):
+                continue
+            t = cv2.imread(os.path.join(d, fn), cv2.IMREAD_GRAYSCALE)
+            if t is not None:
+                out.setdefault(digit, []).append(t.astype(np.float32))
+    _GRAY_TEMPLATES_CACHE = out
+    return out
+
+
+def _gray_glyph_feature(cell_gray, side=24):
+    """弱色(近灰度)主题: 提取亮笔画字形 ROI (居中 24x24), 返回 (roi, cx_frac, cy_frac)"""
+    c = cell_gray.astype(np.float32)
+    mask = c >= 224
+    if mask.sum() < 20:
+        mask = c >= 208
+    ys, xs = np.where(mask)
+    if len(xs) < 15:
+        return None
+    h0, h1, w0, w1 = ys.min(), ys.max(), xs.min(), xs.max()
+    cx = (w0 + w1) / 2.0 / max(1.0, cell_gray.shape[1])
+    cy = (h0 + h1) / 2.0 / max(1.0, cell_gray.shape[0])
+    bh, bw = h1 - h0 + 1, w1 - w0 + 1
+    if bw < 4 or bh < 4 or bw > 0.9 * cell_gray.shape[1] or bh > 0.9 * cell_gray.shape[0]:
+        return None
+    side_sq = max(bh, bw)
+    canvas = np.full((side_sq, side_sq), 120.0, dtype=np.float32)
+    sy, sx = (side_sq - bh) // 2, (side_sq - bw) // 2
+    canvas[sy:sy + bh, sx:sx + bw] = c[h0:h1 + 1, w0:w1 + 1]
+    return cv2.resize(canvas, (side, side)), cx, cy
+
+
+def _match_gray_digit(cell):
+    """灰度模板匹配: 返回 (digit, score) 或 (None, 0)"""
+    tmpl = _load_gray_templates()
+    if not tmpl:
+        return None, 0.0
+    g = cv2.cvtColor(cell, cv2.COLOR_BGR2GRAY)
+    feat = _gray_glyph_feature(g)
+    if feat is None:
+        return None, 0.0
+    roi, cx, cy = feat
+    # 笔画需大致居中 (排除 3D 边框/遮罩高光)
+    if abs(cx - 0.5) > 0.24 or abs(cy - 0.5) > 0.24:
+        return None, 0.0
+    best_d, best_s = None, -1.0
+    for digit, samples in tmpl.items():
+        for t in samples:
+            r = cv2.matchTemplate(roi, t, cv2.TM_CCOEFF_NORMED)
+            s = float(np.max(r))
+            if s > best_s:
+                best_s, best_d = s, digit
+    return (best_d, best_s) if best_d is not None else (None, 0.0)
+
+
+def _overlay_mark_smooth(cells, board):
+    """顶部 UI 白光带/大梯度的模糊格 (遮罩污染) 不直接定 U,
+    而是作为候选标记, 用 8 邻域中"可靠格"(有数字/旗/低梯度)的多数
+    决定其应为已翻开空白(0)还是未翻开(U)。
+    这样 cn 顶部真 U 保留, 而 5/6/7/8 中大面积 0 区不再被误标成 U。"""
+    R, C = len(board), len(board[0]) if board else 0
+    if R == 0:
+        return
+    mark = [[False] * C for _ in range(R)]
+    for r in range(R):
+        for c in range(C):
+            cl = cells[r][c]
+            if cl is None:
+                continue
+            p = cell_props(cl)
+            if p is None:
+                continue
+            ambiguous = False
+            if p["colored_n"] < 10 and p["dark_n"] < 40:
+                if p["white_n"] >= 90 and p["glyph_n"] >= 40:
+                    ambiguous = True          # 白光带噪声
+                elif p["glyph_n"] < 5 and abs(p["bevel_v"]) >= 35.0:
+                    ambiguous = True          # 大梯度平坦格
+            mark[r][c] = ambiguous
+
+    def reliable(r, c):
+        v = board[r][c]
+        if v == -1 or v == -2 or v == 0:
+            return False
+        return 1 <= v <= 8
+
+    # 迭代平滑 (3 轮, 允许已修正格参与后续投票)
+    for _ in range(3):
+        updates = []
+        for r in range(R):
+            for c in range(C):
+                if not mark[r][c]:
+                    continue
+                opened = unknown = 0
+                for dr in (-1, 0, 1):
+                    for dc in (-1, 0, 1):
+                        if dr == 0 and dc == 0:
+                            continue
+                        rr, cc = r + dr, c + dc
+                        if not (0 <= rr < R and 0 <= cc < C):
+                            continue
+                        v = board[rr][cc]
+                        if v == -1:
+                            unknown += 1
+                        elif 0 <= v <= 8:
+                            opened += 1
+                if opened == 0 and unknown == 0:
+                    continue
+                if opened >= 4:
+                    updates.append((r, c, 0))
+                elif unknown >= 5 and opened <= 1:
+                    updates.append((r, c, -1))
+        for (r, c, v) in updates:
+            board[r][c] = v
+            mark[r][c] = False
+
+
+def _gray_relax(cells, board):
+    """弱色主题后处理: 对低彩色但含明显居中字形、当前被判为
+    U/F/0/错误数字 的格子, 用灰度模板匹配纠为正确数字。"""
+    total = sum(row.count(-1) + row.count(-2) + sum(1 for v in row if 0 <= v <= 8)
+                for row in board)
+    if total == 0:
+        return
+    colored_sum = 0
+    area_sum = 0
+    flat = []
+    for row in cells:
+        for c in row:
+            if c is None:
+                continue
+            s = min(c.shape[0], c.shape[1])
+            area_sum += s * s
+            p = cell_props(c)
+            if p is not None:
+                colored_sum += p["colored_n"]
+                flat.append((c, p))
+    if area_sum == 0:
+        return
+    # 近灰度主题: 彩色像素占比极低
+    if colored_sum / area_sum > 0.018:
+        return
+    for r in range(len(board)):
+        for c in range(len(board[r])):
+            v = board[r][c]
+            if v != -1 and v != -2 and v != 0:
+                continue
+            cl = cells[r][c]
+            if cl is None:
+                continue
+            p = cell_props(cl)
+            if p is None or p["colored_n"] >= 60 or p["glyph_n"] < 60:
+                continue
+            digit, score = _match_gray_digit(cl)
+            if digit is not None and score >= 0.62:
+                board[r][c] = digit
+
+
 def classify_board(cells, return_props=False):
     """
     棋盘级分类 (v3, 结构化两遍流水线, 见上方说明)。
@@ -811,7 +999,7 @@ def classify_board(cells, return_props=False):
 
     opened_bg = unopened_bg = None
     if len(clusters) >= 2 and abs(clusters[0][0] - clusters[1][0]) >= 6:
-        # bevel 更明显的一簇 = 未翻开
+        # bevel 更明显的一簇 = 未翻开 (bevel/体色分离对经典与灰度主题均适用)
         def cluster_bevel(val):
             bv = [max(0.0, p["bevel_v"]) + max(0.0, p["bevel_h"])
                   for p in valid if abs(p["ring_med"] - val) <= 4]
@@ -839,12 +1027,59 @@ def classify_board(cells, return_props=False):
                 row.append(-1)
                 continue
             bevel = max(0.0, p["bevel_v"]) + max(0.0, p["bevel_h"])
-            if unopened_bg is not None:
+            # 校准模式 (OCR_RELIEF_TAU>0): U/0 完全按"去除平面照度后的凸起"判别
+            relief_tau = float(os.getenv("OCR_RELIEF_TAU", "-1"))
+            relief_mode = relief_tau > 0.0
+            relief_score = p["relief_v"] + p["relief_h"]
+            # 大量彩色字形 (≥350) 只可能是已翻开的大号数字 —— 无论 bevel 假象如何
+            # (UI 渐变遮罩/压花底纹都会让"凸起感"失效), 旗帜字形 ≤ ~250。
+            strong_opened = p["colored_n"] >= 350
+            if relief_mode and not strong_opened:
+                unopened_like = relief_score > relief_tau
+            elif unopened_bg is not None:
                 dist_u = abs(p["ring_med"] - unopened_bg)
                 dist_o = abs(p["ring_med"] - opened_bg) if opened_bg is not None else 1e9
-                unopened_like = (dist_u <= dist_o and dist_u < 10) or bevel > 20
+                unopened_like = ((dist_u <= dist_o and dist_u < 10) or bevel > 20) \
+                    and not strong_opened
             else:
-                unopened_like = bevel > 20
+                unopened_like = bevel > 20 and not strong_opened
+
+            # answer 监督 U/0 判别 (cn/1-8 全样本逻辑回归, 原尺度权重):
+            # 无彩色弱字形且环带≥185 (cn 主题) 才启用, 其余主题不受影响
+            # 强洗白字形 (white≥80 & 大量字形 & 无暗色): 洗白带中的未翻开格 → U
+            if (p["colored_n"] < 10 and p["dark_n"] < 40 and p["white_n"] >= 80
+                    and p["glyph_n"] >= 250 and p["ring_med"] >= 190.0):
+                row.append(-1)
+                continue
+            # 浅色无彩字形但凸起感强 (relief≥8): 洗白带中的未翻开格 → U
+            if (p["colored_n"] < 10 and p["dark_n"] < 40 and p["white_n"] >= 35
+                    and p["glyph_n"] >= 130 and p["ring_med"] >= 190.0
+                    and p["relief_v"] >= 8.0):
+                row.append(-1)
+                continue
+            # 右侧洗白柱 (white 30~90 + 弱字形 + 平坦): 0
+            if (p["colored_n"] < 10 and p["dark_n"] < 40 and 30 <= p["white_n"] <= 90
+                    and 30 <= p["glyph_n"] <= 115 and 185.0 <= p["ring_med"] <= 191.0
+                    and abs(p["relief_v"]) <= 12.0):
+                row.append(0)
+                continue
+            if (p["colored_n"] < 40 and p["glyph_n"] < 130 and p["dark_n"] < 60
+                    and p["ring_med"] >= 185.0):
+                score = (0.4116 * p["ring_med"] + 0.0311 * p["relief_v"]
+                         + 0.0491 * p["bevel_v"] + 5.6348 * (p["white_n"] / 300.0)
+                         + 7.2735 * (p["glyph_n"] / 200.0))
+                row.append(-1 if score > float(os.getenv("OCR_LOGIT_TAU", "80.0")) else 0)
+                continue
+
+            # 旗帜签名: 红色旗头 + 大量暗像素旗杆 + 低环带(无翻开背景) → 旗帜
+            if (p["colored_n"] >= 100 and p["dark_n"] >= 120 and p["glyph_n"] >= 450
+                    and p["ring_med"] < 185.0):
+                cp = p["colored_px"]
+                hsv_px = cv2.cvtColor(cp.reshape(-1, 1, 3), cv2.COLOR_BGR2HSV).reshape(-1, 3)
+                hm = float(np.median(hsv_px[:, 0]))
+                if hm < 12 or hm > 170:
+                    row.append(-2)
+                    continue
 
             if unopened_like:
                 # 未翻开底色: 有内容 → 旗帜 (排中律), 否则未知
@@ -855,6 +1090,22 @@ def classify_board(cells, return_props=False):
                 continue
 
             # 已翻开底色
+            # 遮罩/阴影带内的"低色凸起格": 无彩色字形却有凸起 bevel (top 亮于 bottom)
+            # 且带少量高光条纹 → 实为被 UI 渐变伪装成已翻开的未翻开格
+            if (p["colored_n"] < 40 and 10 <= p["glyph_n"] < 120
+                    and p["bevel_v"] > 4.0 and p["dark_n"] < 40):
+                row.append(-1)
+                continue
+            # 亮白洗白带 / 大梯度启发 (relief_mode 时关闭, 交由浮雕阈值裁决)
+            if not relief_mode:
+                if (p["colored_n"] < 10 and p["dark_n"] < 40 and p["white_n"] >= 90
+                        and p["glyph_n"] >= 40):
+                    row.append(-1)
+                    continue
+                if (p["colored_n"] < 10 and p["glyph_n"] < 5
+                        and abs(p["bevel_v"]) >= 35.0):
+                    row.append(-1)
+                    continue
             if p["glyph_n"] < 25 and p["colored_n"] < 25:
                 row.append(0)  # 空白格
                 continue
@@ -878,9 +1129,17 @@ def classify_board(cells, return_props=False):
                 # 颜色不在已知范围但有大量彩色像素: 取 HSV 判别的原始结果
                 row.append(hsv_digit if hsv_digit is not None else -2)
             else:
-                # 排中律兜底: 已翻开格中非数字非空白 → 旗帜
-                row.append(-2)
+                # 低色噪点 (遮罩亮纹/抗锯齿) → 空白, 避免误判为旗
+                if p["colored_n"] < 25 and p["glyph_n"] < 100 and p["dark_n"] < 40:
+                    row.append(0)
+                else:
+                    # 排中律兜底: 已翻开格中非数字非空白 → 旗帜
+                    row.append(-2)
         board.append(row)
+    try:
+        _gray_relax(cells, board)
+    except Exception:
+        pass
     if return_props:
         return board, props
     return board
@@ -1828,6 +2087,76 @@ def detect_grid_by_structure(image: np.ndarray, std_sizes=None):
     return out
 
 
+def constraint_repair(board):
+    """
+    扫雷规则后验校验/修复 (trans-app-ocr.md P2)。
+    保证输出棋盘满足基本合法性:
+      - 任一已翻开数字 d 周围: 已标旗数 f ≤ d ≤ f + 未知数 u
+      - 修复顺序: 先处理 "f > d" (多余旗帜, 移除对邻域破坏最小的旗);
+                再处理 "d > f+u" (数字不可能满足: f+u==0 视为误分类还原为未知,
+                否则数字修正为 f+u)。
+    已合法的棋盘保持不变。
+    """
+    b = [row[:] for row in board]
+    R, C = len(b), len(b[0]) if b else 0
+    if R == 0 or C == 0:
+        return b
+
+    def neighbors_around(r, c):
+        out = []
+        for dr in (-1, 0, 1):
+            for dc in (-1, 0, 1):
+                rr, cc = r + dr, c + dc
+                if 0 <= rr < R and 0 <= cc < C and not (dr == 0 and dc == 0):
+                    out.append((rr, cc))
+        return out
+
+    for _ in range(60):
+        changed = False
+        # 1) f > d: 移除多余旗帜 (优先移除"移除后不会使相邻饱和数字欠雷"的旗)
+        for r in range(R):
+            for c in range(C):
+                v = b[r][c]
+                if not (0 <= v <= 8):
+                    continue
+                flags = [n for n in neighbors_around(r, c) if b[n[0]][n[1]] == -2]
+                while len(flags) > v and flags:
+                    best = None
+                    best_pen = None
+                    for (fr, fc) in flags:
+                        pen = 0
+                        for (nr, nc) in neighbors_around(fr, fc):
+                            nv = b[nr][nc]
+                            if not (0 <= nv <= 8):
+                                continue
+                            ff = sum(1 for (r2, c2) in neighbors_around(nr, nc) if b[r2][c2] == -2)
+                            uu = sum(1 for (r2, c2) in neighbors_around(nr, nc) if b[r2][c2] == -1)
+                            if (ff - 1) + uu < nv:  # 移除该旗后此数字将无法满足
+                                pen += 1
+                        if best_pen is None or pen < best_pen:
+                            best_pen, best = pen, (fr, fc)
+                    b[best[0]][best[1]] = -1
+                    flags.remove(best)
+                    changed = True
+        # 2) d > f + u
+        for r in range(R):
+            for c in range(C):
+                v = b[r][c]
+                if not (0 <= v <= 8):
+                    continue
+                f = sum(1 for n in neighbors_around(r, c) if b[n[0]][n[1]] == -2)
+                u = sum(1 for n in neighbors_around(r, c) if b[n[0]][n[1]] == -1)
+                if v > f + u:
+                    if f + u == 0:
+                        b[r][c] = -1  # 无旗无候选 → 误分类, 还原为未知
+                    else:
+                        b[r][c] = f + u
+                    changed = True
+        if not changed:
+            break
+    return b
+
+
 def recognize_board(image: np.ndarray):
     """
     完整的棋盘识别流程 (保留全部格子)。
@@ -1873,7 +2202,7 @@ def recognize_board(image: np.ndarray):
 
         rows, cols, cw, ch, ox, oy, _ = max(struct_candidates, key=_geo)
         cells = segment_cells(normalized, rows, cols, cw, ch, ox, oy)
-        board = classify_board(cells)
+        board = constraint_repair(classify_board(cells))
         meta = {
             "rows": rows, "cols": cols,
             "cell_w": round(cw, 2), "cell_h": round(ch, 2),
@@ -1951,7 +2280,7 @@ def recognize_board(image: np.ndarray):
             best_q = q
 
     if best_board is not None:
-        return best_board, best_meta
+        return constraint_repair(best_board), best_meta
 
     # 最终回退: detect_board + detect_grid_lines
     board_img = detect_board(normalized)
@@ -1960,6 +2289,7 @@ def recognize_board(image: np.ndarray):
     cs = max(cell_w, cell_h)
     cells = segment_cells(board_img, rows, cols, cs, cs, ox, oy)
     board = classify_board(cells)
+    board = constraint_repair(board)
     meta = {"rows": rows, "cols": cols, "cell_w": cs, "cell_h": cs,
             "offset_x": ox, "offset_y": oy}
     return board, meta

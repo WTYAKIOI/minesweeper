@@ -140,6 +140,115 @@ def test_flag_detection():
             f"纯红色被误判为旗帜 (red={red_r:.2f})"
 
 
+def _board_legality_violations(board):
+    """返回违反扫雷基本约束的 (r,c,digit,flags,unknown) 列表:
+    flags ≤ digit ≤ flags + unknown"""
+    bad = []
+    R, C = len(board), len(board[0])
+    for r in range(R):
+        for c in range(C):
+            v = board[r][c]
+            if not (0 <= v <= 8):
+                continue
+            f = u = 0
+            for dr in (-1, 0, 1):
+                for dc in (-1, 0, 1):
+                    rr, cc = r + dr, c + dc
+                    if 0 <= rr < R and 0 <= cc < C:
+                        w = board[rr][cc]
+                        if w == -2:
+                            f += 1
+                        elif w == -1:
+                            u += 1
+            if f > v or v > f + u:
+                bad.append((r, c, v, f, u))
+    return bad
+
+
+def test_all_input_boards_legal():
+    """trans-app-ocr.md P2: 规则后验校验。所有 inuput 截图识别出的棋盘
+    必须满足扫雷基本约束 (无大量不合法旗帜/数字)。"""
+    files = [f for f in sorted(os.listdir(IN_DIR))
+             if f.lower().endswith(('.png', '.jpg', '.jpeg', '.webp'))]
+    cn_dir = os.path.join(IN_DIR, 'minesweeper.cn')
+    if os.path.isdir(cn_dir):
+        files += [os.path.join('minesweeper.cn', f) for f in sorted(os.listdir(cn_dir))
+                  if f.lower().endswith(('.png', '.jpg', '.jpeg', '.webp'))]
+    assert files, "没有找到测试图片"
+    for fname in files:
+        img = load_image(os.path.join(IN_DIR, fname))
+        board, meta = ocr_app.recognize_board(img)
+        rows, cols = len(board), len(board[0]) if board else 0
+        assert rows >= 2 and cols >= 2, f"{fname}: 未识别出棋盘 ({rows}x{cols})"
+        bad = _board_legality_violations(board)
+        assert not bad, f"{fname}: 存在不合法约束 {len(bad)} 处, 示例 {bad[:5]}"
+        print(f"  [OK] {fname}: {cols}x{rows}, 合法 (F={sum(r.count(-2) for r in board)})")
+
+
+def _parse_cn_answers():
+    """解析 answer.txt 中 'for N.png' 分节棋盘"""
+    import re
+    ans_path = os.path.join(IN_DIR, 'minesweeper.cn', 'answer.txt')
+    if not os.path.exists(ans_path):
+        return {}
+    out, cur = {}, None
+    for ln in open(ans_path):
+        s = ln.strip()
+        m = re.search(r'for (\d)\.png', s)
+        if m:
+            cur = m.group(1)
+            out[cur] = []
+            continue
+        toks = s.split()
+        if cur and len(toks) == 30 and all(t in '012345678UF' for t in toks):
+            out[cur].append(toks)
+    return out
+
+
+def test_minesweeper_cn_accuracy():
+    """minesweeper.cn 1-4.png 精度回归 (answer.txt 真值)"""
+    import re
+    sections = _parse_cn_answers()
+    if not sections:
+        return
+    limits = {'1': 0.95, '2': 0.97, '4': 0.99}
+    for name, expect in limits.items():
+        grid = sections.get(name)
+        if not grid or len(grid) != 16:
+            continue
+        T = [[-1 if t == 'U' else -2 if t == 'F' else int(t) for t in row] for row in grid]
+        img = load_image(os.path.join(IN_DIR, 'minesweeper.cn', name + '.png'))
+        board, _meta = ocr_app.recognize_board(img)
+        ok = sum(board[r][c] == T[r][c] for r in range(16) for c in range(30))
+        ratio = ok / 480
+        print(f"  minesweeper.cn/{name}.png: 一致 {ok}/480 ({ratio:.1%})")
+        assert ratio >= expect, f"cn/{name} 精度过低: {ratio:.1%} (<{expect:.0%})"
+
+
+def test_minesweeper_cn4_accuracy():
+    """minesweeper.cn/4.png 精度回归 (answer.txt 提供真值):
+    大号数字识别 (≥350 彩色像素强判已翻开) 修复后应 ≥ 96%。"""
+    ans_path = os.path.join(IN_DIR, 'minesweeper.cn', 'answer.txt')
+    if not os.path.exists(ans_path):
+        return
+    grid = []
+    for ln in open(ans_path):
+        toks = ln.split()
+        if len(toks) == 30 and all(t in '012345678UF' for t in toks):
+            grid.append(toks)
+    if len(grid) != 16:
+        return
+    truth = [[-1 if t == 'U' else -2 if t == 'F' else int(t) for t in row] for row in grid]
+    img = load_image(os.path.join(IN_DIR, 'minesweeper.cn', '4.png'))
+    board, _meta = ocr_app.recognize_board(img)
+    rows, cols = len(board), len(board[0])
+    assert (rows, cols) == (16, 30)
+    ok = sum(board[r][c] == truth[r][c] for r in range(16) for c in range(30))
+    ratio = ok / 480
+    print(f"  minesweeper.cn/4.png: 与 answer.txt 一致 {ok}/480 ({ratio:.1%})")
+    assert ratio >= 0.96, f"cn/4 精度过低: {ratio:.1%}"
+
+
 def test_extra_boards_against_answer():
     """extra.png / extra2.png 网格与识别回归测试。
 
@@ -187,6 +296,13 @@ if __name__ == '__main__':
 
     print("\n--- 图片识别测试 ---")
     test_digit_recognition()
+
+    print("\n--- 规则后验合法性测试 (trans-app-ocr.md P2) ---")
+    test_all_input_boards_legal()
+    print("\n--- cn 精度回归测试 (answer.txt) ---")
+    test_minesweeper_cn_accuracy()
+    test_minesweeper_cn4_accuracy()
+
     print("\n--- extra 棋盘回归测试 ---")
     test_extra_boards_against_answer()
     print("\n[ALL PASS]")
