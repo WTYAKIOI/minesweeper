@@ -140,6 +140,40 @@ def test_flag_detection():
             f"纯红色被误判为旗帜 (red={red_r:.2f})"
 
 
+def test_extra_boards_against_answer():
+    """extra.png / extra2.png 网格与识别回归测试。
+
+    answer.out 为人工/视觉模型转写, 在 红色3↔旗帜 等 ~77 处与截图像素不符
+    (详见 inuput/ 下 .out 说明), 故仅要求:
+      1) 网格为 16×30 (expert)
+      2) 与 answer.out 一致率 ≥ 85% (像素真值 > 90%)
+    """
+    for name in ('extra2.png', 'extra.png'):
+        img = load_image(os.path.join(IN_DIR, name))
+        board, meta = ocr_app.recognize_board(img)
+        rows, cols = len(board), len(board[0])
+        assert (rows, cols) == (16, 30), f"{name}: 网格 {rows}x{cols} != 16x30"
+
+        answer = os.path.join(IN_DIR, 'answer.out')
+        if not os.path.exists(answer):
+            continue
+        grid, mode = [], False
+        for ln in open(answer):
+            s = ln.strip()
+            if s in ('extra2', 'extra'):
+                mode = (s == name.replace('.png', ''))
+                continue
+            if mode and len(s) == 30 and set(s) <= set('012345678UF'):
+                grid.append(s)
+        assert len(grid) == 16, f"answer.out 缺少 {name} 棋盘"
+        sym = {-1: 'U', -2: 'F'}
+        pred = ["".join(sym.get(int(v), str(int(v))) for v in row) for row in board]
+        agree = sum(pred[r][c] == grid[r][c] for r in range(16) for c in range(30))
+        ratio = agree / 480
+        print(f"  {name}: 与 answer.out 一致 {agree}/480 ({ratio:.1%})")
+        assert ratio >= 0.85, f"{name}: 与 answer.out 一致率过低 ({ratio:.1%})"
+
+
 if __name__ == '__main__':
     print("=== OCR 数字识别测试 ===\n")
     test_color_ranges_no_overlap()
@@ -153,4 +187,6 @@ if __name__ == '__main__':
 
     print("\n--- 图片识别测试 ---")
     test_digit_recognition()
+    print("\n--- extra 棋盘回归测试 ---")
+    test_extra_boards_against_answer()
     print("\n[ALL PASS]")
