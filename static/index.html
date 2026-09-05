@@ -229,6 +229,18 @@
         }
         .bad-flag:hover { background: rgba(155, 89, 182, 0.16); }
         .bad-flag b { color: #8E44AD; }
+        .flag-warn {
+            background: rgba(243, 156, 18, 0.12);
+            border: 1px solid rgba(243, 156, 18, 0.4);
+            color: #E67E22;
+            border-radius: 6px;
+            padding: 7px 10px;
+            font-size: 12px;
+            line-height: 1.6;
+            margin-bottom: 8px;
+            display: none;
+        }
+        .flag-warn.show { display: block; }
 
         /* ============ 对话区 ============ */
         #chatLog {
@@ -808,7 +820,10 @@
                     <div class="empty-tip" id="resultEmpty">分析后此处将展示必雷 / 必安全格与推理链</div>
                 </div>
                 <div id="proofSection" class="hidden">
-                    <div class="card-title" style="font-size:14px;"><span>推理链</span></div>
+                    <div class="card-title" style="font-size:14px;">
+                        <span>推理链</span>
+                        <span class="sub" id="llmChainBadge" style="display:none;color:#4A90D9;">🤖 含 LLM 推理分析</span>
+                    </div>
                     <ol id="proofList"></ol>
                 </div>
                 <div id="flagSection" class="hidden" style="margin-top:14px;">
@@ -816,6 +831,7 @@
                         <span>🚩 旗帜验证</span>
                         <span class="sub" id="flagSummary"></span>
                     </div>
+                    <div class="flag-warn" id="flagWarn"></div>
                     <div id="flagBadList"></div>
                     <div id="flagOkLine" style="font-size:12px;color:var(--text-sub);margin-top:6px;line-height:1.6;"></div>
                     <div style="margin-top:10px;display:none;" id="flagRemoveWrap">
@@ -2094,6 +2110,8 @@
             document.getElementById('probSection').classList.add('hidden');
             document.getElementById('analysisSection').classList.add('hidden');
             document.getElementById('flagSection').classList.add('hidden');
+            const warnEl0 = document.getElementById('flagWarn');
+            if (warnEl0) warnEl0.classList.remove('show');
         }
 
         async function runAnalyze(opts = {}) {
@@ -2202,6 +2220,8 @@
                 proofList.appendChild(li);
             });
             document.getElementById('proofSection').classList.toggle('hidden', !actionable.length);
+            const llmBadge = document.getElementById('llmChainBadge');
+            if (llmBadge) llmBadge.style.display = (data.used_llm && data.analysis && data.analysis.trim()) ? '' : 'none';
 
             // 旗帜验证 (Rust 端在推理前完成判定, 随 IR 返回)
             renderFlagVerification(data.ir.flag_verification);
@@ -2239,6 +2259,8 @@
             const rmWrap = document.getElementById('flagRemoveWrap');
             if (!fv || !fv.flags || !fv.flags.length) {      // 无旗帜 / 旧后端无此字段
                 sec.classList.add('hidden');
+                const warnEl0 = document.getElementById('flagWarn');
+                if (warnEl0) warnEl0.classList.remove('show');
                 return;
             }
             const contrad = fv.flags.filter(f => f.status === 'Contradicted');
@@ -2246,6 +2268,19 @@
             const suspected = fv.flags.filter(f => f.status === 'Suspected');
 
             document.getElementById('flagSummary').textContent = fv.summary || '';
+
+            // 旗帜问题 → 显式提示: 概率/推理基于容错假设, 可能出错
+            const warnEl = document.getElementById('flagWarn');
+            if (warnEl) {
+                const attention = fv.flags.filter(f => f.needs_attention);
+                if (attention.length) {
+                    const coords = attention.map(f => `(${f.coord.x},${f.coord.y})`).join(' ');
+                    warnEl.innerHTML = `⚠️ <b>存在 ${attention.length} 面问题旗帜</b>（${coords}，矛盾或极可能误标）：以下必雷/必安全与雷概率基于容错假设，<b>数值可能出错</b>。建议先核对/移除后再做关键决策。`;
+                    warnEl.classList.add('show');
+                } else {
+                    warnEl.classList.remove('show');
+                }
+            }
 
             // 矛盾旗列表 (点击 → 棋盘高亮该旗)
             if (contrad.length) {

@@ -364,13 +364,14 @@ fn is_model_unavailable_error(msg: &str) -> bool {
 }
 
 impl LLMClient {
-    /// LLM HTTP 超时 (秒): 环境变量 LLM_TIMEOUT_SECS, 默认 120
+    /// LLM HTTP 超时 (秒): 环境变量 LLM_TIMEOUT_SECS, 默认 60
+    /// (60s 内大多数模型可完成回答; 超时重试会叠加, 默认值不宜过大)
     pub fn timeout_secs() -> u64 {
         std::env::var("LLM_TIMEOUT_SECS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
             .filter(|v| *v >= 10)
-            .unwrap_or(120)
+            .unwrap_or(60)
     }
 
     pub fn new(config: LLMConfig) -> Self {

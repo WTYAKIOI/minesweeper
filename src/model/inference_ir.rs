@@ -71,6 +71,10 @@ pub struct FlagStatus {
     pub status: FlagVerifyStatus,
     /// 判定理由 (中文, 含具体数字坐标与旗数)
     pub reason: String,
+    /// 是否需要用户处理 (矛盾旗, 或概率佐证极可能误标的未确认旗)。
+    /// 前端/LLM 据此决定是否给出"概率可能出错"警告。
+    #[serde(default)]
+    pub needs_attention: bool,
 }
 
 /// 旗帜正确性判定结果 (在推理之前执行, 随 IR 返回)

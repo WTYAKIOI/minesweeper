@@ -299,7 +299,9 @@ pub fn verify_board_full(
                 }
             }
         };
-        flags.push(FlagStatus { coord: *f, status, reason });
+        let needs_attention = status == FlagVerifyStatus::Contradicted
+            || reason.contains("极可能为误标");
+        flags.push(FlagStatus { coord: *f, status, reason, needs_attention });
     }
     flags.sort_by_key(|f| (f.coord.y, f.coord.x));
 

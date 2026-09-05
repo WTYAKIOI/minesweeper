@@ -102,17 +102,19 @@ impl ProbabilityEngine {
 
         // 7. 未计算格均分剩余雷 (参考 minesweeper_solver._handle_remaining_cells)
         //
-        // 参考 solver.py:
-        //   assigned_mines = sum(probs > 0)
-        //   remaining_mines = total_mines - assigned_mines
-        //   base_probability = remaining_mines / uncalculated_count
-        //
-        // 不再区分"约束格/非约束格"做两套分支 —— 参考实现将所有 probs==-1 的格
-        // 统一按剩余雷均分。若输入 remaining_mines 偏低导致 remaining 为负,
-        // 最终由步骤 7 的 clamp(0,1) 兜底, 不会出现"全部归零"的退化。
-        let total_mines = view.remaining_mines as usize;
-        let known_mine_count = known_mines.len();
-        let remaining_mines = total_mines.saturating_sub(known_mine_count) as f64;
+        // 语义约定: PlayerView.remaining_mines 是"用户输入/推断的剩余雷数",
+        // 即 总雷数 - 已标旗数 —— 已标旗已从该值中扣除。
+        // 因此这里不能再用 known_mines 全部计数: known_mines 中含大量"旗帜证明"
+        // (坐标正是已标旗格), 若再次扣除会把剩余雷数错误压到 0,
+        // 使不与任何数字相邻的未知格全部得到 0% 而误判安全。
+        // 正确口径: 只扣 known_mines 中"非旗帜格" (它们将额外消耗剩余雷数)。
+        let flagged_set: HashSet<Coord> = view.flagged.iter().copied().collect();
+        let known_nonflag_mines = known_mines
+            .iter()
+            .filter(|c| !flagged_set.contains(c))
+            .count();
+        let remaining_mines =
+            (view.remaining_mines as i64 - known_nonflag_mines as i64).max(0) as f64;
 
         let assigned_mines: f64 = probs.values()
             .filter(|&&p| p > 0.0)
@@ -394,5 +396,26 @@ mod tests {
         );
         let expected = p01.unwrap_or(0.0);
         assert!((expected - 1.0).abs() < 1e-6, "唯一候选应为必雷, got {}", expected);
+    }
+
+    /// remaining_mines 语义 = 总雷数 - 已标旗数; known_mines 含"旗帜证明"时
+    /// 不得二次扣减, 否则未约束未知格会被错误归零 (extra2 全安全 bug)。
+    #[test]
+    fn test_remaining_mines_counts_flags_once() {
+        // 2 面旗 + 4 个未知格, 剩余 1 雷, 无数值约束 (不与任何数字相邻)
+        let board = vec![vec![-2, -1, -1], vec![-2, -1, -1]];
+        let view = PlayerView::from_2d(&board, 1);
+        let known_mines: HashSet<Coord> = view.flagged.iter().copied().collect();
+        let probs = ProbabilityEngine::compute(&view, &known_mines, &HashSet::new());
+        assert_eq!(probs.len(), 4);
+        for p in &probs {
+            assert!(
+                p.mine_probability > 0.0 && p.mine_probability <= 1.0,
+                "未知格概率被错误归零: {:?} = {}",
+                p.coord,
+                p.mine_probability
+            );
+            assert!((p.mine_probability - 0.25).abs() < 1e-6, "got {}", p.mine_probability);
+        }
     }
 }

@@ -87,69 +87,171 @@ impl Translator {
         self.language
     }
 
-    /// 将 IR 转为给 LLM 的系统提示词
+    /// 将 IR 转为给 LLM 的系统提示词 (llm-output.md 规范)
+    /// 输出模板 + 硬性规则全模式共享; 答案/策略/教学按模式附加模板.
     pub fn build_system_prompt(&self) -> String {
-        let (lang_rule, base_zh_suffix) = match self.language {
+        let (lang_rule, spec) = match self.language {
             Language::Chinese => (
                 "## 语言要求\n请全程使用简体中文回答。",
-                "## 输出格式要求\n- 答案模式：使用\"因为...所以...\"的因果句式\n- 教学模式：使用提问句式，禁止直接给答案\n- 策略模式：给出坐标级建议，含概率数值",
+                r#"## 输出硬性规则 (违反视为不合格)
+1. 坐标引用: 只允许引用 IR 中实际出现的坐标 (deterministic[].conclusion.coord / probabilities[].coord /
+   文本给出的未知格坐标清单); 一律用 (行,列) 形式; 禁止编造坐标、禁止"左边/附近/那一片"等模糊描述。
+2. 确定性结论: 必须逐条附带依据 (引用 depends_on 中的数字坐标与 rule); 禁止"我认为/可能"句式;
+   不得自行添加 IR 中不存在的结论。
+3. 概率结论: 数值直接来自 IR 的 probabilities (字段名 mine_probability, 即 0~1 的小数,
+   展示时换算为百分比, 不四舍五入成整数); 只可给 IR 中存在的格赋概率; 每个概率格附建议
+   (优先点击 / 可考虑标旗 / 暂缓处理)。
+4. 旗帜验证: 若 flag_verification 中存在 Contradicted/未确认(Suspected) 旗, 必须逐条列出;
+   无问题则写"所有旗帜与当前数字约束一致"。
+5. 旗帜问题警告: 当存在矛盾旗或未确认旗时, 显式提示"存在旗帜问题, 以下概率与推理基于容错假设,
+   数值可能出错, 建议先核对/移除问题旗帜后再做关键决策"。
+6. 长度控制: 普通模式总输出 ≤500 字, 表格每类 ≤10 行 (超 10 行只列前 5 并注明"余 N 个略")。
+7. 确定性结论用 Markdown 表格呈现; 概率参考用表格; 其余用列表; 不用过渡客套话。
+8. deterministic 为空 → 不输出确定性结论表格, 只给概率参考; probabilities 为空 → 写"概率数据不可用"。\n"#,
             ),
             Language::English => (
                 "## Language Requirement\nRespond entirely in English.",
-                "## Output Requirements\n- Answer mode: use cause-and-effect phrasing (\"because...therefore...\")\n- Teaching mode: ask guiding questions, never give the answer directly\n- Strategy mode: give coordinate-level advice with probability values",
+                r#"## Hard Output Rules (violations are rejected)
+1. Coordinates: only cite coordinates present in the IR (deterministic[].conclusion.coord /
+   probabilities[].coord / the listed unknown coordinates); format "(x, y)"; never invent
+   coordinates or use vague descriptions.
+2. Deterministic claims: must cite evidence (depends_on number coordinates and rule); never say
+   "I think"; never add conclusions not in the IR.
+3. Probabilities: take values directly from IR probabilities (field mine_probability, a 0..1 float;
+   show as percentage without rounding to integers); only for cells present in the IR; attach a
+   recommendation (click first / consider flagging / wait).
+4. Flag verification: if flag_verification contains Contradicted or Suspected flags, list them all;
+   otherwise state "all flags are consistent with the board constraints".
+5. Flag warning: when contradicted or unverified flags exist, explicitly warn that probabilities
+   may be wrong because reasoning runs on a fault-tolerant assumption; suggest fixing flags first.
+6. Length: ≤500 characters overall in normal modes; ≤10 table rows per class (list first 5 and
+   note "N more omitted").
+7. Present deterministic results and probability references as Markdown tables.
+8. If deterministic is empty, give only probability reference; if probabilities empty, say
+   "probability data unavailable".\n"#,
             ),
         };
 
         let base = format!(
-            "你是一个扫雷认知助手。你将收到一个JSON格式的推理中间语言(IR)，其中包含：
-1. deterministic: 确定性推理证明链（必雷/必安全格的结论及其依据）
-2. probabilities: 每个未知格子的雷概率和信息增益
-3. regions: 连通区域的特征信息
+            "你是一个扫雷推理助手。你的唯一任务是把 Rust 引擎输出的推理中间语言 (IR) 翻译成符合规范的{}分析报告。你会收到 JSON IR (deterministic / probabilities / regions / flag_verification) 与局面文本说明。
 
 ## 数据防火墙原则
-你收到的数据中绝不包含未翻开格子的真实雷藏信息。所有概率都是基于已知信息的数学推断，不是事后诸葛亮。
+你收到的数据中绝不包含未翻开格子的真实雷藏信息。所有概率都是基于已知信息的数学推断。
 
-## 严格的坐标引用规则（违反则视为幻觉/作弊）
-1. 所有坐标格式必须为 (x, y)，例如 (2, 3) 表示第3列第4行（0-indexed）
-2. 你引用的每一个坐标必须在IR中存在
-3. 严禁编造IR中不存在的坐标
-4. 严禁使用模糊表述如\"中间那个格子\"、\"旁边的格子\"，必须给出精确坐标
-5. 引用推理依据时，必须标明依赖的数字坐标，如\"根据坐标(0,0)的数字3...\"
+## 输入字段说明 (防止读错)
+- deterministic[].conclusion.is_mine: true=必雷结论 / false=必安全结论; depends_on[]: 依赖的数字坐标
+- probabilities[].mine_probability: 雷概率(0~1 小数); info_gain: 信息增益
+- flag_verification.flags[]: 每面旗的 status (Verified=确认正确 / Contradicted=矛盾 /
+  Suspected=未确认) 与 reason(中文理由)
 
 {}
-
 {}
 ",
-            lang_rule, base_zh_suffix
+            match self.language { Language::Chinese => "中文", Language::English => "English" },
+            lang_rule,
+            spec
         );
 
         match &self.mode {
             LLMMode::Teaching => self.teaching_prompt(&base),
-            LLMMode::Answer => format!(
+            LLMMode::Answer => self.answer_prompt(&base),
+            LLMMode::Strategy => self.strategy_prompt(&base),
+        }
+    }
+
+    /// 答案模式模板 (llm-output.md 模板 A: 确定性结论表 + 概率参考表 + 旗帜检查 + 下一步建议)
+    fn answer_prompt(&self, base: &str) -> String {
+        match self.language {
+            Language::Chinese => format!(
                 r##"{}
 
-## 当前模式：答案模式
-请将证明链转为流畅的因果推理文字。格式要求：
-- 每个结论必须引用具体坐标，如「坐标(x, y)是雷」
-- 必须说明依据，如「因为坐标(a, b)的数字N周围...」
-- 对概率较低的格子给出精确概率数值
-- 对无确定性结论的格子，给出概率排序"##,
+## 当前模式：答案模式 — 输出模板 (按序, 缺失章节省略并说明原因)
+## 🎯 确定性结论（必有依据）
+### 💣 必雷格（共 N 个）[若无则此小节不出现]
+| 坐标 | 依据 |
+|------|------|
+| (行,列) | 依据 rule / depends_on |
+### ✅ 安全格（共 N 个）[同上]
+| 坐标 | 依据 |
+|------|------|
+
+## 📊 概率参考（无确定结论时给出; 有确定结论也可附高价值格）
+| 坐标 | 雷概率 | 信息增益 | 建议 |
+|------|--------|----------|------|
+
+## 🚩 旗帜检查
+- ✅ / ⚠️ 说明; 疑似误标按坐标列出原因
+
+## 💡 下一步建议
+[1-2 句, 给出最高优先级操作]
+
+若用户带了具体提问(见消息末尾【用户提问】):
+- "为什么/原因/解释" → 先答标题「## 直接原因」1-3 句并引用坐标, 再给「## 思考引导」1 问;
+- 其他提问 → 先按上方模板输出当前局面结论, 再以「## 回答用户提问」小节直接回答。"##,
                 base
             ),
-            LLMMode::Strategy => format!(
+            Language::English => format!(
                 r##"{}
 
-## 当前模式：策略模式
-请基于概率和收益数据，分析各区域的利弊。格式要求：
-- 每个区域必须列出其包含的坐标范围
-- 比较平均雷概率和信息增益
-- 给出「先处理哪个区域」的明确建议
-- 建议点击的坐标必须在IR的probabilities中存在"##,
+## Current Mode: Answer — Output Template
+## 🎯 Deterministic conclusions (with evidence)
+### 💣 Must-be-mine (N)
+| coord | evidence |
+### ✅ Must-be-safe (N)
+| coord | evidence |
+
+## 📊 Probability reference
+| coord | mine prob | info gain | advice |
+
+## 🚩 Flag check
+list contradicted/suspected flags or state all flags consistent
+
+## 💡 Next step
+1-2 sentences.
+
+If the user asked a question: "why" questions first answer with the heading ## Direct Reason (1-3 sentences citing
+coordinates) then the heading ## Think Further (1 question); other questions: output the template then answer in the
+## Answer section."##,
                 base
             ),
         }
     }
 
+    /// 策略模式模板 (llm-output.md 模板 C)
+    fn strategy_prompt(&self, base: &str) -> String {
+        match self.language {
+            Language::Chinese => format!(
+                r##"{}
+
+## 当前模式：策略比较 — 输出模板
+## 策略比较
+### 方案 A：处理区域 [坐标范围]
+- 收益: [可翻开格数等具体数字]
+- 风险: [雷概率等具体数字]
+- 预期结果: [简述]
+### 方案 B：处理区域 [坐标范围]
+- 收益: ...
+- 风险: ...
+### 建议
+推荐方案 [A/B], 理由: [1-2 句]
+补充: 若存在旗帜问题, 先在结论处提示概率可能出错并建议先处理旗帜。"##,
+                base
+            ),
+            Language::English => format!(
+                r##"{}
+
+## Current Mode: Strategy — Output Template
+## Strategy comparison
+### Option A: region [coordinate range]
+- gain / risk / expected
+### Option B: region ...
+### Recommendation
+Option [A/B], reason.
+Mention flag issues first if any."##,
+                base
+            ),
+        }
+    }
     /// 教学模式提示词: 智能自适应 (teachmod2.md) — 不是复读机,
     /// 根据用户提问在"直接解释"与"引导问题"之间切换, 双语
     fn teaching_prompt(&self, base: &str) -> String {
@@ -297,6 +399,11 @@ Output format:
             .iter()
             .filter(|f| f.status == crate::model::FlagVerifyStatus::Suspected)
             .collect();
+        let attention: Vec<_> = fv
+            .flags
+            .iter()
+            .filter(|f| f.needs_attention)
+            .collect();
         if !fv.flags.is_empty() {
             msg.push_str(&format!("\n\n{} {}", intro, fv.summary));
             if !contrad.is_empty() {
@@ -316,6 +423,19 @@ Output format:
                 msg.push_str("\n结论: 所有旗帜均与数字约束自洽, 可当作已知雷使用。");
             }
         }
+        // 旗帜问题警告: 概率可能出错 (LLM 必须显式告知用户并谨慎引用概率)
+        if !attention.is_empty() {
+            let coords: Vec<String> = attention.iter().map(|f| format!("{}", f.coord)).collect();
+            msg.push_str(&format!(
+                "\n\n⚠️ 重要警告: 当前存在 {} 面问题旗帜 {} (矛盾或极可能误标), 需要用户处理。\n以下概率与推理基于\"问题旗降级为未知、其余旗视为已知雷\"的容错假设, 数值可能出错; 请在回答开头提示用户先核对/移除问题旗帜, 并避免基于可能受影响的概率做出决定性断言。",
+                attention.len(),
+                coords.join(", ")
+            ));
+        }
+        // 0% 概率语义提示: 未与数字相邻的未知格概率为 0, 通常意味着总雷数已在其他区域确认
+        msg.push_str(
+            "\n\n提示: 若某未知格不与任何已翻开数字相邻但雷概率为 0, 通常表示总雷数已被确认在其他格子区域 (该格必为安全); 引用此类结论时说明原因。",
+        );
         msg
     }
 
@@ -587,7 +707,13 @@ mod tests {
         let prompt = t.build_system_prompt();
         assert!(prompt.contains("数据防火墙"));
         assert!(prompt.contains("答案模式"));
-        assert!(prompt.contains("严格的坐标引用规则"));
+        assert!(prompt.contains("输出硬性规则"));   // llm-output.md 规则块
+        assert!(prompt.contains("坐标引用"));
+        assert!(prompt.contains("mine_probability"));
+        assert!(prompt.contains("下一步建议"));
+        // 中文模式下禁止超过 500 字 & 必列表格
+        assert!(prompt.contains("500"));
+        assert!(prompt.contains("旗帜检查"));
     }
 
     #[test]
@@ -664,6 +790,7 @@ mod tests {
                     coord: Coord::new(1, 0),
                     status: FlagVerifyStatus::Contradicted,
                     reason: "数字1位于(0,0)周围旗数超限".into(),
+                    needs_attention: true,
                 }],
                 summary: "发现 1 面可能标错".into(),
                 has_contradiction: true,

@@ -346,8 +346,14 @@ fn run_local_pipeline(
             continue;
         }
         zero_safe.insert(p.coord);
+        let touches_number = view
+            .revealed
+            .iter()
+            .any(|rv| rv.coord.neighbors(view.width, view.height).contains(&p.coord));
         let reason = if view.remaining_mines == 0 {
             "剩余雷数已为 0, 该格必为安全".to_string()
+        } else if !touches_number {
+            "该格不与任何已翻开数字相邻且雷概率为 0, 表明总雷数已被确认在其他格子区域 (该格必为安全)".to_string()
         } else {
             "约束解析下该格雷概率为 0%, 判定为安全 (不存在把雷放在该格的可行方案)".to_string()
         };
@@ -431,7 +437,7 @@ async fn llm_translate_with_retry(
                 // 瞬态错误 (网关 504 / 超时 / 5xx / 连接重置): 立即重试, 最多 3 次
                 // (axum handler 要求 future Send, 故不使用 tokio sleep 退避;
                 // 有界重试保证不会死循环)
-                if attempt < 2 && is_transient_llm_error(&msg) {
+                if attempt < 1 && is_transient_llm_error(&msg) {
                     continue;
                 }
                 last_err = Some(msg);
@@ -455,7 +461,7 @@ async fn llm_translate_with_retry(
         (None, Some(e)) => {
             let local = translator.local_translate(ir);
             let hint = if e.contains("504") || e.contains("Gateway Time-out") {
-                "\n\n提示: 网关 504 超时通常是模型响应过慢或上游代理超时。已自动重试 3 次仍失败，可稍后再试；或调大后端环境变量 LLM_TIMEOUT_SECS（默认 120 秒）。"
+                "\n\n提示: 网关 504 超时通常是模型响应过慢或上游代理超时。瞬态错误自动重试 1 次后仍失败，可稍后再试；或调大后端环境变量 LLM_TIMEOUT_SECS（默认 120 秒）。"
             } else {
                 ""
             };
