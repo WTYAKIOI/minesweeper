@@ -17,6 +17,19 @@ pub struct ProbabilityEngine;
 /// 约束: (未知邻居坐标列表, 剩余雷数)
 type Constraint = (Vec<Coord>, i32);
 
+/// 组合数 C(n, k) (n ≤ 8 量级, 查表级计算)
+fn comb(n: u32, k: u32) -> u64 {
+    if k > n {
+        return 0;
+    }
+    let k = k.min(n - k);
+    let mut r: u64 = 1;
+    for i in 0..k {
+        r = r * (n - i) as u64 / (i + 1) as u64;
+    }
+    r
+}
+
 /// 蒙特卡洛引擎 (保留接口兼容, 内部委托给 ProbabilityEngine)
 #[derive(Default)]
 pub struct MonteCarloEngine {
@@ -134,15 +147,59 @@ impl ProbabilityEngine {
             }
         }
 
-        // 7. 裁剪到 [0, 1]
-        unknowns.iter().map(|c| {
-            let p = probs.get(c).copied().unwrap_or(0.0).clamp(0.0, 1.0);
-            CellProb {
-                coord: *c,
-                mine_probability: p,
-                info_gain: 0.0,
+        // 7. 裁剪到 [0, 1], 并计算期望信息增益 (近似): 点击该格"期望翻开的格数"
+        //
+        // 模型: 点开 c 后
+        //   - c 安全(1-p) 才可能有收益;
+        //   - c 显示为 0 (概率近似 p0) 才会连锁展开到其未知邻居;
+        //   - 每个未知邻居 u 安全则以 (1-p_u) 翻开 (再深一层连锁忽略 → 保守低估).
+        // p0(c) 由相邻数字约束的组合计数近似: c 非雷时, 对它参与的每个数字 n,
+        // 需从其余 U-1 个候选中选出 r=need 个雷: P = C(U-1, r)/C(U, r).
+        // gain = (1-p) * (1 + p0 * Σ_{u∈N8(c)} (1-p_u))
+        let mut result: Vec<CellProb> = Vec::with_capacity(unknowns.len());
+        for c in &unknowns {
+            let pc = probs.get(c).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+
+            let mut p0 = 1.0;
+            for (cells, need) in &constraints {
+                if !cells.contains(c) {
+                    continue;
+                }
+                let u = cells.len();
+                if *need <= 0 || *need as usize > u {
+                    if *need as usize > u {
+                        p0 = 0.0; // 全部候选皆雷 → 该格必非 0
+                        break;
+                    }
+                    continue; // need==0 → 该格必安全, 概率无约束信息
+                }
+                let (denom, numer) = (comb(u as u32, *need as u32), comb(u as u32 - 1, *need as u32));
+                if denom == 0 {
+                    p0 = 0.0;
+                    break;
+                }
+                p0 *= numer as f64 / denom as f64;
             }
-        }).collect()
+
+            let mut expand = 0.0;
+            for n in c.neighbors(view.width, view.height) {
+                if unknown_set.contains(&n) {
+                    if let Some(&pn) = probs.get(&n) {
+                        if pn >= 0.0 {
+                            expand += (1.0 - pn).max(0.0);
+                        }
+                    }
+                }
+            }
+            let safe_p = (1.0 - pc).max(0.0);
+            let gain = safe_p * (1.0 + p0 * expand);
+            result.push(CellProb {
+                coord: *c,
+                mine_probability: pc,
+                info_gain: gain,
+            });
+        }
+        result
     }
 
     /// 构建约束列表: (未知邻居, 剩余雷数)
@@ -416,6 +473,23 @@ mod tests {
                 p.mine_probability
             );
             assert!((p.mine_probability - 0.25).abs() < 1e-6, "got {}", p.mine_probability);
+            // 无数值约束时 P(为0)=1, 且存在安全邻居 → 信息增益应 > 1 (期望连锁展开)
+            assert!(p.info_gain > 1.0, "info_gain 未生效: {}", p.info_gain);
         }
+    }
+
+    #[test]
+    fn test_info_gain_positive() {
+        // 两个数字 1, 各自有 2 个未知候选 (互不重叠), 剩余 2 雷 → 各候选概率 0.5
+        let board = vec![vec![-1, 1, -1, -1, 1, -1]];
+        let view = PlayerView::from_2d(&board, 2);
+        let probs = ProbabilityEngine::compute(&view, &HashSet::new(), &HashSet::new());
+        assert_eq!(probs.len(), 4);
+        for p in &probs {
+            assert!(p.info_gain > 0.0, "info_gain 应非零: {:?} {}", p.coord, p.info_gain);
+        }
+        // 安全概率相同的格, 拥有安全未知邻居时增益应更大 (低雷概率+连锁)
+        let lone = probs.iter().find(|p| p.coord == Coord::new(0, 0)).unwrap();
+        assert!((lone.mine_probability - 0.5).abs() < 1e-9);
     }
 }
