@@ -83,6 +83,7 @@ async fn run_server(port: u16, mc_iterations: usize, ocr_url: String) -> Result<
         llm_client: crate::llm::LLMClient::from_env(),
         mc_iterations,
         ocr_url,
+        usage_store: std::sync::Arc::new(crate::llm::UsageStore::open()),
     };
     let app = crate::server::create_router(state);
     let addr = format!("0.0.0.0:{}", port);
@@ -155,7 +156,13 @@ async fn run_analyze(
             let system_prompt = translator.build_system_prompt();
             let user_message = translator.build_user_message(&view, &ir);
             match client.chat(&system_prompt, &user_message).await {
-                Ok(resp) => resp,
+                Ok(result) => {
+                    if let Some(u) = &result.usage {
+                        println!("[usage] {} tokens (prompt {}, completion {})",
+                            u.total_tokens, u.prompt_tokens, u.completion_tokens);
+                    }
+                    result.content
+                }
                 Err(e) => format!("LLM 调用失败: {}, 回退到本地分析\n\n{}", e, translator.local_translate(&ir)),
             }
         } else {

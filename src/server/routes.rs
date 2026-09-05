@@ -1,5 +1,5 @@
 use axum::{
-    extract::State,
+    extract::{Query, State},
     http::StatusCode,
     response::Json,
     routing::{get, post},
@@ -10,7 +10,7 @@ use std::sync::Arc;
 use tower_http::services::ServeDir;
 
 use crate::engine::{DeterministicEngine, ProbabilityEngine, RegionAnalyzer};
-use crate::llm::{LLMClient, LLMConfig, LLMMode, Translator};
+use crate::llm::{LLMClient, LLMConfig, LLMMode, TokenUsage, Translator, UsageStore};
 use crate::model::{InferenceIR, PlayerView};
 
 /// 应用状态
@@ -20,6 +20,8 @@ pub struct AppState {
     pub mc_iterations: usize,
     /// OCR 微服务地址
     pub ocr_url: String,
+    /// Token 用量存储 (JSONL 持久化 + 内存聚合)
+    pub usage_store: Arc<UsageStore>,
 }
 
 impl Default for AppState {
@@ -29,6 +31,7 @@ impl Default for AppState {
             mc_iterations: 0, // 0 = 动态自适应
             ocr_url: std::env::var("OCR_URL")
                 .unwrap_or_else(|_| "http://localhost:5001".to_string()),
+            usage_store: Arc::new(UsageStore::open()),
         }
     }
 }
@@ -55,6 +58,9 @@ pub struct AnalyzeResponse {
     pub ir: InferenceIR,
     pub analysis: String,
     pub used_llm: bool,
+    /// 本次 LLM 调用的 token 用量 (未调用 LLM 或 API 未返回时为 null)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<TokenUsage>,
 }
 
 /// OCR 请求 (base64 编码图像)
@@ -97,6 +103,13 @@ pub struct LLMStatusResponse {
     pub env_base_url: Option<String>,
 }
 
+/// 用量日志查询参数
+#[derive(Debug, Deserialize)]
+pub struct UsageLogsQuery {
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+}
+
 /// 创建路由
 pub fn create_router(state: AppState) -> Router {
     Router::new()
@@ -104,6 +117,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/ocr", post(ocr))
         .route("/api/llm/test", post(test_llm))
         .route("/api/llm/status", get(llm_status))
+        .route("/api/usage/stats", get(usage_stats))
+        .route("/api/usage/logs", get(usage_logs))
         .route("/api/health", get(health))
         .with_state(Arc::new(state))
         .fallback_service(ServeDir::new("static").fallback(ServeDir::new("static/index.html")))
@@ -176,17 +191,44 @@ async fn analyze(
         None
     };
 
+    // 月度限额: 超限后拒绝 LLM 调用, 回退本地分析 (防止意外超支)
+    let mut llm_blocked_msg: Option<String> = None;
+    let llm_client = if let Some(client) = &llm_client {
+        if state.usage_store.limit_exceeded() {
+            llm_blocked_msg = Some(format!(
+                "⚠️ 本月 token 用量已达限额 ({}), 本次调用被拒绝并回退到本地分析。\n可调整环境变量 LLM_MONTHLY_TOKEN_LIMIT 后重启。",
+                state.usage_store.month_tokens()
+            ));
+            None
+        } else {
+            Some(client.clone())
+        }
+    } else {
+        None
+    };
+
+    let mut usage: Option<TokenUsage> = None;
     let (analysis, used_llm) = if use_llm {
         if let Some(client) = &llm_client {
             let system_prompt = translator.build_system_prompt();
             let user_message = translator.build_user_message(&view, &ir);
             match client.chat(&system_prompt, &user_message).await {
-                Ok(resp) => (resp, true),
+                Ok(result) => {
+                    // 记录 token 用量 (API 未返回 usage 时跳过)
+                    if let Some(u) = &result.usage {
+                        state.usage_store
+                            .record(client.config().model.as_str(), &client.config().provider_label(), u);
+                        usage = Some(u.clone());
+                    }
+                    (result.content, true)
+                }
                 Err(e) => {
                     let local = translator.local_translate(&ir);
                     (format!("⚠️ LLM 调用失败, 已回退到本地分析\n\n错误: {}\n\n{}", e, local), false)
                 }
             }
+        } else if let Some(msg) = llm_blocked_msg {
+            ("⚠️ ".to_string() + &msg + "\n\n" + &translator.local_translate(&ir), false)
         } else {
             ("⚠️ 未配置 LLM API Key, 回退到本地分析\n\n".to_string() + &translator.local_translate(&ir), false)
         }
@@ -200,6 +242,7 @@ async fn analyze(
         ir,
         analysis,
         used_llm,
+        usage,
     }))
 }
 
@@ -284,4 +327,19 @@ async fn llm_status() -> Json<LLMStatusResponse> {
         env_model,
         env_base_url,
     })
+}
+
+/// Token 用量统计 (今日 / 近7日 / 本月 / 累计 + 模型分布 + 近7天趋势)
+async fn usage_stats(State(state): State<Arc<AppState>>) -> Json<crate::llm::UsageStats> {
+    Json(state.usage_store.stats())
+}
+
+/// Token 用量明细日志 (按时间倒序)
+async fn usage_logs(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<UsageLogsQuery>,
+) -> Json<Vec<crate::llm::UsageRecord>> {
+    let limit = q.limit.unwrap_or(100).min(10_000);
+    let offset = q.offset.unwrap_or(0);
+    Json(state.usage_store.logs(limit, offset))
 }

@@ -432,6 +432,171 @@
             padding: 0 4px;
             font-size: 11px;
         }
+
+        /* ============ API 配置面板 (v2) ============ */
+        .api-preset-row { display: flex; gap: 6px; flex-wrap: wrap; }
+        .api-preset-row button { padding: 4px 12px; font-size: 12px; font-weight: 500; }
+        .llm-row .eye-btn {
+            padding: 6px 10px;
+            font-size: 13px;
+            background: var(--chip-bg);
+            border: 1px solid var(--border);
+            color: var(--text);
+        }
+        .llm-advanced {
+            border-top: 1px dashed var(--border);
+            padding-top: 10px;
+            display: flex;
+            gap: 16px;
+            flex-wrap: wrap;
+            align-items: center;
+        }
+        .llm-advanced label { font-size: 12px; gap: 6px; }
+        .llm-advanced input[type="number"] { width: 90px; }
+
+        /* ============ 底部状态栏 ============ */
+        .status-bar {
+            position: fixed;
+            left: 0; right: 0; bottom: 0;
+            z-index: 60;
+            background: var(--card-bg);
+            border-top: 1px solid var(--border);
+            box-shadow: 0 -2px 8px rgba(0, 0, 0, 0.08);
+            padding: 7px 24px;
+            display: flex;
+            align-items: center;
+            gap: 18px;
+            font-size: 12px;
+            color: var(--text-sub);
+            flex-wrap: wrap;
+            cursor: pointer;
+            user-select: none;
+        }
+        .status-bar .sb-item { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+        .status-bar .sb-item b { color: var(--text); }
+        .status-bar .grow { flex: 1; }
+        body { padding-bottom: 44px; }
+
+        .progress {
+            width: 110px; height: 8px;
+            background: var(--chip-bg);
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            overflow: hidden;
+            display: inline-block;
+            vertical-align: middle;
+        }
+        .progress > i {
+            display: block; height: 100%;
+            background: #2ECC71;
+            border-radius: 3px;
+            transition: width 0.3s;
+        }
+        .progress.warn > i { background: #F39C12; }
+        .progress.over > i { background: #E74C3C; }
+
+        /* ============ 用量统计弹窗 ============ */
+        #usageOverlay {
+            position: fixed;
+            inset: 0;
+            background: rgba(0, 0, 0, 0.45);
+            display: none;
+            align-items: center;
+            justify-content: center;
+            z-index: 200;
+            padding: 20px;
+        }
+        #usageOverlay.show { display: flex; }
+        .usage-box {
+            background: var(--card-bg);
+            border-radius: 8px;
+            box-shadow: var(--shadow);
+            max-width: 760px;
+            width: 100%;
+            max-height: 86vh;
+            overflow-y: auto;
+            padding: 22px;
+        }
+        .usage-box h3 {
+            font-size: 17px;
+            margin-bottom: 14px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+        .usage-cards {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+            gap: 10px;
+            margin-bottom: 16px;
+        }
+        .usage-card {
+            background: var(--chip-bg);
+            border-radius: 8px;
+            padding: 12px 14px;
+        }
+        .usage-card .uc-label { font-size: 11px; color: var(--text-sub); }
+        .usage-card .uc-value { font-size: 20px; font-weight: 700; margin: 2px 0; }
+        .usage-card .uc-cost { font-size: 11px; color: var(--text-sub); }
+        .usage-section-title {
+            font-size: 13px; font-weight: 700;
+            margin: 16px 0 8px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+        .trend-chart {
+            display: flex;
+            align-items: flex-end;
+            gap: 10px;
+            height: 110px;
+            padding: 6px 4px 0;
+        }
+        .trend-col { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 4px; height: 100%; justify-content: flex-end; }
+        .trend-bar {
+            width: 70%;
+            max-width: 42px;
+            background: var(--primary);
+            border-radius: 3px 3px 0 0;
+            min-height: 2px;
+            opacity: 0.85;
+        }
+        .trend-col .trend-val { font-size: 10px; color: var(--text-sub); }
+        .trend-col .trend-date { font-size: 10px; color: var(--text-sub); }
+        .model-dist { display: flex; flex-direction: column; gap: 7px; }
+        .model-row { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+        .model-row .model-name { width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .model-row .model-bar-wrap { flex: 1; height: 10px; background: var(--chip-bg); border-radius: 3px; overflow: hidden; }
+        .model-row .model-bar { height: 100%; background: var(--primary); opacity: 0.8; border-radius: 3px; }
+        .model-row .model-pct { width: 46px; text-align: right; color: var(--text-sub); }
+        table.usage-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 12px;
+        }
+        table.usage-table th, table.usage-table td {
+            text-align: left;
+            padding: 6px 8px;
+            border-bottom: 1px solid var(--border);
+        }
+        table.usage-table th { color: var(--text-sub); font-weight: 500; }
+        table.usage-table td.num, table.usage-table th.num { text-align: right; }
+        .usage-warn-row {
+            margin-top: 16px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            font-size: 12px;
+            color: var(--text-sub);
+            flex-wrap: wrap;
+        }
+        .usage-warn-row .progress { flex: 1; max-width: 280px; height: 10px; }
+        .usage-privacy { font-size: 11px; color: var(--text-sub); margin-top: 12px; line-height: 1.6; }
+        .usage-empty { color: var(--text-sub); font-size: 12px; text-align: center; padding: 12px 0; }
     </style>
 </head>
 <body>
@@ -440,6 +605,8 @@
         <div class="nav-title">🧠 扫雷认知助手</div>
         <div class="nav-actions">
             <button class="icon-btn" id="themeBtn" title="切换浅色/深色主题">🌙 深色</button>
+            <button class="icon-btn" onclick="scrollToLLMPanel()" title="API 配置">🤖 LLM</button>
+            <button class="icon-btn" onclick="openUsagePanel()" title="Token 消耗统计">📊 用量</button>
             <button class="icon-btn" onclick="toggleHelp(true)" title="使用帮助">❓ 帮助</button>
         </div>
     </nav>
@@ -449,41 +616,57 @@
 
             <!-- ============ 左：棋盘编辑器 ============ -->
             <div class="card">
-                <!-- LLM 设置 (可折叠) -->
+                <!-- API 配置 (可折叠) -->
                 <div class="llm-panel collapsed" id="llmPanel">
                     <div class="llm-panel-header" onclick="toggleLLMPanel()">
-                        <span class="title">🤖 LLM 设置</span>
+                        <span class="title">⚙️ API 配置</span>
                         <span class="sub" id="llmHeaderStatus">未配置 · 点击展开</span>
                     </div>
                     <div class="llm-body">
-                        <div class="llm-provider-presets">
-                            <button class="secondary small" onclick="applyLLMPreset('openai')">OpenAI</button>
-                            <button class="secondary small" onclick="applyLLMPreset('deepseek')">DeepSeek</button>
-                            <button class="secondary small" onclick="applyLLMPreset('kimi')">Kimi</button>
-                            <button class="secondary small" onclick="applyLLMPreset('ollama')">Ollama 本地</button>
-                        </div>
                         <div class="llm-row">
-                            <label>API Key</label>
-                            <input type="password" id="llmApiKey" placeholder="sk-...">
+                            <label>快速预设</label>
+                            <div class="api-preset-row" id="apiPresetRow">
+                                <button class="secondary small" data-preset="openai" onclick="applyLLMPreset('openai')">OpenAI</button>
+                                <button class="secondary small" data-preset="deepseek" onclick="applyLLMPreset('deepseek')">DeepSeek</button>
+                                <button class="secondary small" data-preset="kimi" onclick="applyLLMPreset('kimi')">Kimi</button>
+                                <button class="secondary small" data-preset="openrouter" onclick="applyLLMPreset('openrouter')">OpenRouter</button>
+                                <button class="secondary small" data-preset="ollama" onclick="applyLLMPreset('ollama')">Ollama 本地</button>
+                                <button class="secondary small" data-preset="qwen" onclick="applyLLMPreset('qwen')">通义千问</button>
+                                <button class="secondary small" data-preset="custom" onclick="applyLLMPreset('custom')">自定义</button>
+                            </div>
                         </div>
                         <div class="llm-row">
                             <label>Base URL</label>
                             <input type="text" id="llmBaseUrl" placeholder="https://api.openai.com/v1">
+                            <button class="secondary small" onclick="testLLM()">🔗 测试连接</button>
                         </div>
                         <div class="llm-row">
-                            <label>模型</label>
+                            <label>模型名称</label>
                             <input type="text" id="llmModel" placeholder="gpt-4o-mini">
                         </div>
+                        <div class="llm-hint" id="llmModelHint" style="margin:-4px 0 0 80px;">模型名填网关可用的模型标识即可; 若使用中转/OpenRouter 网关, 需带厂商前缀 (如 openai/gpt-4o-mini)。</div>
                         <div class="llm-row">
-                            <button class="secondary small" onclick="testLLM()">🔌 测试连接</button>
+                            <label>API Key</label>
+                            <input type="password" id="llmApiKey" placeholder="sk-... (仅保存在内存中)">
+                            <button class="secondary small eye-btn" onclick="toggleKeyVisibility()" title="显示/隐藏">👁️</button>
+                        </div>
+                        <div class="llm-advanced">
+                            <label>最大 Token <input type="number" id="llmMaxTokens" value="2048" min="16" max="32768" step="16"></label>
+                            <label>温度 <input type="number" id="llmTemperature" value="0.3" min="0" max="2" step="0.1"></label>
                             <span class="llm-status wait" id="llmTestStatus">未测试</span>
+                        </div>
+                        <div class="llm-row">
+                            <button class="secondary small" onclick="saveLLMConfig()">💾 保存配置</button>
+                            <button class="secondary small" onclick="resetLLMConfig()">🔄 重置默认</button>
                             <span class="grow"></span>
-                            <button class="secondary small" onclick="saveLLMConfig()">💾 保存</button>
+                            <span class="sub" id="llmConnMeta"></span>
                         </div>
                         <div class="llm-hint">
-                            配置保存在浏览器 localStorage, 不会发送到第三方。<br>
-                            支持 OpenAI / DeepSeek / Kimi / Moonshot / 本地 Ollama 等任何 OpenAI 兼容 API。<br>
-                            环境变量 <code>OPENAI_API_KEY</code> / <code>OPENAI_BASE_URL</code> / <code>OPENAI_MODEL</code> 同样生效, UI 配置优先。
+                            🔒 API Key 仅保存在内存中, 刷新页面后需重新输入, 不会被写入 localStorage 或上传到任何服务器;<br>
+                            Base URL / 模型 / 参数保存在本地浏览器。<code>OPENAI_API_KEY</code> / <code>OPENAI_BASE_URL</code> / <code>OPENAI_MODEL</code>
+                            环境变量同样生效, UI 配置优先。本地 Ollama 无需 Key。<br>
+                            ⚠️ OpenRouter 及部分中转网关要求模型名带厂商前缀 (如 <code>openai/gpt-4o-mini</code>); 若提示
+                            "No proxy configuration found for requested model", 说明该模型名在当前网关不可用, 请带前缀重试或更换网关已配置的模型。
                         </div>
                     </div>
                 </div>
@@ -587,6 +770,55 @@
     <!-- 悬停格子信息浮层 -->
     <div id="cellTip"></div>
 
+    <!-- ============ 底部状态栏 (API 提供商 / 费用 / 用量) ============ -->
+    <div class="status-bar" id="statusBar" onclick="openUsagePanel()" title="点击查看 Token 消耗统计">
+        <span class="sb-item" id="sbProvider">🤖 未配置 LLM</span>
+        <span class="sb-item">💰 本月 <b id="sbMonthCost">$0.000</b></span>
+        <span class="sb-item">📊 用量 <b id="sbMonthTokens">0</b><span id="sbLimitLabel"></span>
+            <span class="progress" id="sbProgress"><i style="width:0%"></i></span>
+        </span>
+        <span class="grow"></span>
+        <span class="sb-item" id="sbHint">点击展开统计面板 · ⚙️ 配置 API</span>
+    </div>
+
+    <!-- ============ Token 消耗统计弹窗 ============ -->
+    <div id="usageOverlay" onclick="if(event.target===this) closeUsagePanel()">
+        <div class="usage-box">
+            <h3>
+                <span>📊 Token 消耗统计</span>
+                <span>
+                    <button class="secondary small" onclick="exportUsageCsv()">📥 导出CSV</button>
+                    <button class="secondary small" onclick="loadUsageStats(true)">🔄 刷新</button>
+                    <button class="secondary small" onclick="closeUsagePanel()">× 关闭</button>
+                </span>
+            </h3>
+            <div class="usage-cards">
+                <div class="usage-card"><div class="uc-label">今日用量</div><div class="uc-value" id="ucToday">0</div><div class="uc-cost" id="ucTodayCost">~$0.000</div></div>
+                <div class="usage-card"><div class="uc-label">近 7 日</div><div class="uc-value" id="ucWeek">0</div><div class="uc-cost" id="ucWeekCost">~$0.000</div></div>
+                <div class="usage-card"><div class="uc-label">本月用量</div><div class="uc-value" id="ucMonth">0</div><div class="uc-cost" id="ucMonthCost">~$0.000</div></div>
+                <div class="usage-card"><div class="uc-label">累计用量</div><div class="uc-value" id="ucAll">0</div><div class="uc-cost" id="ucAllCost">~$0.000</div></div>
+            </div>
+            <div class="usage-section-title">用量趋势 (近 7 天)</div>
+            <div class="trend-chart" id="trendChart"></div>
+            <div class="usage-section-title">按模型分布</div>
+            <div class="model-dist" id="modelDist"></div>
+            <div class="usage-section-title">按日期明细 (近 14 天)</div>
+            <table class="usage-table">
+                <thead><tr><th>日期</th><th class="num">Tokens</th><th class="num">估算费用</th></tr></thead>
+                <tbody id="usageTableBody"></tbody>
+            </table>
+            <div class="usage-warn-row">
+                <span>用量警告</span>
+                <span class="progress" id="usageWarnProgress"><i style="width:0%"></i></span>
+                <span id="usageWarnText">未设置限额</span>
+            </div>
+            <div class="usage-privacy">
+                🔒 您的 API Key 仅存储在本地内存, 不会被上传; 用量数据仅保存在本机 <code>data/usage.jsonl</code>。
+                成本基于公开定价估算, 实际费用以 API 提供商账单为准。
+            </div>
+        </div>
+    </div>
+
     <!-- 帮助弹窗 -->
     <div id="helpOverlay" onclick="if(event.target===this) toggleHelp(false)">
         <div class="help-box">
@@ -633,7 +865,6 @@
         let highlightedStep = null;   // 当前选中的推理步骤涉及的坐标
         let teachingMode = false;
         let ocrBusy = false;
-        let llmConfig = null;         // {api_key, base_url, model} from localStorage
 
         const canvas = document.getElementById('boardCanvas');
         const ctx = canvas.getContext('2d');
@@ -644,30 +875,52 @@
         // 经典扫雷数字配色
         const DIGIT_COLORS = ['', '#1B4FD8', '#1E8E3E', '#D93025', '#1A237E', '#8B1A1A', '#00838F', '#202124', '#6B7280'];
 
-        /* ==================== LLM 配置 ==================== */
+        /* ==================== LLM / API 配置 ==================== */
+        // 快速预设: 点击填充 Base URL 与模型 (API Key 单独输入, 不随预设保存)
         const LLM_PRESETS = {
-            openai:   { base_url: 'https://api.openai.com/v1',      model: 'gpt-4o-mini' },
-            deepseek: { base_url: 'https://api.deepseek.com/v1',    model: 'deepseek-chat' },
-            kimi:     { base_url: 'https://api.moonshot.cn/v1',      model: 'moonshot-v1-8k' },
-            ollama:   { base_url: 'http://localhost:11434/v1',       model: 'qwen2.5:7b' },
+            openai:     { label: 'OpenAI',      provider: 'openai',     base_url: 'https://api.openai.com/v1',                          model: 'gpt-4o-mini' },
+            deepseek:   { label: 'DeepSeek',    provider: 'deepseek',   base_url: 'https://api.deepseek.com/v1',                        model: 'deepseek-chat' },
+            kimi:       { label: 'Kimi',        provider: 'kimi',       base_url: 'https://api.moonshot.cn/v1',                          model: 'moonshot-v1-8k' },
+            openrouter: { label: 'OpenRouter',  provider: 'openrouter', base_url: 'https://openrouter.ai/api/v1',                        model: 'openai/gpt-4o-mini' },
+            ollama:     { label: 'Ollama',      provider: 'ollama',     base_url: 'http://localhost:11434/v1',                           model: 'qwen2.5:7b' },
+            qwen:       { label: '通义千问',     provider: 'qwen',       base_url: 'https://dashscope.aliyuncs.com/compatible-mode/v1',   model: 'qwen-plus' },
+            custom:     { label: '自定义',       provider: 'custom',     base_url: '',                                                    model: '' },
         };
+
+        // 需要厂商前缀 (vendor/model) 的网关提示
+        function openrouterLike(baseUrl, provider) {
+            return provider === 'openrouter' || /openrouter/i.test(baseUrl || '');
+        }
+
+        // 安全策略: API Key 只保存在内存 (页面生命周期), 其余配置持久化到 localStorage
+        let llmKey = '';                 // 内存中的 API Key
+        let llmPersisted = null;         // {provider, base_url, model, max_tokens, temperature}
+        let lastConnMeta = '';           // 最近一次测试连接信息
+
+        function isLocalBase(url) {
+            return /\/\/(localhost|127\.0\.0\.1|\[::1\])/i.test(url || '');
+        }
 
         function loadLLMConfig() {
             try {
                 const saved = localStorage.getItem('ms-llm-config');
                 if (saved) {
-                    llmConfig = JSON.parse(saved);
-                    document.getElementById('llmApiKey').value = llmConfig.api_key || '';
-                    document.getElementById('llmBaseUrl').value = llmConfig.base_url || '';
-                    document.getElementById('llmModel').value = llmConfig.model || '';
+                    llmPersisted = JSON.parse(saved);
+                    document.getElementById('llmBaseUrl').value = llmPersisted.base_url || '';
+                    document.getElementById('llmModel').value = llmPersisted.model || '';
+                    document.getElementById('llmMaxTokens').value = llmPersisted.max_tokens || 2048;
+                    document.getElementById('llmTemperature').value = llmPersisted.temperature != null ? llmPersisted.temperature : 0.3;
+                    markPresetActive(llmPersisted.provider);
                     updateLLMHeaderStatus(true);
+                    updateModelHint();
                     // 自动勾选"调用 LLM"
                     document.getElementById('useLLM').checked = true;
+                    document.getElementById('llmApiKey').placeholder = '🔒 Key 未保存, 刷新后需重新输入';
                 }
             } catch (e) { /* ignore */ }
             // 也检查后端环境变量状态
             fetch('/api/llm/status').then(r => r.json()).then(data => {
-                if (data.env_configured && !llmConfig) {
+                if (data.env_configured && !llmPersisted) {
                     const msg = `环境变量已配置 (${data.env_model || '未知模型'})`;
                     document.getElementById('llmHeaderStatus').textContent = msg + ' · 点击展开';
                     document.getElementById('llmTestStatus').textContent = '环境变量已配置';
@@ -675,52 +928,150 @@
                     document.getElementById('useLLM').checked = true;
                 }
             }).catch(() => {});
+            loadUsageStats();
         }
 
         function saveLLMConfig() {
-            const cfg = {
+            const cfg = readLLMForm();
+            if (!cfg.base_url || !cfg.model) {
+                setLLMTestStatus('err', 'Base URL 和模型名称不能为空');
+                return;
+            }
+            const local = isLocalBase(cfg.base_url);
+            if (!cfg.api_key && !local) {
+                setLLMTestStatus('err', 'API Key 不能为空 (本地 Ollama 可免 Key)');
+                return;
+            }
+            llmKey = cfg.api_key;  // 仅内存
+            llmPersisted = { provider: cfg.provider, base_url: cfg.base_url, model: cfg.model,
+                             max_tokens: cfg.max_tokens, temperature: cfg.temperature };
+            localStorage.setItem('ms-llm-config', JSON.stringify(llmPersisted));
+            updateLLMHeaderStatus(true);
+            markPresetActive(cfg.provider);
+            updateModelHint();
+            document.getElementById('useLLM').checked = true;
+            document.getElementById('llmApiKey').value = '';
+            document.getElementById('llmApiKey').placeholder = '🔒 Key 已在内存中生效, 刷新后需重新输入';
+            setLLMTestStatus('ok', '已保存 (Key 仅内存)');
+            addChat('system', '✅ API 配置已保存并启用「调用 LLM」。API Key 仅保存在本页内存, 刷新后需重新输入。');
+        }
+
+        function resetLLMConfig() {
+            if (!confirm('重置为默认配置? (OpenAI / gpt-4o-mini, 清除已保存配置)')) return;
+            llmKey = '';
+            llmPersisted = null;
+            localStorage.removeItem('ms-llm-config');
+            document.getElementById('llmBaseUrl').value = LLM_PRESETS.openai.base_url;
+            document.getElementById('llmModel').value = LLM_PRESETS.openai.model;
+            document.getElementById('llmMaxTokens').value = 2048;
+            document.getElementById('llmTemperature').value = 0.3;
+            document.getElementById('llmApiKey').value = '';
+            markPresetActive('openai');
+            updateLLMHeaderStatus(false);
+            updateModelHint();
+            setLLMTestStatus('wait', '已重置');
+        }
+
+        function readLLMForm() {
+            return {
                 api_key: document.getElementById('llmApiKey').value.trim(),
                 base_url: document.getElementById('llmBaseUrl').value.trim(),
                 model: document.getElementById('llmModel').value.trim(),
+                provider: detectProviderLabel(),
+                max_tokens: parseInt(document.getElementById('llmMaxTokens').value, 10) || 2048,
+                temperature: parseFloat(document.getElementById('llmTemperature').value),
+                _isNaNTemp: isNaN(parseFloat(document.getElementById('llmTemperature').value)),
             };
-            if (!cfg.api_key) {
-                setLLMTestStatus('err', 'API Key 不能为空');
-                return;
+        }
+
+        function detectProviderLabel() {
+            const active = document.querySelector('#apiPresetRow button.active');
+            if (active && active.dataset.preset !== 'custom') return active.dataset.preset;
+            const url = document.getElementById('llmBaseUrl').value.toLowerCase();
+            if (url.includes('localhost') || url.includes('127.0.0.1')) return 'ollama';
+            if (url.includes('openrouter')) return 'openrouter';
+            if (url.includes('deepseek')) return 'deepseek';
+            if (url.includes('moonshot')) return 'kimi';
+            if (url.includes('dashscope') || url.includes('aliyun')) return 'qwen';
+            if (url.includes('openai')) return 'openai';
+            return 'custom';
+        }
+
+        // OpenRouter / 中转网关: 模型名必须带厂商前缀 (vendor/model)
+        function updateModelHint() {
+            const url = document.getElementById('llmBaseUrl').value;
+            const model = document.getElementById('llmModel').value;
+            const prov = detectProviderLabel();
+            const el = document.getElementById('llmModelHint');
+            if (!el) return;
+            const isOR = openrouterLike(url, prov);
+            if (isOR) {
+                const hasPrefix = (model || '').includes('/');
+                el.textContent = hasPrefix
+                    ? '✅ OpenRouter 模型名已带厂商前缀'
+                    : '⚠️ OpenRouter 模型名需带厂商前缀 (如 openai/gpt-4o-mini)。后端会自动尝试补全, 否则请手动填写。';
+                el.style.color = hasPrefix ? '#2ECC71' : '#F39C12';
+            } else {
+                el.textContent = '模型名填网关可用的模型标识即可; 若使用中转/OpenRouter 网关, 需带厂商前缀 (如 openai/gpt-4o-mini)。';
+                el.style.color = '';
             }
-            llmConfig = cfg;
-            localStorage.setItem('ms-llm-config', JSON.stringify(cfg));
-            updateLLMHeaderStatus(true);
-            document.getElementById('useLLM').checked = true;
-            setLLMTestStatus('ok', '已保存');
-            addChat('system', '✅ LLM 配置已保存, 已自动启用「调用 LLM」。');
         }
 
         function getLLMConfigForRequest() {
-            if (llmConfig && llmConfig.api_key) return llmConfig;
-            return null;
+            const base = llmPersisted;
+            if (!base || !base.base_url || !base.model) return null;
+            if (!llmKey && !isLocalBase(base.base_url)) return null; // Key 已随刷新清除
+            return {
+                api_key: llmKey || '',
+                base_url: base.base_url,
+                model: base.model,
+                provider: base.provider,
+                max_tokens: base.max_tokens,
+                temperature: base.temperature,
+            };
         }
 
         function updateLLMHeaderStatus(configured) {
             const el = document.getElementById('llmHeaderStatus');
-            if (configured && llmConfig) {
-                el.textContent = `已配置: ${llmConfig.model || '?'} · 点击展开`;
+            if (configured && llmPersisted) {
+                const hasKey = !!llmKey || isLocalBase(llmPersisted.base_url);
+                el.textContent = `已配置: ${llmPersisted.model || '?'}${hasKey ? '' : ' (待输入 Key)'} · 点击展开`;
             } else {
                 el.textContent = '未配置 · 点击展开';
             }
         }
 
-        function toggleLLMPanel() {
+        function scrollToLLMPanel() {
             const panel = document.getElementById('llmPanel');
-            panel.classList.toggle('collapsed');
+            panel.classList.remove('collapsed');
+            panel.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }
+
+        function toggleLLMPanel() {
+            document.getElementById('llmPanel').classList.toggle('collapsed');
+        }
+
+        function markPresetActive(provider) {
+            document.querySelectorAll('#apiPresetRow button').forEach(b => {
+                b.classList.toggle('active', b.dataset.preset === provider);
+            });
         }
 
         function applyLLMPreset(key) {
             const p = LLM_PRESETS[key];
             if (!p) return;
-            if (!document.getElementById('llmBaseUrl').value || confirm('应用预设会覆盖当前 Base URL 和模型, 继续?')) {
+            if (p.base_url === '' || !document.getElementById('llmBaseUrl').value ||
+                confirm(`应用预设「${p.label}」会覆盖当前 Base URL 和模型, 继续?`)) {
                 document.getElementById('llmBaseUrl').value = p.base_url;
                 document.getElementById('llmModel').value = p.model;
             }
+            markPresetActive(key);
+            updateModelHint();
+        }
+
+        function toggleKeyVisibility() {
+            const input = document.getElementById('llmApiKey');
+            input.type = input.type === 'password' ? 'text' : 'password';
         }
 
         function setLLMTestStatus(type, msg) {
@@ -730,27 +1081,167 @@
         }
 
         async function testLLM() {
-            const cfg = {
-                api_key: document.getElementById('llmApiKey').value.trim(),
-                base_url: document.getElementById('llmBaseUrl').value.trim(),
-                model: document.getElementById('llmModel').value.trim(),
-            };
-            if (!cfg.api_key) { setLLMTestStatus('err', 'API Key 不能为空'); return; }
+            const cfg = readLLMForm();
+            if (!cfg.base_url || !cfg.model) { setLLMTestStatus('err', 'Base URL 和模型不能为空'); return; }
+            if (!cfg.api_key && !isLocalBase(cfg.base_url)) { setLLMTestStatus('err', 'API Key 不能为空 (本地 Ollama 可免 Key)'); return; }
             setLLMTestStatus('wait', '测试中...');
             try {
                 const resp = await fetch('/api/llm/test', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ llm_config: cfg })
+                    body: JSON.stringify({ llm_config: {
+                        api_key: cfg.api_key, base_url: cfg.base_url, model: cfg.model,
+                        provider: cfg.provider, max_tokens: 1, temperature: 0,
+                    }})
                 });
                 const data = await resp.json();
+                const ms = Math.round(performance.now());
                 if (data.success) {
-                    setLLMTestStatus('ok', `✅ 连接成功 (${data.model})`);
+                    lastConnMeta = `${data.model}`;
+                    document.getElementById('llmConnMeta').textContent = `当前模型: ${data.model}`;
+                    setLLMTestStatus('ok', `✅ 连接成功 (${ms}ms)`);
                 } else {
                     setLLMTestStatus('err', '❌ ' + (data.error || '未知错误'));
                 }
             } catch (e) {
                 setLLMTestStatus('err', '❌ 请求失败: ' + e.message);
+            }
+        }
+
+        /* ==================== Token 用量统计 ==================== */
+        let usageStatsCache = null;
+
+        function fmtTokens(n) {
+            if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+            if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
+            return String(n);
+        }
+        function fmtCost(c) { return '~$' + Number(c || 0).toFixed(3); }
+
+        async function loadUsageStats(force) {
+            try {
+                if (usageStatsCache && !force) { renderStatusBar(usageStatsCache); return; }
+                const resp = await fetch('/api/usage/stats');
+                if (!resp.ok) return;
+                usageStatsCache = await resp.json();
+                renderStatusBar(usageStatsCache);
+                renderUsageModal(usageStatsCache);
+            } catch (e) { /* 统计不可用不影响主流程 */ }
+        }
+
+        function limitOf(stats) {
+            return stats.monthly_limit || 100000; // 未配置限额时按 100K 展示
+        }
+
+        function renderStatusBar(stats) {
+            const providerEl = document.getElementById('sbProvider');
+            if (llmPersisted) {
+                const p = LLM_PRESETS[llmPersisted.provider];
+                providerEl.innerHTML = `🤖 <b>${(p && p.label) || llmPersisted.provider || '自定义'}</b> · ${llmPersisted.model || '?'}`;
+            } else {
+                providerEl.textContent = '🤖 未配置 LLM · 点击 ⚙️ 配置';
+            }
+            document.getElementById('sbMonthCost').textContent = fmtCost(stats.month_cost);
+            document.getElementById('sbMonthTokens').textContent = fmtTokens(stats.month_tokens);
+            const limit = limitOf(stats);
+            document.getElementById('sbLimitLabel').textContent = stats.monthly_limit ? ` / ${fmtTokens(limit)}` : '';
+            setProgress('sbProgress', stats.month_tokens / limit);
+            const warn = document.getElementById('sbHint');
+            if (stats.limit_exceeded) {
+                warn.textContent = '⚠️ 本月用量已超限, LLM 调用被暂停';
+                warn.style.color = '#E74C3C';
+            } else if (stats.month_tokens / limit > 0.9) {
+                warn.textContent = '⚠️ 用量接近限额';
+                warn.style.color = '#F39C12';
+            } else {
+                warn.textContent = '点击展开统计面板 · ⚙️ 配置 API';
+                warn.style.color = '';
+            }
+        }
+
+        function setProgress(id, ratio) {
+            const el = document.getElementById(id);
+            const pct = Math.max(0, Math.min(1, ratio)) * 100;
+            el.innerHTML = `<i style="width:${pct.toFixed(1)}%"></i>`;
+            el.classList.toggle('warn', pct >= 70 && pct < 90);
+            el.classList.toggle('over', pct >= 90);
+        }
+
+        function openUsagePanel() {
+            document.getElementById('usageOverlay').classList.add('show');
+            loadUsageStats(true);
+        }
+        function closeUsagePanel() {
+            document.getElementById('usageOverlay').classList.remove('show');
+        }
+
+        function renderUsageModal(stats) {
+            document.getElementById('ucToday').textContent = fmtTokens(stats.today_tokens);
+            document.getElementById('ucTodayCost').textContent = fmtCost(stats.today_cost);
+            document.getElementById('ucWeek').textContent = fmtTokens(stats.week_tokens);
+            document.getElementById('ucWeekCost').textContent = fmtCost(stats.week_cost);
+            document.getElementById('ucMonth').textContent = fmtTokens(stats.month_tokens);
+            document.getElementById('ucMonthCost').textContent = fmtCost(stats.month_cost);
+            document.getElementById('ucAll').textContent = fmtTokens(stats.all_tokens);
+            document.getElementById('ucAllCost').textContent = fmtCost(stats.all_cost);
+
+            // 趋势 (近 7 天柱状)
+            const maxTrend = Math.max(1, ...stats.trend.map(t => t.tokens));
+            document.getElementById('trendChart').innerHTML = stats.trend.map(t => `
+                <div class="trend-col" title="${t.date}: ${t.tokens} tokens (${fmtCost(t.cost)})">
+                    <span class="trend-val">${t.tokens ? fmtTokens(t.tokens) : ''}</span>
+                    <div class="trend-bar" style="height:${Math.max(2, t.tokens / maxTrend * 82)}%"></div>
+                    <span class="trend-date">${t.date.slice(5)}</span>
+                </div>`).join('');
+
+            // 按模型分布
+            const entries = Object.entries(stats.by_model).sort((a, b) => b[1].tokens - a[1].tokens);
+            const modelEl = document.getElementById('modelDist');
+            if (!entries.length) {
+                modelEl.innerHTML = '<div class="usage-empty">暂无调用记录 — 配置并调用 LLM 后这里会展示分布</div>';
+            } else {
+                const total = entries.reduce((s, [, v]) => s + v.tokens, 0) || 1;
+                modelEl.innerHTML = entries.map(([model, v]) => {
+                    const pct = (v.tokens / total * 100);
+                    return `<div class="model-row" title="${model}: ${v.tokens} tokens (${fmtCost(v.cost)})">
+                        <span class="model-name">${escapeHtml(model)}</span>
+                        <span class="model-bar-wrap"><span class="model-bar" style="width:${pct.toFixed(1)}%"></span></span>
+                        <span class="model-pct">${pct.toFixed(0)}%</span>
+                    </div>`;
+                }).join('');
+            }
+
+            // 按日期明细 (由 trend 逆向补齐 14 天: trend 只有 7 天, 明细直接用 trend 倒序)
+            const rows = [...stats.trend].reverse().filter(t => t.tokens > 0);
+            document.getElementById('usageTableBody').innerHTML = rows.length
+                ? rows.map(t => `<tr><td>${t.date}</td><td class="num">${t.tokens.toLocaleString()}</td><td class="num">${fmtCost(t.cost)}</td></tr>`).join('')
+                : '<tr><td colspan="3" style="text-align:center;color:var(--text-sub)">近 7 天暂无调用</td></tr>';
+
+            // 警告条
+            const limit = limitOf(stats);
+            setProgress('usageWarnProgress', stats.month_tokens / limit);
+            document.getElementById('usageWarnText').textContent = stats.monthly_limit
+                ? `本月 ${fmtTokens(stats.month_tokens)} / 限额 ${fmtTokens(stats.monthly_limit)} (${(stats.month_tokens / limit * 100).toFixed(0)}%)`
+                : `本月 ${fmtTokens(stats.month_tokens)} / 展示基数 ${fmtTokens(limit)} (未设限额, 可用 LLM_MONTHLY_TOKEN_LIMIT 配置)`;
+        }
+
+        async function exportUsageCsv() {
+            try {
+                const resp = await fetch('/api/usage/logs?limit=10000');
+                const logs = await resp.json();
+                const csv = ['timestamp,model,provider,prompt_tokens,completion_tokens,total_tokens,cost_usd']
+                    .concat(logs.map(r => [
+                        new Date(r.timestamp * 1000).toISOString(), r.model, r.provider,
+                        r.prompt_tokens, r.completion_tokens, r.total_tokens, r.cost.toFixed(6),
+                    ].join(',')));
+                const blob = new Blob([csv.join('\n')], { type: 'text/csv;charset=utf-8' });
+                const a = document.createElement('a');
+                a.href = URL.createObjectURL(blob);
+                a.download = `token-usage-${new Date().toISOString().slice(0, 10)}.csv`;
+                a.click();
+                URL.revokeObjectURL(a.href);
+            } catch (e) {
+                addChat('system', '❌ 导出失败: ' + e.message);
             }
         }
 
@@ -861,6 +1352,12 @@
             else el.textContent = '';
         }
         document.getElementById('mineCount').addEventListener('input', updateMeta);
+
+        // API 配置: Base URL / 模型手动输入时刷新网关提示
+        ['llmBaseUrl', 'llmModel'].forEach(id => {
+            const el = document.getElementById(id);
+            if (el) el.addEventListener('input', updateModelHint);
+        });
 
         /* ==================== 棋盘绘制 (canvas) ==================== */
         function drawBoard() {
@@ -1245,6 +1742,11 @@
                 renderResult(data);
                 if (silent) {
                     addChat('system', '【分析结果】\n' + data.analysis, { copyText: data.analysis });
+                }
+                // LLM 用量即时上报 (底部状态栏 / 统计面板)
+                if (data.usage && data.usage.total_tokens) {
+                    addChat('system', `📊 本次 LLM 调用消耗 ${data.usage.total_tokens} tokens (输入 ${data.usage.prompt_tokens} / 输出 ${data.usage.completion_tokens})。`);
+                    loadUsageStats(true);
                 }
             } catch (e) {
                 addChat('system', '❌ 分析失败: ' + e.message);

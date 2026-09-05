@@ -21,13 +21,14 @@ docker compose up
 <details>
 <summary>启用 LLM（可选，两种方式）</summary>
 
-**方式 A — 界面配置（推荐）**：打开 http://localhost:8080 后，展开左侧「🤖 LLM 设置」面板，填入 API Key / Base URL / 模型名，点击「测试连接」验证后保存。配置存储在浏览器 localStorage，下次自动加载。
+**方式 A — 界面配置（推荐）**：打开 http://localhost:8080 后，点击导航栏「🤖 LLM」展开「⚙️ API 配置」面板，从快速预设选择提供商（OpenAI / DeepSeek / Kimi / OpenRouter / Ollama 本地 / 通义千问 / 自定义），填入 Base URL / 模型名 / API Key，点击「🔗 测试连接」验证后「💾 保存配置」。
 
 **方式 B — 环境变量**：
 
 ```bash
 OPENAI_API_KEY=sk-xxx OPENAI_BASE_URL=https://api.openai.com/v1 OPENAI_MODEL=gpt-4o-mini docker compose up
 ```
+
 或在 `docker-compose.yml` 的 `app.environment` 中填写后重启。
 
 > 界面配置优先于环境变量。两者都未配置时自动回退到本地分析引擎。
@@ -53,7 +54,7 @@ export OPENAI_BASE_URL=https://api.openai.com/v1   # 可省略
 export OPENAI_MODEL=gpt-4o-mini                    # 可省略
 cargo run --release
 
-# 方式 B: 界面配置 — 打开 http://localhost:8080 后在「LLM 设置」面板填写
+# 方式 B: 界面配置 — 打开 http://localhost:8080 后点击「🤖 LLM」进入 API 配置面板填写
 
 # OCR 截图识别 (Python 微服务)
 cd ocr && pip install -r requirements.txt && python app.py   # 端口 5001
@@ -91,10 +92,12 @@ minesweeper-agent import -i tests/sample_board.json
 
 | 端点 | 说明 |
 |------|------|
-| `POST /api/analyze` | 分析局面：`{ "board": [[1,-1,-1],...], "remaining_mines": 3, "mode": "answer\|teaching\|strategy", "use_llm": false, "llm_config": {"api_key":"sk-...","base_url":"...","model":"..."} }` |
+| `POST /api/analyze` | 分析局面：`{ "board": [[1,-1,-1],...], "remaining_mines": 3, "mode": "answer\|teaching\|strategy", "use_llm": false, "llm_config": {"api_key":"sk-...","base_url":"...","model":"...","max_tokens":2048,"temperature":0.3} }` |
 | `POST /api/ocr` | 截图识别代理：`{ "image": "<base64>" }` → `{ "board": [[...]], "remaining_mines": n }` |
-| `POST /api/llm/test` | 测试 LLM 连接：`{ "llm_config": {"api_key":"...","base_url":"...","model":"..."} }` → `{ "success": true, "model": "gpt-4o-mini" }` |
+| `POST /api/llm/test` | 测试 LLM 连接：`{ "llm_config": {...} }` → `{ "success": true, "model": "openai/gpt-4o-mini" }` |
 | `GET /api/llm/status` | 查询环境变量 LLM 配置状态（不泄露 key） |
+| `GET /api/usage/stats` | Token 用量统计（今日/近7日/本月/累计 + 模型分布 + 趋势） |
+| `GET /api/usage/logs` | Token 用量明细日志（`?limit=&offset=`） |
 | `POST /api/debug` | OCR 调试：返回每格的颜色/形态分析细节，便于排查误识别 |
 | `POST /api/learn` | 用户反馈学习：`{ "image": "<base64>", "digit": n }` → 加入模板库 |
 | `GET /api/health` | 健康检查 |
@@ -104,14 +107,17 @@ minesweeper-agent import -i tests/sample_board.json
 ## 🤖 LLM 大模型集成
 
 LLM 负责将 Rust 推理引擎的计算结果（IR）翻译为人类可读的策略语言，支持**答案 / 教学 / 策略**三种模式。
+同时自动记录每次调用的 token 用量（见下方「Token 用量统计」）。
 
 ### 配置方式
 
 | 方式 | 说明 | 优先级 |
 |------|------|--------|
-| **界面配置** | 左侧「LLM 设置」面板填写 API Key / Base URL / 模型，保存到 localStorage | 高 |
+| **界面配置** | 导航栏「🤖 LLM」→「⚙️ API 配置」面板：预设 / Base URL / 模型 / API Key / 最大 Token / 温度，点击「测试连接」验证 | 高 |
 | **环境变量** | `OPENAI_API_KEY` / `OPENAI_BASE_URL` / `OPENAI_MODEL` | 低 |
 | **均未配置** | 自动回退到本地分析引擎（纯 Rust 规则转译） | — |
+
+> 🔒 **API Key 安全**：界面填写的 Key 仅保存在页面内存中，刷新即清除，不写入任何持久化存储；Base URL / 模型 / 参数等非敏感配置保存在浏览器 localStorage。
 
 ### 支持的 API 提供商（任何 OpenAI 兼容接口）
 
@@ -120,10 +126,50 @@ LLM 负责将 Rust 推理引擎的计算结果（IR）翻译为人类可读的�
 | OpenAI | `https://api.openai.com/v1` | `gpt-4o-mini` |
 | DeepSeek | `https://api.deepseek.com/v1` | `deepseek-chat` |
 | Kimi / Moonshot | `https://api.moonshot.cn/v1` | `moonshot-v1-8k` |
-| Ollama 本地 | `http://localhost:11434/v1` | `qwen2.5:7b` |
+| OpenRouter | `https://openrouter.ai/api/v1` | `openai/gpt-4o-mini` |
+| Ollama 本地 | `http://localhost:11434/v1` | `qwen2.5:7b`（免 Key） |
 | 通义千问 | `https://dashscope.aliyuncs.com/compatible-mode/v1` | `qwen-plus` |
+| 自定义中转网关 | 网关提供的地址 | 网关已配置的模型名 |
 
 界面面板提供一键预设按钮，点击自动填入 Base URL 和模型名。
+
+### 常见问题排查
+
+**连接失败提示 `No proxy configuration found for requested model`**（HTTP 500 类错误）：
+
+- 这是 **OpenRouter / 中转网关** 的典型报错：模型名不带厂商前缀，或该模型在此网关没有可用通道。
+- **修复**：模型名需带厂商前缀，如 `gpt-4o-mini` → `openai/gpt-4o-mini`、`claude-sonnet-4` → `anthropic/claude-sonnet-4`。选择「OpenRouter」预设会自动填入正确格式。
+- 后端已内置**自动补全重试**：当 Base URL 为 OpenRouter（或配置了 provider=openrouter 的中转网关）且模型名无前缀时，首次请求失败会自动用常见厂商前缀（`openai/`、`anthropic/`、`deepseek/`、`google/` 等）重试一次。
+- 若为其他中转/网关（one-api / new-api 等），需填该网关「已配置的模型别名」，并检查渠道是否启用。
+
+**其他常见错误**：
+
+| 提示 | 含义 |
+|------|------|
+| `Insufficient Balance` / `quota` | 账户余额不足或额度用完 |
+| `Invalid API Key` / 401 | Key 错误或已过期 |
+| `rate limit` / 429 | 请求频率超限，稍后重试 |
+| 网络错误 | Base URL 不可达（本地 Ollama 未启动、代理未开等） |
+
+### Token 用量统计（v0.2）
+
+每次 LLM 调用后，后端自动从响应 `usage` 字段提取 token 消耗并记录：
+
+- **存储**：本机 `data/usage.jsonl`（JSONL 追加，无原生依赖；可用环境变量 `USAGE_DB_PATH` 覆盖路径）
+- **统计维度**：今日 / 近 7 日 / 本月 / 累计 tokens 与估算费用、按模型分布、近 7 天趋势
+- **界面**：底部状态栏常驻显示提供商 · 本月费用 · 用量进度条；点击展开「📊 Token 消耗统计」弹窗（支持导出 CSV）
+- **费用估算**：内置常见模型单价表（gpt-4o-mini / deepseek-chat / moonshot / qwen 等，每 1M tokens 输入/输出单价），未知模型与本地模型按 $0 计，仅本地估算不上传
+- **月度限额**：环境变量 `LLM_MONTHLY_TOKEN_LIMIT`（如 `100000`）设置后，本月用量超限将自动拒绝 LLM 调用并回退本地分析；进度条 70% 变橙、90% 变红提示
+- **时区**：统计按日/月分界默认使用 UTC+8，可用 `USAGE_TZ_OFFSET_HOURS` 调整
+
+```bash
+LLM_MONTHLY_TOKEN_LIMIT=100000 USAGE_DB_PATH=/data/usage.jsonl cargo run --release
+```
+
+| 端点 | 说明 |
+|------|------|
+| `GET /api/usage/stats` | 用量统计（今日/近7日/本月/累计 + 模型分布 + 趋势 + 限额状态） |
+| `GET /api/usage/logs?limit=100&offset=0` | 用量明细（按时间倒序） |
 
 ### Rust ↔ LLM 交互流程
 
@@ -175,7 +221,7 @@ minesweeper/
 │   │   ├── probabilistic.rs  # 蒙特卡洛模拟 (动态迭代)
 │   │   └── region.rs         # 连通区域分析 (并查集)
 │   ├── model/            # PlayerView / Coord / InferenceIR
-│   ├── llm/              # LLM 转译 (translator + client)
+│   ├── llm/              # LLM 转译 (translator + client + usage 用量统计)
 │   ├── server/           # Web 服务 (axum)
 │   └── cli.rs            # CLI (clap)
 ├── static/index.html     # 前端 (Canvas 棋盘 + 对话引导区)
