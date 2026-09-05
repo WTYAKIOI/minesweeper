@@ -12,26 +12,96 @@ pub enum LLMMode {
     Strategy,
 }
 
+/// 回答语言
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Language {
+    Chinese,
+    English,
+}
+
+impl Language {
+    /// 解析前端传入值: "en"/"english" → English, 其余默认中文
+    pub fn parse(s: Option<&str>) -> Self {
+        match s.map(str::trim).unwrap_or("").to_lowercase().as_str() {
+            "en" | "english" | "en-us" | "en-gb" => Language::English,
+            _ => Language::Chinese,
+        }
+    }
+}
+
+/// 教学模式完整性阈值: 标题后仅剩 1 行正文且总长 < 此值 → 视为"输出被吃"
+/// (自适应教学中"## 直接原因"+一句话也可能偏短, 阈值不宜过大)
+pub const MIN_TEACHING_OUTPUT_CHARS: usize = 30;
+
+/// 输出完整性检测 (教学模式):
+/// 空文本 → 不完整;
+/// 以 "##" 开头但标题后无正文, 或仅 1 行过短正文 (<30 字符) → 视为"输出被吃"
+pub fn is_output_incomplete(text: &str) -> bool {
+    let t = text.trim();
+    if t.is_empty() {
+        return true;
+    }
+    if !t.starts_with("##") {
+        return false;
+    }
+    let body: Vec<&str> = t
+        .lines()
+        .skip(1)
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .collect();
+    if body.is_empty() {
+        return true;
+    }
+    if body.len() == 1 && t.chars().count() < MIN_TEACHING_OUTPUT_CHARS {
+        return true;
+    }
+    false
+}
+
 /// 推理 IR → 自然语言转译器
 ///
 /// 将 Rust 推理引擎的计算结果翻译为人类可理解的策略语言。
 /// 支持三种模式：答案模式、教学模式、策略模式。
 pub struct Translator {
     mode: LLMMode,
+    language: Language,
 }
 
 impl Translator {
     pub fn new(mode: LLMMode) -> Self {
-        Self { mode }
+        Self { mode, language: Language::Chinese }
     }
 
     pub fn set_mode(&mut self, mode: LLMMode) {
         self.mode = mode;
     }
 
+    /// 设置回答语言 (默认中文)
+    pub fn set_language(&mut self, language: Language) {
+        self.language = language;
+    }
+
+    /// 当前语言
+    pub fn language(&self) -> Language {
+        self.language
+    }
+
     /// 将 IR 转为给 LLM 的系统提示词
     pub fn build_system_prompt(&self) -> String {
-        let base = r#"你是一个扫雷认知助手。你将收到一个JSON格式的推理中间语言(IR)，其中包含：
+        let (lang_rule, base_zh_suffix) = match self.language {
+            Language::Chinese => (
+                "## 语言要求\n请全程使用简体中文回答。",
+                "## 输出格式要求\n- 答案模式：使用\"因为...所以...\"的因果句式\n- 教学模式：使用提问句式，禁止直接给答案\n- 策略模式：给出坐标级建议，含概率数值",
+            ),
+            Language::English => (
+                "## Language Requirement\nRespond entirely in English.",
+                "## Output Requirements\n- Answer mode: use cause-and-effect phrasing (\"because...therefore...\")\n- Teaching mode: ask guiding questions, never give the answer directly\n- Strategy mode: give coordinate-level advice with probability values",
+            ),
+        };
+
+        let base = format!(
+            "你是一个扫雷认知助手。你将收到一个JSON格式的推理中间语言(IR)，其中包含：
 1. deterministic: 确定性推理证明链（必雷/必安全格的结论及其依据）
 2. probabilities: 每个未知格子的雷概率和信息增益
 3. regions: 连通区域的特征信息
@@ -43,16 +113,18 @@ impl Translator {
 1. 所有坐标格式必须为 (x, y)，例如 (2, 3) 表示第3列第4行（0-indexed）
 2. 你引用的每一个坐标必须在IR中存在
 3. 严禁编造IR中不存在的坐标
-4. 严禁使用模糊表述如"中间那个格子"、"旁边的格子"，必须给出精确坐标
-5. 引用推理依据时，必须标明依赖的数字坐标，如"根据坐标(0,0)的数字3..."
+4. 严禁使用模糊表述如\"中间那个格子\"、\"旁边的格子\"，必须给出精确坐标
+5. 引用推理依据时，必须标明依赖的数字坐标，如\"根据坐标(0,0)的数字3...\"
 
-## 输出格式要求
-- 用中文回答
-- 答案模式：使用"因为...所以..."的因果句式
-- 教学模式：使用提问句式，禁止直接给答案
-- 策略模式：给出坐标级建议，含概率数值"#;
+{}
+
+{}
+",
+            lang_rule, base_zh_suffix
+        );
 
         match &self.mode {
+            LLMMode::Teaching => self.teaching_prompt(&base),
             LLMMode::Answer => format!(
                 r##"{}
 
@@ -62,17 +134,6 @@ impl Translator {
 - 必须说明依据，如「因为坐标(a, b)的数字N周围...」
 - 对概率较低的格子给出精确概率数值
 - 对无确定性结论的格子，给出概率排序"##,
-                base
-            ),
-            LLMMode::Teaching => format!(
-                r##"{}
-
-## 当前模式：教学模式
-请将证明链倒置，生成逐步引导问题。格式要求：
-- 每步只提问一个引导性问题，如「坐标(a, b)的数字N周围还有几个未知格？」
-- 严禁直接说出「坐标(x, y)是雷」或「坐标(x, y)安全」
-- 引导玩家自己算出：剩余雷数 = 数字 - 已标旗数
-- 最后一个问题后留出思考空间"##,
                 base
             ),
             LLMMode::Strategy => format!(
@@ -89,8 +150,104 @@ impl Translator {
         }
     }
 
+    /// 教学模式提示词: 智能自适应 (teachmod2.md) — 不是复读机,
+    /// 根据用户提问在"直接解释"与"引导问题"之间切换, 双语
+    fn teaching_prompt(&self, base: &str) -> String {
+        match self.language {
+            Language::Chinese => format!(
+                r##"{}
+
+## 当前模式：教学模式（智能引导）
+你是扫雷教练。用户开启了教学模式，但你**不是复读机**：根据用户的提问动态调整回答策略。
+
+## 核心规则
+规则 1：若用户问"为什么 / 原因 / 解释"类问题
+→ 先给出直接、清晰的解释（1-3 句话，引用具体数字与坐标），随后追加 1 个思考引导问题。
+输出格式：
+## 直接原因
+[简洁解释核心原因]
+
+## 思考引导
+[1 个针对性问题]
+
+规则 2：若用户问"怎么做 / 下一步 / 该点哪里"类问题，或问题不明确
+→ 只输出 3-5 个引导性问题，不直接给出答案。
+输出格式：
+## 引导问题
+1. [问题]
+2. [问题]
+3. [问题]
+（总问题数 3~5 个，不超过 5 个；每题 ≤30 字并含精确坐标）
+
+规则 3：若用户说"我懂了 / 继续 / 下一个"类问题
+→ 进入更深层次的推理引导，提出 1-2 个进阶问题。
+输出格式：
+## 进阶引导
+1. [问题]
+2. [问题]
+
+## 重要约束
+- 所有回答必须使用简体中文
+- 只引用 IR 中存在的坐标 (x, y)，禁止编造
+- 每次回答不超过 5 个问题，保持简洁
+- 禁止空标题、空回答或未完结尾"##,
+                base
+            ),
+            Language::English => format!(
+                r##"{}
+
+## Current Mode: Teaching (Adaptive)
+You are a Minesweeper coach. Teaching mode is enabled, but you are **not a parrot**: adapt your reply to the user's question.
+
+## Core Rules
+Rule 1: If the user asks "why / reason / explain" questions
+→ First give a direct, clear explanation (1-3 sentences citing exact numbers and coordinates), then add 1 thought-provoking question.
+Output format:
+## Direct Reason
+[concise explanation]
+
+## Think Further
+[1 targeted question]
+
+Rule 2: If the user asks "what should I do / next step / where to click" questions, or the question is unclear
+→ Give only 3-5 guiding questions, never the answer directly.
+Output format:
+## Guiding Questions
+1. [question]
+2. [question]
+3. [question]
+(3 to 5 questions total, never more than 5; each within 30 words and containing an exact coordinate)
+
+Rule 3: If the user says "I see / continue / next"
+→ Guide deeper, asking 1-2 advanced questions.
+Output format:
+## Advanced Guidance
+1. [question]
+2. [question]
+
+## Hard constraints
+- Respond entirely in English
+- Only cite coordinates (x, y) that exist in the IR; never invent coordinates
+- Never exceed 5 questions per reply; stay concise
+- No empty headings, empty answers, or unfinished endings"##,
+                base
+            ),
+        }
+    }
+
     /// 将 IR + PlayerView 序列化为给 LLM 的用户消息
     pub fn build_user_message(&self, view: &PlayerView, ir: &InferenceIR) -> String {
+        self.build_user_message_with_question(view, ir, None)
+    }
+
+    /// 同上, 但附带用户在对话区输入的问题 (教学模式问答的关键:
+    /// 不带问题时 LLM 只能泛泛引导, 无法针对用户提问作答)
+    pub fn build_user_message_with_question(
+        &self,
+        view: &PlayerView,
+        ir: &InferenceIR,
+        question: Option<&str>,
+    ) -> String {
         let ir_json = serde_json::to_string_pretty(ir).unwrap_or_else(|e| format!("序列化失败: {}", e));
         let view_info = format!(
             "棋盘: {}x{}, 剩余雷数: {}, 已翻开格子数: {}, 已标旗数: {}, 未知格数: {}",
@@ -106,10 +263,22 @@ impl Translator {
         let valid_coords: Vec<String> = view.unknown.iter().map(format_coord).collect();
         let revealed_coords: Vec<String> = view.revealed.iter().map(|c| format_coord(&c.coord)).collect();
 
-        format!(
+        let mut msg = format!(
             "当前局面信息:\n{}\n\n已翻开数字坐标: {}\n未知格子坐标(你的建议只能在这些中选): {}\n\n推理结果 (IR):\n```json\n{}\n```\n\n请根据以上信息给出分析。记住：你引用的每个坐标必须在上述列表中。",
             view_info, revealed_coords.join(", "), valid_coords.join(", "), ir_json
-        )
+        );
+
+        // 用户提问: 让 LLM 围绕该问题作答 (教学模式下用提问引导, 其他模式直接解答)
+        if let Some(q) = question {
+            let q = q.trim();
+            if !q.is_empty() {
+                msg.push_str(&format!(
+                    "\n\n【用户提问】{}\n请围绕上述提问给出回答：教学模式用引导问题逐步启发（严禁直接说出必雷/必安全结论）；答案/策略模式可直接解答。",
+                    q
+                ));
+            }
+        }
+        msg
     }
 
     /// 验证 LLM 输出是否只引用了 IR 中存在的坐标
@@ -380,6 +549,85 @@ mod tests {
         assert!(prompt.contains("数据防火墙"));
         assert!(prompt.contains("答案模式"));
         assert!(prompt.contains("严格的坐标引用规则"));
+    }
+
+    #[test]
+    fn test_teaching_prompt_requires_full_output() {
+        // 教学模式提示词: 智能自适应 (不是复读机), 强制结构化 + 限长
+        let t = Translator::new(LLMMode::Teaching);
+        let prompt = t.build_system_prompt();
+        assert!(prompt.contains("不是**复读机**") || prompt.contains("不是复读机"));
+        assert!(prompt.contains("规则 1"));
+        assert!(prompt.contains("## 直接原因"));
+        assert!(prompt.contains("## 引导问题"));
+        assert!(prompt.contains("3-5 个引导性问题"));
+        assert!(prompt.contains("不超过 5 个"));
+        assert!(prompt.contains("30 字"));
+        assert!(prompt.contains("禁止空标题"));
+        assert!(prompt.contains("简体中文"));
+    }
+
+    #[test]
+    fn test_teaching_prompt_english() {
+        let mut t = Translator::new(LLMMode::Teaching);
+        t.set_language(Language::English);
+        let prompt = t.build_system_prompt();
+        assert!(prompt.contains("## Guiding Questions"));
+        assert!(prompt.contains("3 to 5 questions"));
+        assert!(prompt.contains("30 words"));
+        assert!(prompt.contains("Respond entirely in English"));
+        assert!(prompt.contains("## Direct Reason"));
+    }
+
+    #[test]
+    fn test_language_parse() {
+        assert_eq!(Language::parse(Some("en")), Language::English);
+        assert_eq!(Language::parse(Some("EN")), Language::English);
+        assert_eq!(Language::parse(Some("english")), Language::English);
+        assert_eq!(Language::parse(Some("zh")), Language::Chinese);
+        assert_eq!(Language::parse(None), Language::Chinese);
+        assert_eq!(Language::parse(Some("de")), Language::Chinese);
+    }
+
+    #[test]
+    fn test_output_incompleteness() {
+        // 空输出
+        assert!(is_output_incomplete(""));
+        assert!(is_output_incomplete("   \n  "));
+        // 以 ## 开头但标题后无正文 → "输出被吃"
+        assert!(is_output_incomplete("## "));
+        assert!(is_output_incomplete("## 引导问题"));
+        // 完整结构化输出 → 正常
+        let full = "## 引导问题\n\n1. 【坐标(0,1)数字3周围还剩几个未知格?】\n2. 【(1,2)周围已标几面旗?】\n3. 【剩余雷数=数字-旗数, 还差多少?】";
+        assert!(!is_output_incomplete(full));
+        // 自适应规则1: "## 直接原因"+一段充分解释 → 正常 (不误判为被吃)
+        let reason = "## 直接原因\n\n因为坐标(0,1)的数字3周围只剩1个未知格且仍需1雷, 该格必雷";
+        assert!(!is_output_incomplete(reason));
+        // 普通长文本 (非 ## 开头) → 正常
+        assert!(!is_output_incomplete("坐标(0, 1)是安全的，因为……"));
+    }
+
+    #[test]
+    fn test_user_message_carries_question() {
+        let view = PlayerView {
+            width: 3, height: 3,
+            revealed: vec![],
+            flagged: vec![],
+            unknown: vec![Coord::new(1, 0), Coord::new(2, 1)],
+            remaining_mines: 1,
+        };
+        let ir = InferenceIR {
+            deterministic: vec![],
+            probabilities: vec![],
+            regions: vec![],
+        };
+        let t = Translator::new(LLMMode::Teaching);
+        let msg = t.build_user_message_with_question(&view, &ir, Some("目前的局面怎么进行解决"));
+        assert!(msg.contains("【用户提问】"));
+        assert!(msg.contains("目前的局面怎么进行解决"));
+        // 不带提问时不出现该块
+        let plain = t.build_user_message(&view, &ir);
+        assert!(!plain.contains("【用户提问】"));
     }
 
     #[test]

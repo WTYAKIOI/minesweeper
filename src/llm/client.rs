@@ -18,13 +18,22 @@ pub struct LLMConfig {
     /// 提供商标签 (用于用量统计分组), 如 openai / deepseek / ollama
     #[serde(default)]
     pub provider: Option<String>,
-    /// 最大生成 token 数 (None = 使用默认 2048)
+    /// 最大生成 token 数 (None = 使用默认 4096)
     #[serde(default)]
     pub max_tokens: Option<u32>,
     /// 采样温度 (None = 使用默认 0.3)
     #[serde(default)]
     pub temperature: Option<f64>,
+    /// 厂商前缀策略 (适用于需要 vendor/model 的网关, 如 OpenRouter / 清华 Sub2API 等):
+    ///   - None / ""     → 不补前缀
+    ///   - Some("auto")  → 按模型名首段自动猜 (openai/anthropic/deepseek/...)
+    ///   - Some("thu-ai")→ 使用指定前缀 (模型无 "/" 时尝试 "thu-ai/{model}")
+    #[serde(default)]
+    pub prefix: Option<String>,
 }
+
+/// 默认最大生成 token 数
+pub const DEFAULT_MAX_TOKENS: u32 = 4096;
 
 impl Default for LLMConfig {
     fn default() -> Self {
@@ -35,6 +44,7 @@ impl Default for LLMConfig {
             provider: None,
             max_tokens: None,
             temperature: None,
+            prefix: None,
         }
     }
 }
@@ -85,7 +95,7 @@ impl LLMConfig {
 
     /// 实际生效的最大生成 token 数
     pub fn effective_max_tokens(&self) -> u32 {
-        self.max_tokens.unwrap_or(2048).clamp(16, 32768)
+        self.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS).clamp(16, 32768)
     }
 
     /// 实际生效的温度
@@ -156,6 +166,20 @@ struct ChatRequest {
 struct ChatMessage {
     role: String,
     content: String,
+    /// 思维链模型 (glm-thinking / deepseek-reasoner 等) 的推理过程字段;
+    /// 仅在响应中出现, 请求时序列化会跳过
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<String>,
+}
+
+impl ChatMessage {
+    fn new(role: &str, content: impl Into<String>) -> Self {
+        Self {
+            role: role.to_string(),
+            content: content.into(),
+            reasoning_content: None,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -174,6 +198,93 @@ struct ChatChoice {
 #[derive(Debug, Deserialize)]
 struct ApiErrorBody {
     error: Option<ApiErrorDetail>,
+}
+
+/// OpenAI 兼容 /models 响应: { "object": "list", "data": [{"id": ...}, ...] }
+#[derive(Debug, Deserialize)]
+struct ModelsResponse {
+    data: Option<Vec<ModelItem>>,
+    /// Ollama 原生 /api/tags 形状: { "models": [{"name": ...}, ...] }
+    models: Option<Vec<OllamaModelItem>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelItem {
+    id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OllamaModelItem {
+    name: Option<String>,
+}
+
+impl LLMClient {
+    /// 从网关获取可用模型列表 (GET {base_url}/models, OpenAI 兼容)。
+    ///
+    /// 部分网关 (如 Ollama) 走本地 /api/tags, 返回 {models:[{name}]},
+    /// 此处兼容两种形状。返回模型 id 列表 (保留原始顺序去重)。
+    pub async fn fetch_models(&self) -> Result<Vec<String>, String> {
+        let base = self.config.base_url.trim_end_matches('/');
+        // Ollama 原生接口: 先尝试 /api/tags
+        if is_ollama_url(&self.config.base_url) {
+            if let Ok(list) = self.fetch_models_url(&format!("{}/api/tags", base)).await {
+                if !list.is_empty() {
+                    return Ok(list);
+                }
+            }
+        }
+        self.fetch_models_url(&format!("{}/models", base)).await
+    }
+
+    async fn fetch_models_url(&self, url: &str) -> Result<Vec<String>, String> {
+        let mut req = self.http_client.get(url).timeout(std::time::Duration::from_secs(30));
+        if !self.config.api_key.is_empty() {
+            req = req.header("Authorization", format!("Bearer {}", self.config.api_key));
+        }
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| format!("网络错误: {} (请检查 Base URL 是否可达)", e))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format_upstream_error(status.as_u16(), &body));
+        }
+        let parsed: ModelsResponse = resp
+            .json()
+            .await
+            .map_err(|e| format!("解析模型列表失败: {}", e))?;
+        let mut out: Vec<String> = Vec::new();
+        if let Some(data) = parsed.data {
+            for item in data {
+                if let Some(id) = item.id {
+                    if !id.is_empty() && !out.contains(&id) {
+                        out.push(id);
+                    }
+                }
+            }
+        }
+        if let Some(list) = parsed.models {
+            for item in list {
+                if let Some(name) = item.name {
+                    let name = name.trim_end_matches(":latest").to_string();
+                    if !name.is_empty() && !out.contains(&name) {
+                        out.push(name);
+                    }
+                }
+            }
+        }
+        if out.is_empty() {
+            return Err("网关未返回可用模型 (响应中无 data/models 字段)".to_string());
+        }
+        Ok(out)
+    }
+}
+
+/// 是否为本地 Ollama (模型列表走 /api/tags 而非 OpenAI /models)
+fn is_ollama_url(base_url: &str) -> bool {
+    let u = base_url.to_lowercase();
+    u.contains("localhost") || u.contains("127.0.0.1") || u.contains("[::1]")
 }
 
 #[derive(Debug, Deserialize)]
@@ -298,14 +409,22 @@ impl LLMClient {
             .map_err(|e| format!("网络错误: {} (请检查 Base URL 是否可达)", e))?;
 
         let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        // teachmod.md 排查第一步: LLM_DEBUG=1 时打印上游原始响应
+        if std::env::var("LLM_DEBUG").map(|v| v == "1").unwrap_or(false) {
+            let shown: String = text.chars().take(4000).collect();
+            eprintln!("[LLM Raw Response] (HTTP {}):\n{}", status.as_u16(), shown);
+            if text.chars().count() > 4000 {
+                eprintln!("[LLM Raw Response] ... (截断, 共 {} 字符)", text.chars().count());
+            }
+        }
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(format_upstream_error(status.as_u16(), &body));
+            return Err(format_upstream_error(status.as_u16(), &text));
         }
 
-        resp.json::<ChatResponse>()
-            .await
-            .map_err(|e| format!("响应解析失败: {}", e))
+        let parsed: ChatResponse = serde_json::from_str(&text)
+            .map_err(|e| format!("响应解析失败: {} (原始响应: {})", e, &text[..text.len().min(200)]))?;
+        Ok(parsed)
     }
 
     /// 是否 OpenRouter 或其协议的中转网关:
@@ -318,20 +437,32 @@ impl LLMClient {
 
     /// 需尝试的模型候选列表。
     ///
-    /// OpenRouter / 中转网关要求模型名带厂商前缀 (vendor/model);
-    /// 若用户填的是无前缀模型 (如 gpt-4o-mini) 且首个请求失败,
-    /// 则自动按常见厂商前缀补全重试 (如 openai/gpt-4o-mini)。
+    /// 需要厂商前缀的网关 (OpenRouter / 清华 Sub2API 等中转): 模型名须为
+    /// vendor/model。若用户填的是无前缀模型 (如 gpt-4o-mini) 且首个请求
+    /// 失败, 按以下规则补全重试:
+    ///   1. config.prefix 显式指定 (如 "thu-ai") → 使用该前缀
+    ///   2. config.prefix = "auto" 或 OpenRouter 类网关 → 按模型名首段自动猜
     fn model_candidates(&self) -> Vec<String> {
         let model = self.config.model.trim().to_string();
         if model.is_empty() {
             return Vec::new();
         }
-        if !self.is_openrouter_gateway() || model.contains('/') {
+        if model.contains('/') {
             return vec![model];
         }
+        let prefix_mode = self.config.prefix.as_deref().unwrap_or("");
+        let vendor: Option<&str> = if !prefix_mode.is_empty() && prefix_mode != "auto" {
+            Some(prefix_mode)
+        } else if prefix_mode == "auto" || self.is_openrouter_gateway() {
+            guess_vendor_prefix(&model)
+        } else {
+            None
+        };
         let mut out = vec![model.clone()];
-        if let Some(vendor) = guess_vendor_prefix(&model) {
-            out.push(format!("{}/{}", vendor, model));
+        if let Some(v) = vendor {
+            if !v.is_empty() {
+                out.push(format!("{}/{}", v, model));
+            }
         }
         out
     }
@@ -339,14 +470,8 @@ impl LLMClient {
     /// 发送对话请求 (带 OpenRouter 厂商前缀自动重试), 返回内容与 token 用量
     pub async fn chat(&self, system_prompt: &str, user_message: &str) -> Result<ChatResult, Box<dyn std::error::Error>> {
         let messages = vec![
-            ChatMessage {
-                role: "system".to_string(),
-                content: system_prompt.to_string(),
-            },
-            ChatMessage {
-                role: "user".to_string(),
-                content: user_message.to_string(),
-            },
+            ChatMessage::new("system", system_prompt),
+            ChatMessage::new("user", user_message),
         ];
         let temperature = self.config.effective_temperature();
         let max_tokens = self.config.effective_max_tokens();
@@ -355,12 +480,21 @@ impl LLMClient {
         for model in self.model_candidates() {
             match self.post_once(&model, messages.clone(), temperature, max_tokens).await {
                 Ok(chat_resp) => {
-                    let content = chat_resp
+                    let msg = chat_resp
                         .choices
                         .into_iter()
                         .next()
-                        .map(|c| c.message.content)
+                        .map(|c| c.message)
                         .ok_or("API 返回空响应 (无 choices)")?;
+                    // 思维链模型兼容: content 为空时回退到 reasoning_content
+                    let content = if msg.content.trim().is_empty() {
+                        msg.reasoning_content.unwrap_or_default().trim().to_string()
+                    } else {
+                        msg.content
+                    };
+                    if content.trim().is_empty() {
+                        return Err("API 返回空内容 (content 与 reasoning_content 均为空)".into());
+                    }
                     return Ok(ChatResult { content, usage: chat_resp.usage });
                 }
                 Err(e) => {
@@ -379,10 +513,7 @@ impl LLMClient {
     ///
     /// 返回 Ok(model_name) 成功, Err(message) 失败
     pub async fn test_connection(&self) -> Result<String, String> {
-        let messages = vec![ChatMessage {
-            role: "user".to_string(),
-            content: "ping".to_string(),
-        }];
+        let messages = vec![ChatMessage::new("user", "ping")];
         let mut last_err = String::new();
         for model in self.model_candidates() {
             match self.post_once(&model, messages.clone(), 0.0, 1).await {
@@ -433,7 +564,7 @@ mod tests {
         let c: LLMConfig = serde_json::from_str(json).unwrap();
         assert_eq!(c.api_key, "sk-test");
         assert_eq!(c.model, "deepseek-chat");
-        assert_eq!(c.effective_max_tokens(), 2048);
+        assert_eq!(c.effective_max_tokens(), 4096);
         assert!((c.effective_temperature() - 0.3).abs() < 1e-9);
         // 新字段生效
         let json2 = r#"{"api_key":"k","base_url":"https://x/v1","model":"m","max_tokens":4096,"temperature":0.7,"provider":"custom"}"#;
@@ -543,5 +674,37 @@ mod tests {
             client4.model_candidates(),
             vec!["gpt-4o-mini".to_string(), "openai/gpt-4o-mini".to_string()]
         );
+
+        // 任意网关 + 显式前缀 (如清华 Sub2API 的 thu-ai) → 自动补全该前缀
+        let cfg5 = LLMConfig {
+            base_url: "https://sub2api.example.edu.cn/v1".into(),
+            model: "glm-5".into(),
+            prefix: Some("thu-ai".into()),
+            ..base.clone()
+        };
+        let client5 = LLMClient::new(cfg5);
+        assert_eq!(
+            client5.model_candidates(),
+            vec!["glm-5".to_string(), "thu-ai/glm-5".to_string()]
+        );
+
+        // 模型名已带 "/" → 不重复补全
+        let cfg6 = LLMConfig {
+            base_url: "https://sub2api.example.edu.cn/v1".into(),
+            model: "thu-ai/glm-5".into(),
+            prefix: Some("thu-ai".into()),
+            ..base.clone()
+        };
+        let client6 = LLMClient::new(cfg6);
+        assert_eq!(client6.model_candidates(), vec!["thu-ai/glm-5".to_string()]);
+
+        // prefix 未配置且非 openrouter → 不补全
+        let cfg7 = LLMConfig {
+            base_url: "https://api.deepseek.com/v1".into(),
+            model: "deepseek-chat".into(),
+            ..base.clone()
+        };
+        let client7 = LLMClient::new(cfg7);
+        assert_eq!(client7.model_candidates(), vec!["deepseek-chat".to_string()]);
     }
 }

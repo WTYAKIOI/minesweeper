@@ -48,6 +48,12 @@ pub struct AnalyzeRequest {
     /// 可选: 运行时 LLM 配置 (覆盖环境变量)
     /// 前端 UI 传入, 不依赖 docker env
     pub llm_config: Option<LLMConfig>,
+    /// 可选: 用户在对话区输入的问题 (教学/问答模式携带)
+    #[serde(default)]
+    pub question: Option<String>,
+    /// 可选: 回答语言 ("zh" / "en", 默认 zh)
+    #[serde(default)]
+    pub language: Option<String>,
 }
 
 /// 分析响应
@@ -94,6 +100,20 @@ pub struct LLMTestResponse {
     pub error: Option<String>,
 }
 
+/// 从网关获取模型列表请求 (复用运行时配置)
+#[derive(Debug, Deserialize)]
+pub struct LLMModelsRequest {
+    pub llm_config: LLMConfig,
+}
+
+/// 模型列表响应
+#[derive(Debug, Serialize)]
+pub struct LLMModelsResponse {
+    pub success: bool,
+    pub models: Option<Vec<String>>,
+    pub error: Option<String>,
+}
+
 /// LLM 配置状态查询响应 (不泄露 api_key)
 #[derive(Debug, Serialize)]
 pub struct LLMStatusResponse {
@@ -116,6 +136,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/analyze", post(analyze))
         .route("/api/ocr", post(ocr))
         .route("/api/llm/test", post(test_llm))
+        .route("/api/llm/models", post(llm_models))
         .route("/api/llm/status", get(llm_status))
         .route("/api/usage/stats", get(usage_stats))
         .route("/api/usage/logs", get(usage_logs))
@@ -173,7 +194,8 @@ async fn analyze(
         Some("strategy") => LLMMode::Strategy,
         _ => LLMMode::Answer,
     };
-    let translator = Translator::new(mode.clone());
+    let mut translator = Translator::new(mode.clone());
+    translator.set_language(crate::llm::translator::Language::parse(req.language.as_deref()));
     let use_llm = req.use_llm.unwrap_or(false);
 
     // LLM 客户端优先级: 请求中的运行时配置 > 环境变量 > 无
@@ -208,23 +230,66 @@ async fn analyze(
     };
 
     let mut usage: Option<TokenUsage> = None;
+    let is_teaching = mode == LLMMode::Teaching;
     let (analysis, used_llm) = if use_llm {
         if let Some(client) = &llm_client {
             let system_prompt = translator.build_system_prompt();
-            let user_message = translator.build_user_message(&view, &ir);
-            match client.chat(&system_prompt, &user_message).await {
-                Ok(result) => {
-                    // 记录 token 用量 (API 未返回 usage 时跳过)
-                    if let Some(u) = &result.usage {
-                        state.usage_store
-                            .record(client.config().model.as_str(), &client.config().provider_label(), u);
-                        usage = Some(u.clone());
-                    }
-                    (result.content, true)
+            let base_user = translator.build_user_message_with_question(&view, &ir, req.question.as_deref());
+
+            // 教学模式: 输出完整性检测 + 自动重试 (最多 3 次, 防死循环)。
+            // 只有"输出被吃"(空/仅标题)才重试; 网络/API 错误直接失败回退。
+            let mut last_err: Option<String> = None;
+            let mut last_content: Option<String> = None;
+            for attempt in 0..3 {
+                let mut user_message = base_user.clone();
+                if attempt > 0 {
+                    user_message.push_str(
+                        "\n\n【重试提醒】你上一次的输出不完整或为空。请严格按输出格式重新输出完整内容，不要只输出标题、不要留空。",
+                    );
                 }
-                Err(e) => {
+                match client.chat(&system_prompt, &user_message).await {
+                    Ok(result) => {
+                        // 记录 token 用量 (API 未返回 usage 时跳过)
+                        if let Some(u) = &result.usage {
+                            state.usage_store
+                                .record(client.config().model.as_str(), &client.config().provider_label(), u);
+                            usage = Some(u.clone());
+                        }
+                        last_content = Some(result.content);
+                        let incomplete = is_teaching
+                            && crate::llm::translator::is_output_incomplete(last_content.as_deref().unwrap_or(""));
+                        if !incomplete {
+                            break;
+                        }
+                        // 否则视为"输出被吃", 进入下一次重试
+                    }
+                    Err(e) => {
+                        last_err = Some(e.to_string());
+                        break;
+                    }
+                }
+            }
+
+            match (last_content, last_err) {
+                (Some(content), _) => {
+                    // 重试耗尽仍不完整 (教学模式) → 附本地引导, 避免空输出
+                    if is_teaching && crate::llm::translator::is_output_incomplete(&content) {
+                        let local = translator.local_translate(&ir);
+                        (
+                            format!("⚠️ LLM 连续 3 次输出不完整（空或仅标题），已回退到本地引导：\n\n{}", local),
+                            true,
+                        )
+                    } else {
+                        (content, true)
+                    }
+                }
+                (None, Some(e)) => {
                     let local = translator.local_translate(&ir);
                     (format!("⚠️ LLM 调用失败, 已回退到本地分析\n\n错误: {}\n\n{}", e, local), false)
+                }
+                (None, None) => {
+                    let local = translator.local_translate(&ir);
+                    (format!("⚠️ LLM 未返回有效内容, 已回退到本地分析\n\n{}", local), false)
                 }
             }
         } else if let Some(msg) = llm_blocked_msg {
@@ -312,6 +377,36 @@ async fn test_llm(
         Err(e) => Ok(Json(LLMTestResponse {
             success: false,
             model: None,
+            error: Some(e),
+        })),
+    }
+}
+
+/// 从网关获取可用模型列表 (前端「🔍 从网关获取」按钮)
+///
+/// 通过后端代理请求 {base_url}/models (浏览器直连会触发 CORS),
+/// Ollama 等本地网关自动回退到 /api/tags。
+async fn llm_models(
+    Json(req): Json<LLMModelsRequest>,
+) -> Result<Json<LLMModelsResponse>, (StatusCode, String)> {
+    let cfg = req.llm_config;
+    if cfg.base_url.trim().is_empty() {
+        return Ok(Json(LLMModelsResponse {
+            success: false,
+            models: None,
+            error: Some("Base URL 不能为空".to_string()),
+        }));
+    }
+    let client = LLMClient::new(cfg);
+    match client.fetch_models().await {
+        Ok(models) => Ok(Json(LLMModelsResponse {
+            success: true,
+            models: Some(models),
+            error: None,
+        })),
+        Err(e) => Ok(Json(LLMModelsResponse {
+            success: false,
+            models: None,
             error: Some(e),
         })),
     }

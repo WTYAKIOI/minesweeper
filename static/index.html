@@ -401,6 +401,25 @@
             min-width: 120px;
         }
         .llm-row input:focus { outline: 2px solid var(--primary); outline-offset: 1px; }
+        .model-input-group {
+            flex: 1;
+            display: flex;
+            gap: 8px;
+            align-items: center;
+            min-width: 120px;
+        }
+        .model-input-group select { flex: 1; min-width: 120px; }
+        .model-input-group input[type="text"] { flex: 1; min-width: 140px; }
+        .model-input-group select,
+        .model-input-group input[type="text"] {
+            background: var(--input-bg);
+            color: var(--text);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 6px 10px;
+            font-size: 13px;
+            font-family: inherit;
+        }
         .llm-status {
             font-size: 12px;
             padding: 4px 10px;
@@ -632,8 +651,16 @@
                                 <button class="secondary small" data-preset="openrouter" onclick="applyLLMPreset('openrouter')">OpenRouter</button>
                                 <button class="secondary small" data-preset="ollama" onclick="applyLLMPreset('ollama')">Ollama 本地</button>
                                 <button class="secondary small" data-preset="qwen" onclick="applyLLMPreset('qwen')">通义千问</button>
-                                <button class="secondary small" data-preset="custom" onclick="applyLLMPreset('custom')">自定义</button>
+                                <button class="secondary small" data-preset="custom" onclick="applyLLMPreset('custom')" title="不清空当前输入, 进入自定义编辑模式">✨ 自定义</button>
                             </div>
+                        </div>
+                        <div class="llm-row">
+                            <label>我的预设</label>
+                            <select id="myPresetSelect" style="flex:1;min-width:120px;" onchange="applyMyPreset()">
+                                <option value="">— 选择保存的预设 —</option>
+                            </select>
+                            <button class="secondary small" onclick="saveAsMyPreset()" title="将当前 Base URL/模型/参数 (不含 Key) 保存为本地预设">➕ 保存当前</button>
+                            <button class="secondary small" onclick="deleteMyPreset()" title="删除选中的我的预设">🗑 删除</button>
                         </div>
                         <div class="llm-row">
                             <label>Base URL</label>
@@ -642,7 +669,13 @@
                         </div>
                         <div class="llm-row">
                             <label>模型名称</label>
-                            <input type="text" id="llmModel" placeholder="gpt-4o-mini">
+                            <div class="model-input-group">
+                                <select id="llmModelSelect" onchange="onModelSelectChange()" title="选择网关模型 (可先从网关获取)">
+                                    <option value="">手动输入…</option>
+                                </select>
+                                <input type="text" id="llmModel" placeholder="gpt-4o-mini">
+                                <button class="secondary small" onclick="fetchModelsFromGateway()" title="调用当前网关的 /models 接口获取可用模型">🔍 获取模型</button>
+                            </div>
                         </div>
                         <div class="llm-hint" id="llmModelHint" style="margin:-4px 0 0 80px;">模型名填网关可用的模型标识即可; 若使用中转/OpenRouter 网关, 需带厂商前缀 (如 openai/gpt-4o-mini)。</div>
                         <div class="llm-row">
@@ -651,8 +684,9 @@
                             <button class="secondary small eye-btn" onclick="toggleKeyVisibility()" title="显示/隐藏">👁️</button>
                         </div>
                         <div class="llm-advanced">
-                            <label>最大 Token <input type="number" id="llmMaxTokens" value="2048" min="16" max="32768" step="16"></label>
+                            <label>最大 Token <input type="number" id="llmMaxTokens" value="4096" min="16" max="32768" step="16"></label>
                             <label>温度 <input type="number" id="llmTemperature" value="0.3" min="0" max="2" step="0.1"></label>
+                            <label>厂商前缀 <input type="text" id="llmPrefix" style="width:150px;" placeholder="auto / thu-ai / openai" title="需 vendor/model 的网关: 留空不补, auto=按模型名自动猜, 或填具体前缀如 thu-ai"></label>
                             <span class="llm-status wait" id="llmTestStatus">未测试</span>
                         </div>
                         <div class="llm-row">
@@ -695,6 +729,12 @@
                         <select id="mode">
                             <option value="answer">答案模式</option>
                             <option value="strategy">策略模式</option>
+                        </select>
+                    </label>
+                    <label>语言
+                        <select id="lang">
+                            <option value="zh">中文</option>
+                            <option value="en">English</option>
                         </select>
                     </label>
                     <label><input type="checkbox" id="useLLM"> 调用 LLM</label>
@@ -894,11 +934,22 @@
 
         // 安全策略: API Key 只保存在内存 (页面生命周期), 其余配置持久化到 localStorage
         let llmKey = '';                 // 内存中的 API Key
-        let llmPersisted = null;         // {provider, base_url, model, max_tokens, temperature}
+        let llmPersisted = null;         // {provider, base_url, model, max_tokens, temperature, prefix}
         let lastConnMeta = '';           // 最近一次测试连接信息
 
         function isLocalBase(url) {
             return /\/\/(localhost|127\.0\.0\.1|\[::1\])/i.test(url || '');
+        }
+
+        function applyConfigToForm(p) {
+            document.getElementById('llmBaseUrl').value = p.base_url || '';
+            document.getElementById('llmModel').value = p.model || '';
+            document.getElementById('llmMaxTokens').value = p.max_tokens || 4096;
+            document.getElementById('llmTemperature').value = p.temperature != null ? p.temperature : 0.3;
+            document.getElementById('llmPrefix').value = p.prefix || '';
+            markPresetActive(p.provider);
+            syncModelSelect();
+            updateModelHint();
         }
 
         function loadLLMConfig() {
@@ -906,13 +957,8 @@
                 const saved = localStorage.getItem('ms-llm-config');
                 if (saved) {
                     llmPersisted = JSON.parse(saved);
-                    document.getElementById('llmBaseUrl').value = llmPersisted.base_url || '';
-                    document.getElementById('llmModel').value = llmPersisted.model || '';
-                    document.getElementById('llmMaxTokens').value = llmPersisted.max_tokens || 2048;
-                    document.getElementById('llmTemperature').value = llmPersisted.temperature != null ? llmPersisted.temperature : 0.3;
-                    markPresetActive(llmPersisted.provider);
+                    applyConfigToForm(llmPersisted);
                     updateLLMHeaderStatus(true);
-                    updateModelHint();
                     // 自动勾选"调用 LLM"
                     document.getElementById('useLLM').checked = true;
                     document.getElementById('llmApiKey').placeholder = '🔒 Key 未保存, 刷新后需重新输入';
@@ -928,6 +974,7 @@
                     document.getElementById('useLLM').checked = true;
                 }
             }).catch(() => {});
+            loadMyPresets();
             loadUsageStats();
         }
 
@@ -944,11 +991,11 @@
             }
             llmKey = cfg.api_key;  // 仅内存
             llmPersisted = { provider: cfg.provider, base_url: cfg.base_url, model: cfg.model,
-                             max_tokens: cfg.max_tokens, temperature: cfg.temperature };
+                             max_tokens: cfg.max_tokens, temperature: cfg.temperature,
+                             prefix: readPrefix() };
             localStorage.setItem('ms-llm-config', JSON.stringify(llmPersisted));
             updateLLMHeaderStatus(true);
-            markPresetActive(cfg.provider);
-            updateModelHint();
+            applyConfigToForm(llmPersisted);
             document.getElementById('useLLM').checked = true;
             document.getElementById('llmApiKey').value = '';
             document.getElementById('llmApiKey').placeholder = '🔒 Key 已在内存中生效, 刷新后需重新输入';
@@ -961,12 +1008,9 @@
             llmKey = '';
             llmPersisted = null;
             localStorage.removeItem('ms-llm-config');
-            document.getElementById('llmBaseUrl').value = LLM_PRESETS.openai.base_url;
-            document.getElementById('llmModel').value = LLM_PRESETS.openai.model;
-            document.getElementById('llmMaxTokens').value = 2048;
-            document.getElementById('llmTemperature').value = 0.3;
+            applyConfigToForm({ provider: 'openai', base_url: LLM_PRESETS.openai.base_url,
+                                model: LLM_PRESETS.openai.model, max_tokens: 4096, temperature: 0.3, prefix: '' });
             document.getElementById('llmApiKey').value = '';
-            markPresetActive('openai');
             updateLLMHeaderStatus(false);
             updateModelHint();
             setLLMTestStatus('wait', '已重置');
@@ -978,10 +1022,23 @@
                 base_url: document.getElementById('llmBaseUrl').value.trim(),
                 model: document.getElementById('llmModel').value.trim(),
                 provider: detectProviderLabel(),
-                max_tokens: parseInt(document.getElementById('llmMaxTokens').value, 10) || 2048,
+                max_tokens: parseInt(document.getElementById('llmMaxTokens').value, 10) || 4096,
                 temperature: parseFloat(document.getElementById('llmTemperature').value),
                 _isNaNTemp: isNaN(parseFloat(document.getElementById('llmTemperature').value)),
             };
+        }
+
+        // 厂商前缀: "" → 不补; "auto" → 后端按模型名自动猜; "thu-ai" → 用指定前缀重试
+        function readPrefix() {
+            const v = document.getElementById('llmPrefix').value.trim();
+            return v || null;
+        }
+
+        // 同步模型下拉与输入框 (输入为手动值时下拉显示"手动输入…")
+        function syncModelSelect() {
+            const sel = document.getElementById('llmModelSelect');
+            const model = document.getElementById('llmModel').value.trim();
+            sel.value = model; // 选项存在则选中, 否则回落为空 (手动输入)
         }
 
         function detectProviderLabel() {
@@ -1001,18 +1058,28 @@
         function updateModelHint() {
             const url = document.getElementById('llmBaseUrl').value;
             const model = document.getElementById('llmModel').value;
+            const prefix = readPrefix();
             const prov = detectProviderLabel();
             const el = document.getElementById('llmModelHint');
             if (!el) return;
             const isOR = openrouterLike(url, prov);
+            const hasPrefix = (model || '').includes('/');
             if (isOR) {
-                const hasPrefix = (model || '').includes('/');
-                el.textContent = hasPrefix
-                    ? '✅ OpenRouter 模型名已带厂商前缀'
-                    : '⚠️ OpenRouter 模型名需带厂商前缀 (如 openai/gpt-4o-mini)。后端会自动尝试补全, 否则请手动填写。';
-                el.style.color = hasPrefix ? '#2ECC71' : '#F39C12';
+                if (hasPrefix) {
+                    el.textContent = '✅ OpenRouter 模型名已带厂商前缀';
+                    el.style.color = '#2ECC71';
+                } else if (prefix) {
+                    el.textContent = `✅ 已配置厂商前缀"${prefix}", 请求失败时自动重试 ${prefix}/${model}`;
+                    el.style.color = '#2ECC71';
+                } else {
+                    el.textContent = '⚠️ OpenRouter 模型名需带厂商前缀 (如 openai/gpt-4o-mini), 或在上方填厂商前缀 auto 自动补全。';
+                    el.style.color = '#F39C12';
+                }
+            } else if (prefix && !hasPrefix) {
+                el.textContent = `✅ 已配置厂商前缀"${prefix}", 请求失败时自动重试 ${prefix}/${model}`;
+                el.style.color = '#2ECC71';
             } else {
-                el.textContent = '模型名填网关可用的模型标识即可; 若使用中转/OpenRouter 网关, 需带厂商前缀 (如 openai/gpt-4o-mini)。';
+                el.textContent = '模型名填网关可用的模型标识即可; 若使用中转/OpenRouter 网关, 需带厂商前缀 (如 openai/gpt-4o-mini), 也可用「🔍 获取模型」从网关拉取准确列表。';
                 el.style.color = '';
             }
         }
@@ -1028,6 +1095,7 @@
                 provider: base.provider,
                 max_tokens: base.max_tokens,
                 temperature: base.temperature,
+                prefix: base.prefix || null,
             };
         }
 
@@ -1060,13 +1128,146 @@
         function applyLLMPreset(key) {
             const p = LLM_PRESETS[key];
             if (!p) return;
-            if (p.base_url === '' || !document.getElementById('llmBaseUrl').value ||
+            if (key === 'custom') {
+                // 自定义: 不清空当前输入, 仅高亮进入可编辑状态
+                markPresetActive('custom');
+                updateModelHint();
+                return;
+            }
+            if (!document.getElementById('llmBaseUrl').value ||
                 confirm(`应用预设「${p.label}」会覆盖当前 Base URL 和模型, 继续?`)) {
                 document.getElementById('llmBaseUrl').value = p.base_url;
                 document.getElementById('llmModel').value = p.model;
             }
             markPresetActive(key);
+            syncModelSelect();
             updateModelHint();
+        }
+
+        /* ============ 模型下拉组合框 ============ */
+        function onModelSelectChange() {
+            const sel = document.getElementById('llmModelSelect');
+            if (sel.value) {
+                document.getElementById('llmModel').value = sel.value;
+                updateModelHint();
+            }
+        }
+
+        // 从网关获取模型列表 (后端代理, 避免浏览器 CORS)
+        async function fetchModelsFromGateway() {
+            const cfg = readLLMForm();
+            if (!cfg.base_url) {
+                setLLMTestStatus('err', '请先填写 Base URL');
+                return;
+            }
+            const key = cfg.api_key || llmKey;
+            if (!key && !isLocalBase(cfg.base_url)) {
+                setLLMTestStatus('err', '请先输入 API Key (本地网关可免)');
+                return;
+            }
+            const btn = document.querySelector('button[onclick="fetchModelsFromGateway()"]');
+            const old = btn.textContent;
+            btn.textContent = '⏳ 获取中…';
+            btn.disabled = true;
+            try {
+                const resp = await fetch('/api/llm/models', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ llm_config: {
+                        api_key: key, base_url: cfg.base_url, model: cfg.model,
+                        provider: cfg.provider, prefix: readPrefix(),
+                    }})
+                });
+                const data = await resp.json();
+                if (data.success && Array.isArray(data.models)) {
+                    const sel = document.getElementById('llmModelSelect');
+                    const cur = document.getElementById('llmModel').value.trim();
+                    const list = data.models.slice().sort((a, b) => a.localeCompare(b));
+                    sel.innerHTML = '<option value="">手动输入…</option>'
+                        + list.map(m => `<option value="${m.replace(/"/g, '&quot;')}">${m.replace(/"/g, '&quot;')}</option>`).join('');
+                    // 保留当前已选模型 (若在列表中)
+                    sel.value = list.includes(cur) ? cur : '';
+                    setLLMTestStatus('ok', `✅ 获取到 ${list.length} 个模型, 请选择`);
+                    addChat('system', `🔍 网关返回 ${list.length} 个可用模型${list.length > 0 ? '，请在下拉框选择（如 ' + list.slice(0, 3).join(' / ') + '…）' : ''}。`);
+                } else {
+                    setLLMTestStatus('err', '❌ ' + (data.error || '获取失败'));
+                    addChat('system', '❌ 获取模型列表失败: ' + (data.error || '未知错误') + '\n可继续手动输入模型名。');
+                }
+            } catch (e) {
+                setLLMTestStatus('err', '❌ 请求失败: ' + e.message);
+            } finally {
+                btn.textContent = old;
+                btn.disabled = false;
+            }
+        }
+
+        /* ============ 我的预设 (localStorage, 不含 Key) ============ */
+        let myPresets = [];
+
+        function loadMyPresets() {
+            try {
+                const raw = localStorage.getItem('ms-llm-presets');
+                myPresets = raw ? JSON.parse(raw) : [];
+            } catch (e) { myPresets = []; }
+            renderMyPresetSelect();
+        }
+
+        function renderMyPresetSelect() {
+            const sel = document.getElementById('myPresetSelect');
+            if (!sel) return;
+            const keep = sel.value;
+            sel.innerHTML = '<option value="">— 选择保存的预设 —</option>'
+                + myPresets.map((p, i) => `<option value="${i}">${p.name}</option>`).join('');
+            if (keep && myPresets[keep]) sel.value = keep;
+        }
+
+        function saveAsMyPreset() {
+            const cfg = readLLMForm();
+            if (!cfg.base_url || !cfg.model) {
+                setLLMTestStatus('err', 'Base URL 和模型不能为空');
+                return;
+            }
+            const name = prompt('为此预设命名 (不保存 API Key):', cfg.base_url.replace(/^https?:\/\//, '').replace(/\/.*$/, ''));
+            if (!name) return;
+            myPresets.push({
+                name,
+                provider: cfg.provider,
+                base_url: cfg.base_url,
+                model: cfg.model,
+                max_tokens: cfg.max_tokens,
+                temperature: cfg.temperature,
+                prefix: readPrefix(),
+            });
+            localStorage.setItem('ms-llm-presets', JSON.stringify(myPresets));
+            renderMyPresetSelect();
+            setLLMTestStatus('ok', `✅ 已保存预设「${name}」(Key 不保存)`);
+        }
+
+        function applyMyPreset() {
+            const sel = document.getElementById('myPresetSelect');
+            const idx = sel.value;
+            if (idx === '' || !myPresets[idx]) { sel.value = ''; return; }
+            const p = myPresets[idx];
+            document.getElementById('llmBaseUrl').value = p.base_url || '';
+            document.getElementById('llmModel').value = p.model || '';
+            document.getElementById('llmMaxTokens').value = p.max_tokens || 4096;
+            document.getElementById('llmTemperature').value = p.temperature != null ? p.temperature : 0.3;
+            document.getElementById('llmPrefix').value = p.prefix || '';
+            markPresetActive(p.provider && LLM_PRESETS[p.provider] ? p.provider : 'custom');
+            syncModelSelect();
+            updateModelHint();
+            setLLMTestStatus('wait', `已载入预设「${p.name}」, 输入 Key 后保存/测试`);
+        }
+
+        function deleteMyPreset() {
+            const sel = document.getElementById('myPresetSelect');
+            const idx = sel.value;
+            if (idx === '' || !myPresets[idx]) return;
+            if (!confirm(`删除预设「${myPresets[idx].name}」?`)) return;
+            myPresets.splice(idx, 1);
+            localStorage.setItem('ms-llm-presets', JSON.stringify(myPresets));
+            renderMyPresetSelect();
+            setLLMTestStatus('wait', '已删除');
         }
 
         function toggleKeyVisibility() {
@@ -1085,6 +1286,7 @@
             if (!cfg.base_url || !cfg.model) { setLLMTestStatus('err', 'Base URL 和模型不能为空'); return; }
             if (!cfg.api_key && !isLocalBase(cfg.base_url)) { setLLMTestStatus('err', 'API Key 不能为空 (本地 Ollama 可免 Key)'); return; }
             setLLMTestStatus('wait', '测试中...');
+            const t0 = performance.now();
             try {
                 const resp = await fetch('/api/llm/test', {
                     method: 'POST',
@@ -1092,10 +1294,11 @@
                     body: JSON.stringify({ llm_config: {
                         api_key: cfg.api_key, base_url: cfg.base_url, model: cfg.model,
                         provider: cfg.provider, max_tokens: 1, temperature: 0,
+                        prefix: readPrefix(),
                     }})
                 });
                 const data = await resp.json();
-                const ms = Math.round(performance.now());
+                const ms = Math.round(performance.now() - t0);
                 if (data.success) {
                     lastConnMeta = `${data.model}`;
                     document.getElementById('llmConnMeta').textContent = `当前模型: ${data.model}`;
@@ -1353,11 +1556,16 @@
         }
         document.getElementById('mineCount').addEventListener('input', updateMeta);
 
-        // API 配置: Base URL / 模型手动输入时刷新网关提示
-        ['llmBaseUrl', 'llmModel'].forEach(id => {
+        // API 配置: Base URL / 模型 / 厂商前缀 手动输入时刷新提示与下拉同步
+        ['llmBaseUrl', 'llmModel', 'llmPrefix'].forEach(id => {
             const el = document.getElementById(id);
-            if (el) el.addEventListener('input', updateModelHint);
+            if (!el) return;
+            el.addEventListener('input', () => {
+                updateModelHint();
+                if (id === 'llmModel') syncModelSelect();
+            });
         });
+        // 从网关获取到模型后, 选中下拉项也会同步输入框 (onModelSelectChange 已绑定) 
 
         /* ==================== 棋盘绘制 (canvas) ==================== */
         function drawBoard() {
@@ -1674,11 +1882,11 @@
                 addChat('system', '当前没有棋盘。请先粘贴文本棋盘（如 "? ? 1\\n? 2 ?"）、粘贴截图或点击格子手动录入。');
                 return;
             }
-            // 问题路由: 教学/策略关键词 → 对应模式
-            const q = text.toLowerCase();
+            // 模式选择: 只有显式开启「教学模式」才用教学模式;
+            // 未开启时一律用界面下拉所选模式 (答案/策略), 不做关键词隐式跳转,
+            // 避免"没开教学却收到引导问题" (teachmod2.md)。
             let mode = document.getElementById('mode').value;
-            if (teachingMode || /教|引导|提示|怎么想|为什么/.test(q)) mode = 'teaching';
-            else if (/策略|先.{0,3}(左|右|上|下)|比较|区域|收益|概率/.test(q)) mode = 'strategy';
+            if (teachingMode) mode = 'teaching';
             addChat('system', `🔎 结合当前局面（${mode === 'teaching' ? '教学' : mode === 'strategy' ? '策略' : '答案'}模式）分析你的问题…`);
             await runAnalyze({ silent: true, mode, question: text });
         }
@@ -1724,8 +1932,11 @@
                 board,
                 remaining_mines: parseInt(document.getElementById('mineCount').value, 10) || 0,
                 mode,
-                use_llm: useLLM
+                use_llm: useLLM,
+                language: document.getElementById('lang') ? document.getElementById('lang').value : 'zh'
             };
+            // 对话区提问 → 随请求发给后端 (此前被丢弃, 教学模式答非所问的根因之一)
+            if (opts.question) req.question = String(opts.question);
             // 启用 LLM 时附带运行时配置 (优先于环境变量)
             if (useLLM) {
                 const cfg = getLLMConfigForRequest();
@@ -1740,6 +1951,10 @@
                 if (!resp.ok) throw new Error(await resp.text());
                 const data = await resp.json();
                 renderResult(data);
+                // 防止"输出被吃": 若 LLM 返回内容异常稀薄, 明确提示 (便于排查)
+                if (data.used_llm && data.analysis.trim().length < 8) {
+                    addChat('system', '⚠️ LLM 返回内容异常简短, 已按原样展示。可开启后端 LLM_DEBUG=1 查看原始响应 (docker compose logs app)。');
+                }
                 if (silent) {
                     addChat('system', '【分析结果】\n' + data.analysis, { copyText: data.analysis });
                 }
@@ -1852,6 +2067,7 @@
         window.addEventListener('resize', drawBoard);
         addChat('system', '👋 欢迎使用扫雷认知助手！三种方式录入局面：\n1) 在输入框按 Ctrl+V 粘贴截图或文本棋盘\n2) 点击棋盘格手动编辑（右键插旗）\n3) 从「加载示例」选择经典残局\n完成后点击「分析局面」。');
         loadPreset('endgame');
+        syncModelSelect();
         loadLLMConfig();
     </script>
 </body>

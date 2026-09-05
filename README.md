@@ -92,9 +92,10 @@ minesweeper-agent import -i tests/sample_board.json
 
 | 端点 | 说明 |
 |------|------|
-| `POST /api/analyze` | 分析局面：`{ "board": [[1,-1,-1],...], "remaining_mines": 3, "mode": "answer\|teaching\|strategy", "use_llm": false, "llm_config": {"api_key":"sk-...","base_url":"...","model":"...","max_tokens":2048,"temperature":0.3} }` |
+| `POST /api/analyze` | 分析局面：`{ "board": [[1,-1,-1],...], "remaining_mines": 3, "mode": "answer\|teaching\|strategy", "use_llm": false, "language": "zh\|en", "question": "可选提问", "llm_config": {"api_key":"sk-...","base_url":"...","model":"...","max_tokens":4096,"temperature":0.3} }` |
 | `POST /api/ocr` | 截图识别代理：`{ "image": "<base64>" }` → `{ "board": [[...]], "remaining_mines": n }` |
 | `POST /api/llm/test` | 测试 LLM 连接：`{ "llm_config": {...} }` → `{ "success": true, "model": "openai/gpt-4o-mini" }` |
+| `POST /api/llm/models` | 从网关获取模型列表（后端代理 `/models`，避免浏览器 CORS） |
 | `GET /api/llm/status` | 查询环境变量 LLM 配置状态（不泄露 key） |
 | `GET /api/usage/stats` | Token 用量统计（今日/近7日/本月/累计 + 模型分布 + 趋势） |
 | `GET /api/usage/logs` | Token 用量明细日志（`?limit=&offset=`） |
@@ -133,13 +134,33 @@ LLM 负责将 Rust 推理引擎的计算结果（IR）翻译为人类可读的�
 
 界面面板提供一键预设按钮，点击自动填入 Base URL 和模型名。
 
+### 自定义 / 中转网关（OpenRouter 协议、清华 Sub2API 等）
+
+选择「✨ 自定义」进入自由编辑模式，支持：
+
+- **从网关获取模型列表**：点击「🔍 获取模型」，后端代理请求 `{base_url}/models`（Ollama 自动回退 `/api/tags`），下拉框中列出网关真实可用的模型 id —— 彻底避免手写模型名不可用的问题。
+- **模型下拉 + 手动输入组合框**：可从获取的列表中选择，也可手动输入。
+- **厂商前缀**（可选）：对要求 `vendor/model` 的网关，在高级选项填前缀后，模型名无前缀且请求失败时自动重试 `前缀/模型`：
+  - `auto` → 按模型名首段自动猜（`openai` / `anthropic` / `deepseek` / `thu-ai` 等）
+  - 具体前缀如 `thu-ai` → 固定使用该前缀重试
+  - 留空 → 不补前缀（OpenRouter 类网关除外，仍自动猜测）
+- **我的预设**：将 Base URL / 模型 / 参数（不含 Key）保存到浏览器 localStorage，下次一键载入。
+
+示例（清华 Sub2API 风格网关）：
+
+```
+Base URL: https://<你的网关>/v1      模型: glm-5     厂商前缀: thu-ai
+→ 后端自动重试 thu-ai/glm-5 并成功
+```
+
 ### 常见问题排查
 
 **连接失败提示 `No proxy configuration found for requested model`**（HTTP 500 类错误）：
 
 - 这是 **OpenRouter / 中转网关** 的典型报错：模型名不带厂商前缀，或该模型在此网关没有可用通道。
-- **修复**：模型名需带厂商前缀，如 `gpt-4o-mini` → `openai/gpt-4o-mini`、`claude-sonnet-4` → `anthropic/claude-sonnet-4`。选择「OpenRouter」预设会自动填入正确格式。
-- 后端已内置**自动补全重试**：当 Base URL 为 OpenRouter（或配置了 provider=openrouter 的中转网关）且模型名无前缀时，首次请求失败会自动用常见厂商前缀（`openai/`、`anthropic/`、`deepseek/`、`google/` 等）重试一次。
+- **修复**：模型名需带厂商前缀，如 `gpt-4o-mini` → `openai/gpt-4o-mini`、`glm-5` → `thu-ai/glm-5`。选择「OpenRouter」预设会自动填入正确格式；也可在高级选项填「厂商前缀」（`auto` 或具体前缀如 `thu-ai`）。
+- **推荐**：点击「🔍 获取模型」从网关拉取真实模型列表并选择，可彻底避免手写模型名不可用。
+- 后端已内置**自动补全重试**：模型名无前缀且首次请求失败时，按厂商前缀配置（OpenRouter 类网关自动猜测 `openai/`、`anthropic/`、`deepseek/`、`thu-ai/` 等）重试一次。
 - 若为其他中转/网关（one-api / new-api 等），需填该网关「已配置的模型别名」，并检查渠道是否启用。
 
 **其他常见错误**：
@@ -150,6 +171,26 @@ LLM 负责将 Rust 推理引擎的计算结果（IR）翻译为人类可读的�
 | `Invalid API Key` / 401 | Key 错误或已过期 |
 | `rate limit` / 429 | 请求频率超限，稍后重试 |
 | 网络错误 | Base URL 不可达（本地 Ollama 未启动、代理未开等） |
+
+### 对话语言与生成参数
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| **语言** | 中文 | 界面「分析模式」旁可选 中文 / English；随请求传入后端并注入 System Prompt（`## 语言要求`），教学模式有对应的中/英结构化模板（`## 引导问题` / `## Guiding Questions`） |
+| **max_tokens** | **4096** | 单次响应最大生成 token 数。默认 4096（足够教学模式 3~5 问与答案模式长文）；范围 16–32768，可在「API 配置 → 高级选项」调整，或通过 `LLMConfig.max_tokens` / 请求体传入 |
+| **temperature** | **0.3** | 采样温度，影响输出的随机性/创造力。**建议**：扫雷推理属于逻辑任务，保持 **0 ~ 0.5**（确定性更高、坐标幻觉更少）；如需更活泼的措辞可调到 0.7 以上，但不建议超过 1.0，否则容易编造坐标。可在「API 配置 → 高级选项」调整 |
+
+### 教学模式：智能引导与完整性保障
+
+- **模式选择规则**：只有显式开启「🎓 教学模式」时提问才进入教学模式；未开启时一律使用界面下拉所选模式（答案/策略）直接回答，**不做关键词隐式跳转**（不再出现"没开教学却收到引导问题"）。
+- **智能自适应提示词**（teachmod2.md）：开启教学后 LLM 根据你的提问切换策略，而不是"复读机式"只给问题：
+  - 问「为什么 / 原因 / 解释」→ 先给 **1-3 句直接解释**（`## 直接原因`），再附 **1 个思考引导**（`## 思考引导`）
+  - 问「怎么做 / 下一步 / 该点哪里」或问题不明确 → 输出 **3-5 个引导性问题**（`## 引导问题`，每题 ≤30 字/词、含精确坐标）
+  - 说「我懂了 / 继续 / 下一个」→ 进入更深推理，给 **1-2 个进阶问题**（`## 进阶引导`）
+- **输出完整性检测 + 自动重试**：若 LLM 返回为空、或仅输出 `##` 标题而无正文（"输出被吃"），后端自动重试（附带重试提醒），**最多 3 次，不会死循环**；重试耗尽仍不完整则回退到本地引导并附警告。网络/API 错误不触发重试，直接回退本地分析。
+- **用户提问透传**：对话区输入的问题（`question` 字段）会随每次分析请求发给 LLM，教学模式围绕你的提问展开引导，不再答非所问。
+- **思维链模型兼容**：GLM / DeepSeek-reasoner 等把正文放在 `reasoning_content` 的模型，`content` 为空时自动回退使用思维链文本。
+- **调试**：容器/进程加环境变量 `LLM_DEBUG=1` 时打印每次上游调用的完整原始响应（`[LLM Raw Response]`），便于排查"输出被吃"。
 
 ### Token 用量统计（v0.2）
 
