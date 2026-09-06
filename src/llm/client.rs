@@ -30,6 +30,12 @@ pub struct LLMConfig {
     ///   - Some("thu-ai")→ 使用指定前缀 (模型无 "/" 时尝试 "thu-ai/{model}")
     #[serde(default)]
     pub prefix: Option<String>,
+    /// 视觉模型名 (仅截图识别 LLM OCR 使用; 留空 = 与 model 相同)。
+    ///
+    /// 主模型可以是纯文本模型 (如 glm-5 / deepseek-chat), 只要这里填一个
+    /// 支持图像输入的模型 (如 glm-4v / gpt-4o / qwen-vl) 即可用 LLM 识别截图。
+    #[serde(default)]
+    pub vision_model: Option<String>,
 }
 
 /// 默认最大生成 token 数
@@ -45,6 +51,7 @@ impl Default for LLMConfig {
             max_tokens: None,
             temperature: None,
             prefix: None,
+            vision_model: None,
         }
     }
 }
@@ -244,7 +251,7 @@ impl LLMClient {
         let resp = req
             .send()
             .await
-            .map_err(|e| format!("网络错误: {} (请检查 Base URL 是否可达)", e))?;
+            .map_err(|e| format_network_error(&e))?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
@@ -329,6 +336,76 @@ fn format_upstream_error(status: u16, body: &str) -> String {
     format!("HTTP {}: {}{}", status, detail.trim(), hint)
 }
 
+/// 展开 reqwest 错误的完整原因链。
+///
+/// reqwest 顶层 Display 只显示 "error sending request for url (...)",
+/// 真实原因 (超时 / 连接重置 / TLS 握手失败) 藏在 source() 链中;
+/// 不展开会导致提示语误导、且瞬态错误重试判断 (is_transient_llm_error) 失效。
+fn format_network_error(e: &reqwest::Error) -> String {
+    let mut parts: Vec<String> = vec![e.to_string()];
+    let mut src: Option<&dyn std::error::Error> = std::error::Error::source(e);
+    while let Some(s) = src {
+        let msg = s.to_string();
+        if !msg.is_empty() && !parts.contains(&msg) {
+            parts.push(msg);
+        }
+        src = s.source();
+    }
+    let joined = parts.join(" ← ");
+    let lower = joined.to_lowercase();
+    let hint = if lower.contains("timed out") || lower.contains("timeout") {
+        format!(
+            " (请求超时; 当前超时 {} 秒, 可用环境变量 LLM_TIMEOUT_SECS 调大)",
+            LLMClient::timeout_secs()
+        )
+    } else if lower.contains("connection reset") || lower.contains("connection closed") {
+        " (连接被重置, 常见于网关拒绝过大/过慢的请求)".to_string()
+    } else {
+        " (请检查 Base URL 是否可达)".to_string()
+    };
+    format!("网络错误: {}{}", joined, hint)
+}
+
+/// SSE 流式增量累积器 (OpenAI 兼容 chunked 响应)
+#[derive(Default)]
+struct SseAccumulator {
+    content: String,
+    reasoning: String,
+    usage: Option<TokenUsage>,
+}
+
+/// 解析一行 SSE 数据 (`data: {...}` / `data: [DONE]`), 累积到 acc。
+/// 非法行静默忽略 (流中可能出现注释/心跳行)。
+fn feed_sse_line(line: &str, acc: &mut SseAccumulator) {
+    let line = line.trim();
+    let Some(data) = line.strip_prefix("data:") else {
+        return;
+    };
+    let data = data.trim();
+    if data.is_empty() || data == "[DONE]" {
+        return;
+    }
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else {
+        return;
+    };
+    // 最终 chunk 可能携带 usage (需 stream_options.include_usage)
+    if let Some(u) = v.get("usage").filter(|u| !u.is_null()) {
+        if let Ok(parsed) = serde_json::from_value::<TokenUsage>(u.clone()) {
+            acc.usage = Some(parsed);
+        }
+    }
+    let Some(delta) = v.pointer("/choices/0/delta") else {
+        return;
+    };
+    if let Some(c) = delta.get("content").and_then(|c| c.as_str()) {
+        acc.content.push_str(c);
+    }
+    // 思维链模型: 流式推理过程字段
+    if let Some(r) = delta.get("reasoning_content").and_then(|c| c.as_str()) {
+        acc.reasoning.push_str(r);
+    }
+}
+
 /// 是否为 OpenRouter (或基于其协议的中转网关)
 fn is_openrouter_url(base_url: &str) -> bool {
     base_url.to_lowercase().contains("openrouter")
@@ -363,15 +440,54 @@ fn is_model_unavailable_error(msg: &str) -> bool {
         || m.contains("no endpoints found")
 }
 
+/// 判断错误是否为"模型/网关不支持图像输入" (纯文本模型收到 image_url)。
+///
+/// 典型上游报错:
+///   - "messages.content.type 参数非法，取值范围 ['text']" (清华 Sub2API / 部分网关)
+///   - "Invalid type for 'messages[1].content[1].type': 'image_url' is not allowed"
+pub fn is_vision_unsupported_error(msg: &str) -> bool {
+    let m = msg.to_lowercase();
+    m.contains("content.type")
+        || m.contains("content[1].type")
+        || m.contains("image_url")
+        || m.contains("multimodal")
+        || m.contains("multi-modal")
+        || m.contains("不支持图像")
+        || m.contains("仅支持文本")
+        || (m.contains("image") && (m.contains("not support") || m.contains("unsupported")))
+}
+
+/// 从 ChatResponse 提取首个消息内容 (兼容思维链模型回退 reasoning_content)
+fn extract_chat_result(chat_resp: ChatResponse) -> Result<ChatResult, String> {
+    let usage = chat_resp.usage;
+    let msg = chat_resp
+        .choices
+        .into_iter()
+        .next()
+        .map(|c| c.message)
+        .ok_or("API 返回空响应 (无 choices)")?;
+    // 思维链模型兼容: content 为空时回退到 reasoning_content
+    let content = if msg.content.trim().is_empty() {
+        msg.reasoning_content.unwrap_or_default().trim().to_string()
+    } else {
+        msg.content
+    };
+    if content.trim().is_empty() {
+        return Err("API 返回空内容 (content 与 reasoning_content 均为空)".to_string());
+    }
+    Ok(ChatResult { content, usage })
+}
+
 impl LLMClient {
-    /// LLM HTTP 超时 (秒): 环境变量 LLM_TIMEOUT_SECS, 默认 60
-    /// (60s 内大多数模型可完成回答; 超时重试会叠加, 默认值不宜过大)
+    /// LLM HTTP 超时 (秒): 环境变量 LLM_TIMEOUT_SECS, 默认 120。
+    /// 校园网关/思维链模型处理长提示较慢, 60s 内可能出不完结果
+    /// (超时重试会叠加, 默认值兼顾首次成功率与总等待时长)
     pub fn timeout_secs() -> u64 {
         std::env::var("LLM_TIMEOUT_SECS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
             .filter(|v| *v >= 10)
-            .unwrap_or(60)
+            .unwrap_or(120)
     }
 
     pub fn new(config: LLMConfig) -> Self {
@@ -392,21 +508,14 @@ impl LLMClient {
         &self.config
     }
 
-    /// 发送一次请求 (不自动重试)
-    async fn post_once(
-        &self,
-        model: &str,
-        messages: Vec<ChatMessage>,
-        temperature: f64,
-        max_tokens: u32,
-    ) -> Result<ChatResponse, String> {
-        let request = ChatRequest {
-            model: model.to_string(),
-            messages,
-            temperature,
-            max_tokens,
-        };
-
+    /// 发送一次请求 (不自动重试), 消息体为任意 JSON (支持多模态 content 数组)
+    async fn post_request(&self, request: serde_json::Value) -> Result<ChatResponse, String> {
+        // LLM_DEBUG=1 时打印请求体大小 (排查网关请求体过大 / 413 / 超时问题)
+        if std::env::var("LLM_DEBUG").map(|v| v == "1").unwrap_or(false) {
+            let model = request.get("model").and_then(|m| m.as_str()).unwrap_or("?");
+            let size = serde_json::to_string(&request).map(|s| s.len()).unwrap_or(0);
+            eprintln!("[LLM Request] model={} body={} bytes", model, size);
+        }
         // 去掉 base_url 末尾多余的 "/", 再拼接 /chat/completions
         let url = format!("{}/chat/completions", self.config.base_url.trim_end_matches('/'));
         let resp = self
@@ -416,7 +525,7 @@ impl LLMClient {
             .json(&request)
             .send()
             .await
-            .map_err(|e| format!("网络错误: {} (请检查 Base URL 是否可达)", e))?;
+            .map_err(|e| format_network_error(&e))?;
 
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
@@ -437,6 +546,180 @@ impl LLMClient {
         Ok(parsed)
     }
 
+    /// 发送一次纯文本请求 (不自动重试)
+    async fn post_once(
+        &self,
+        model: &str,
+        messages: Vec<ChatMessage>,
+        temperature: f64,
+        max_tokens: u32,
+    ) -> Result<ChatResponse, String> {
+        let request = serde_json::to_value(ChatRequest {
+            model: model.to_string(),
+            messages,
+            temperature,
+            max_tokens,
+        })
+        .map_err(|e| format!("构建请求失败: {}", e))?;
+        self.post_request(request).await
+    }
+
+    /// 按模型候选列表依次尝试发请求; 仅"模型名不可用"错误才换前缀重试
+    async fn post_with_model_candidates(
+        &self,
+        build_request: impl Fn(&str) -> serde_json::Value,
+    ) -> Result<ChatResult, String> {
+        let candidates = self.model_candidates();
+        self.post_candidates(&candidates, build_request).await
+    }
+
+    /// 是否启用流式请求 (默认开启; LLM_STREAM=0 关闭)。
+    ///
+    /// 网关 nginx 通常有 60s 级空闲超时 (proxy_read_timeout), 非流式请求
+    /// 在模型生成期间无数据流动, 会被网关切断返回 504 — 后端调大超时无用。
+    /// 流式下生成内容以 chunk 持续到达, 网关不会判空闲。
+    pub fn stream_enabled() -> bool {
+        std::env::var("LLM_STREAM").map(|v| v != "0").unwrap_or(true)
+    }
+
+    /// 发送聊天请求 (chat / 视觉共用入口): 优先流式, 网关不支持时逐级回退。
+    async fn send_chat_request(&self, request: serde_json::Value) -> Result<ChatResult, String> {
+        if !Self::stream_enabled() {
+            return self
+                .post_request(request)
+                .await
+                .and_then(extract_chat_result);
+        }
+        // 1) stream + stream_options (OpenAI 协议, 附带 usage 统计)
+        let mut req = request.clone();
+        req["stream"] = serde_json::Value::Bool(true);
+        req["stream_options"] = serde_json::json!({ "include_usage": true });
+        match self.send_streaming(req).await {
+            Ok(r) => return Ok(r),
+            Err(e1) => {
+                // 2) 网关不认识 stream_options → 去掉后重试
+                if e1.to_lowercase().contains("stream_options") {
+                    let mut req = request.clone();
+                    req["stream"] = serde_json::Value::Bool(true);
+                    match self.send_streaming(req).await {
+                        Ok(r) => return Ok(r),
+                        Err(e2) => {
+                            // 3) 网关完全不支持流式 → 回退普通请求
+                            let m = e2.to_lowercase();
+                            if m.contains("stream") && (m.contains("http 4") || m.contains("invalid")) {
+                                return self
+                                    .post_request(request)
+                                    .await
+                                    .and_then(extract_chat_result);
+                            }
+                            return Err(e2);
+                        }
+                    }
+                }
+                return Err(e1);
+            }
+        }
+    }
+
+    /// 发送一次流式请求并解析 SSE 响应。
+    /// 网关忽略 stream 参数返回普通 JSON 时 (content-type 非 event-stream),
+    /// 自动按非流式响应解析, 兼容所有 OpenAI 兼容网关。
+    async fn send_streaming(&self, request: serde_json::Value) -> Result<ChatResult, String> {
+        let url = format!("{}/chat/completions", self.config.base_url.trim_end_matches('/'));
+        let resp = self
+            .http_client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.config.api_key))
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| format_network_error(&e))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format_upstream_error(status.as_u16(), &body));
+        }
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_lowercase();
+
+        let mut resp = resp;
+        // 网关未走流式 (忽略 stream 参数) → 整体按普通 JSON 解析
+        if !content_type.contains("text/event-stream") {
+            let text = resp.text().await.unwrap_or_default();
+            let parsed: ChatResponse = serde_json::from_str(&text).map_err(|e| {
+                format!("响应解析失败: {} (原始响应: {})", e, &text[..text.len().min(200)])
+            })?;
+            return extract_chat_result(parsed);
+        }
+
+        // SSE: 逐 chunk 读取, 按行喂给累积器 (Response::chunk 无需额外依赖)
+        let mut acc = SseAccumulator::default();
+        let mut buf: Vec<u8> = Vec::new();
+        while let Ok(Some(chunk)) = resp.chunk().await {
+            buf.extend_from_slice(&chunk);
+            while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                let line = String::from_utf8_lossy(&buf[..pos]).into_owned();
+                buf.drain(..=pos);
+                feed_sse_line(&line, &mut acc);
+            }
+        }
+        if !buf.is_empty() {
+            let tail = String::from_utf8_lossy(&buf).into_owned();
+            feed_sse_line(&tail, &mut acc);
+        }
+
+        let debug = std::env::var("LLM_DEBUG").map(|v| v == "1").unwrap_or(false);
+        if debug {
+            eprintln!(
+                "[LLM Stream] content={} chars, reasoning={} chars, usage={:?}",
+                acc.content.chars().count(),
+                acc.reasoning.chars().count(),
+                acc.usage
+            );
+        }
+
+        // 思维链模型兼容: content 为空时回退到 reasoning_content
+        let content = if acc.content.trim().is_empty() {
+            acc.reasoning.trim().to_string()
+        } else {
+            acc.content
+        };
+        if content.trim().is_empty() {
+            return Err("API 返回空内容 (流式累计 content 与 reasoning 均为空)".to_string());
+        }
+        Ok(ChatResult { content, usage: acc.usage })
+    }
+
+    /// 按给定候选列表依次尝试发请求 (主模型 / 视觉模型共用)
+    async fn post_candidates(
+        &self,
+        candidates: &[String],
+        build_request: impl Fn(&str) -> serde_json::Value,
+    ) -> Result<ChatResult, String> {
+        if candidates.is_empty() {
+            return Err("模型名不能为空".to_string());
+        }
+        let mut last_err = String::new();
+        for model in candidates {
+            match self.send_chat_request(build_request(model)).await {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    last_err = e.clone();
+                    // 只有模型名不可用类的错误才值得换前缀重试
+                    if !is_model_unavailable_error(&e) {
+                        break;
+                    }
+                }
+            }
+        }
+        Err(last_err)
+    }
+
     /// 是否 OpenRouter 或其协议的中转网关:
     /// - base_url 含 openrouter, 或
     /// - 显式配置了 provider=openrouter (中转域名可能不含 "openrouter")
@@ -453,7 +736,12 @@ impl LLMClient {
     ///   1. config.prefix 显式指定 (如 "thu-ai") → 使用该前缀
     ///   2. config.prefix = "auto" 或 OpenRouter 类网关 → 按模型名首段自动猜
     fn model_candidates(&self) -> Vec<String> {
-        let model = self.config.model.trim().to_string();
+        self.candidates_for(&self.config.model)
+    }
+
+    /// 任意模型名的候选列表 (含厂商前缀补全), 供主模型与视觉模型共用
+    fn candidates_for(&self, model: &str) -> Vec<String> {
+        let model = model.trim().to_string();
         if model.is_empty() {
             return Vec::new();
         }
@@ -477,6 +765,16 @@ impl LLMClient {
         out
     }
 
+    /// 截图识别实际使用的模型: vision_model 优先 (须支持图像输入), 未配置时与主模型相同
+    pub fn effective_vision_model(&self) -> &str {
+        self.config
+            .vision_model
+            .as_deref()
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .unwrap_or(&self.config.model)
+    }
+
     /// 发送对话请求 (带 OpenRouter 厂商前缀自动重试), 返回内容与 token 用量
     pub async fn chat(&self, system_prompt: &str, user_message: &str) -> Result<ChatResult, Box<dyn std::error::Error>> {
         let messages = vec![
@@ -486,37 +784,81 @@ impl LLMClient {
         let temperature = self.config.effective_temperature();
         let max_tokens = self.config.effective_max_tokens();
 
-        let mut last_err = String::new();
-        for model in self.model_candidates() {
-            match self.post_once(&model, messages.clone(), temperature, max_tokens).await {
-                Ok(chat_resp) => {
-                    let msg = chat_resp
-                        .choices
-                        .into_iter()
-                        .next()
-                        .map(|c| c.message)
-                        .ok_or("API 返回空响应 (无 choices)")?;
-                    // 思维链模型兼容: content 为空时回退到 reasoning_content
-                    let content = if msg.content.trim().is_empty() {
-                        msg.reasoning_content.unwrap_or_default().trim().to_string()
-                    } else {
-                        msg.content
-                    };
-                    if content.trim().is_empty() {
-                        return Err("API 返回空内容 (content 与 reasoning_content 均为空)".into());
-                    }
-                    return Ok(ChatResult { content, usage: chat_resp.usage });
-                }
-                Err(e) => {
-                    last_err = e.clone();
-                    // 只有模型名不可用类的错误才值得换前缀重试
-                    if !is_model_unavailable_error(&e) {
-                        break;
-                    }
-                }
-            }
-        }
-        Err(last_err.into())
+        let result = self
+            .post_with_model_candidates(|model| {
+                serde_json::to_value(ChatRequest {
+                    model: model.to_string(),
+                    messages: messages.clone(),
+                    temperature,
+                    max_tokens,
+                })
+                .unwrap_or_default()
+            })
+            .await?;
+        Ok(result)
+    }
+
+    /// 发送多模态请求 (文本 + 图像), 用于截图棋盘识别等视觉任务。
+    ///
+    /// `image_data_url` 为 data URL 形式 (`data:image/png;base64,....`),
+    /// 兼容 OpenAI vision 协议 (image_url content part) 及其兼容网关。
+    /// 模型取 effective_vision_model (vision_model 优先, 未配置时与主模型相同),
+    /// 带厂商前缀重试, 语义与 chat 一致。
+    ///
+    /// 注意: 主模型为纯文本模型 (网关报 "content.type 取值范围 ['text']")
+    /// 时不支持图像输入, 由调用方按 is_vision_unsupported_error 识别并引导。
+    pub async fn chat_with_image(
+        &self,
+        system_prompt: &str,
+        user_text: &str,
+        image_data_url: &str,
+    ) -> Result<ChatResult, Box<dyn std::error::Error>> {
+        let temperature = self.config.effective_temperature();
+        let max_tokens = self.config.effective_max_tokens();
+        let candidates = self.candidates_for(self.effective_vision_model());
+
+        let result = self
+            .post_candidates(&candidates, |model| {
+                serde_json::json!({
+                    "model": model,
+                    "messages": [
+                        { "role": "system", "content": system_prompt },
+                        { "role": "user", "content": [
+                            { "type": "text", "text": user_text },
+                            { "type": "image_url", "image_url": { "url": image_data_url } }
+                        ]}
+                    ],
+                    "temperature": temperature,
+                    "max_tokens": max_tokens
+                })
+            })
+            .await?;
+        Ok(result)
+    }
+
+    /// 发送任意多轮消息 (Agent 循环等场景)。
+    ///
+    /// `messages`: [{role: "system"|"user"|"assistant", content: String}, ...]。
+    /// 自动带厂商前缀重试 + 流式 (LLM_STREAM=0 可关), 语义与 chat 一致。
+    pub async fn chat_messages(
+        &self,
+        messages: Vec<serde_json::Value>,
+    ) -> Result<ChatResult, Box<dyn std::error::Error>> {
+        let temperature = self.config.effective_temperature();
+        let max_tokens = self.config.effective_max_tokens();
+        let candidates = self.model_candidates();
+
+        let result = self
+            .post_candidates(&candidates, |model| {
+                serde_json::json!({
+                    "model": model,
+                    "messages": messages,
+                    "temperature": temperature,
+                    "max_tokens": max_tokens
+                })
+            })
+            .await?;
+        Ok(result)
     }
 
     /// 测试连接 — 发送一个最小请求验证 API key / base_url / model 是否可用
@@ -581,6 +923,86 @@ mod tests {
         let c2: LLMConfig = serde_json::from_str(json2).unwrap();
         assert_eq!(c2.effective_max_tokens(), 4096);
         assert_eq!(c2.provider_label(), "custom");
+    }
+
+    #[test]
+    fn test_vision_model_config() {
+        // 旧版配置 (无 vision_model 字段) 反序列化 → None
+        let c: LLMConfig = serde_json::from_str(
+            r#"{"api_key":"k","base_url":"https://x/v1","model":"glm-5"}"#,
+        )
+        .unwrap();
+        assert!(c.vision_model.is_none());
+        assert_eq!(c.model, "glm-5");
+
+        // 视觉模型生效: 未配置时与主模型相同, 配置后优先
+        let client = LLMClient::new(c.clone());
+        assert_eq!(client.effective_vision_model(), "glm-5");
+        assert_eq!(client.candidates_for("glm-5"), vec!["glm-5".to_string()]);
+
+        let c2 = LLMConfig {
+            vision_model: Some("glm-4v".into()),
+            prefix: Some("thu-ai".into()),
+            ..c.clone()
+        };
+        let client2 = LLMClient::new(c2);
+        assert_eq!(client2.effective_vision_model(), "glm-4v");
+        // 视觉模型同样走厂商前缀补全
+        assert_eq!(
+            client2.candidates_for(client2.effective_vision_model()),
+            vec!["glm-4v".to_string(), "thu-ai/glm-4v".to_string()]
+        );
+
+        // vision_model 为空白串 → 视为未配置
+        let c3 = LLMConfig { vision_model: Some("  ".into()), ..c };
+        assert_eq!(LLMClient::new(c3).effective_vision_model(), "glm-5");
+    }
+
+    #[test]
+    fn test_is_vision_unsupported_error() {
+        // 用户实测的清华 Sub2API 报错
+        assert!(is_vision_unsupported_error(
+            "HTTP 400: messages.content.type 参数非法，取值范围 ['text']"
+        ));
+        // OpenAI 风格报错
+        assert!(is_vision_unsupported_error(
+            "Invalid type for 'messages[1].content[1].type': expected one of 'text'"
+        ));
+        assert!(is_vision_unsupported_error("image_url is not allowed"));
+        assert!(is_vision_unsupported_error("该模型不支持图像输入"));
+        // 无关错误不误判
+        assert!(!is_vision_unsupported_error("Insufficient Balance"));
+        assert!(!is_vision_unsupported_error("HTTP 504: Gateway Time-out"));
+        assert!(!is_vision_unsupported_error("Invalid API key"));
+    }
+
+    #[test]
+    fn test_feed_sse_line() {
+        let mut acc = SseAccumulator::default();
+        // 正常内容增量
+        feed_sse_line(r#"data: {"choices":[{"delta":{"content":"你好"}}]}"#, &mut acc);
+        feed_sse_line(r#"data: {"choices":[{"delta":{"content":"，扫雷"}}]}"#, &mut acc);
+        // 思维链增量
+        feed_sse_line(
+            r#"data: {"choices":[{"delta":{"reasoning_content":"先分析数字..."}}]}"#,
+            &mut acc,
+        );
+        // usage (最终 chunk, 需 stream_options.include_usage)
+        feed_sse_line(
+            r#"data: {"choices":[{"delta":{}}],"usage":{"prompt_tokens":100,"completion_tokens":20,"total_tokens":120}}"#,
+            &mut acc,
+        );
+        // 结束标记 / 注释 / 垃圾行 → 忽略
+        feed_sse_line("data: [DONE]", &mut acc);
+        feed_sse_line(": keep-alive", &mut acc);
+        feed_sse_line("event: message", &mut acc);
+        feed_sse_line("data: not-json", &mut acc);
+
+        assert_eq!(acc.content, "你好，扫雷");
+        assert_eq!(acc.reasoning, "先分析数字...");
+        let u = acc.usage.expect("usage parsed");
+        assert_eq!(u.total_tokens, 120);
+        assert_eq!(u.prompt_tokens, 100);
     }
 
     #[test]

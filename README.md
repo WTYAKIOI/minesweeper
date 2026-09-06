@@ -3,6 +3,7 @@
 Rust 推理引擎 + LLM 翻译层 + Web 棋盘编辑器 + OCR 截图识别
 
 - **确定性推理**：约束传播 + 子集规则，输出带完整依赖链的必雷 / 必安全证明
+- **ReAct Agent 循环**：9.2.7 工具调用 + Agent 循环——LLM 逐轮决策调工具（标旗/取证/知识库），Rust 校验执行并回写状态，带步数/超时/费用护栏（见下文 9.2.7 节）
 - **概率引擎**：动态迭代蒙特卡洛模拟，30×30 大棋盘 < 150ms
 - **LLM 输出规范（llm-output.md）**：System Prompt 全模式注入"输出硬性规则 + 输入字段说明"，答案/策略模式按模板输出（确定性结论表、概率参考表、🚩旗帜检查、下一步建议；≤500 字；表格 ≤10 行）；用户提问时按模板 D（直接原因/思考引导）或"模板+回答用户提问"作答。旗帜存在矛盾/未确认时，prompt 与用户消息均显式警告"概率可能出错"，并说明 0% 概率格的语义（未邻数字且为 0 → 总雷数已被其他区域确认）
 - **LLM 转译**：答案 / 教学 / 策略三种模式，把推理 IR 翻译成人类语言（含坐标幻觉检测）
@@ -261,6 +262,51 @@ PlayerView (棋盘) → Rust 推理引擎 → InferenceIR (JSON)
 
 **数据防火墙**：传给 LLM 的信息绝不包含未翻开格子的真实雷藏。所有概率均为数学推断，非事后诸葛亮。LLM 输出经过坐标幻觉检测，引用不存在坐标时会被标记。
 
+### ReAct Agent 循环（improve.md 落地：从"翻译器"到"操作器"）
+
+**该循环不是独立模式，而是「分析局面」的内置推理方式**：答案模式下勾选「调用 LLM」再点「⚡ 分析局面」时，后端自动进入 Agent 循环——LLM 不接收完整 IR，而是通过与**本地推理库**（工具）逐轮交互理解局面、核实结论，最后产出一段简洁自然的讲解。LLM 只负责推理与表达；参数校验、约束查询、必雷判定等一切事实均来自 Rust 本地引擎。
+
+#### 9.2.7.1 工具调用（Tool Call）
+
+- **协议**：模型每轮只输出一个 JSON——`{"action":"tool","name":"flag_cell","args":{"x":28,"y":12},"reason":"…≤30字"}` 或 `{"action":"final","answer":"…"}`。纯文本 JSON 协议兼容任意 OpenAI 兼容网关，无需原生 function calling。
+- **工具集（Rust 执行）** `src/agent/tools.rs`：
+
+| 工具 | 作用 | 校验规则 |
+|------|------|----------|
+| `analyze_board()` | 全量推理摘要（必雷未标旗 / 必安全 / 矛盾旗 / 概率） | — |
+| `flag_cell(x,y)` | 给引擎证明的必雷格标旗 | 越界 / 已翻开 / 已标旗 / **未证明必雷** → 拒绝并附概率 |
+| `check_safe(x,y)` | 查询某格必雷/必安全/概率及证据 | 越界 → 拒绝 |
+| `explain_cell(x,y)` | **可验证推理素材**：引擎判定 + 相关数字局部约束表（旗数/剩余需雷/候选格清单）；矛盾旗额外给出"保留旗 vs 撤旗"对照行 | 越界 → 拒绝；同格只查一次 |
+| `verify_flag(x,y)` | 旗帜验证（确认/矛盾/未确认） | 非旗格 → 拒绝 |
+| `get_constraints(x,y)` | 目标格周围数字约束详情 | 越界 → 拒绝 |
+| `list_regions()` | 连通区域概要 | — |
+| `get_knowledge(topic)` | 扫雷知识库（1-2-1 / 1-2-2-1 / 子集 / 组合枚举 / 剩余雷数规则…） | — |
+
+- **诚实性原则**：本系统只有玩家视角（无真实雷藏），故**不做"模拟点击翻开"类造假工具**；`flag_cell` 只对"引擎已形式化证明必雷"的格生效（Rust 侧二次校验），工具被拒后观察结果以"错误:"开头回写，模型据此修正。
+- 知识库（"知道什么"）与工具（"能做什么"）分离：模式库 `KNOWLEDGE_BASE` 只返回资料供模型引用，推理一律由引擎工具完成；Skills（"应该怎么做"）固化在系统提示词的工作流程与输出纪律中；MCP 服务器可在后续按统一协议扩展更多外部工具/数据源。
+
+#### 9.2.7.2 Agent 循环（Agent Loop）
+
+- **状态机** `src/agent/loop_.rs`：工作棋盘 `AgentBoard`（模型标旗后真实更新）→ 每轮组消息（system + 历史 ≤6 对 + 当前摘要）→ LLM 决策 → `parse_decision` 解析 → `execute_tool` 校验执行 → 观察结果写回历史 → 下一轮，直到 `final`。
+- **任务状态记忆**：`AgentStep{step, reason, reply, action, observation}` 时间线随响应返回，前端聊天区逐步渲染（💭 理由 → 🛠 工具 → ↳ 观察），并展示"思维链"；成功后棋盘回写前端（用户可核对新增旗帜）。
+- **安全护栏**（必须满足，否则停止）：
+
+| 护栏 | 实现 |
+|------|------|
+| 最大步数 | `AGENT_MAX_STEPS`（默认 8，硬上限 15，请求体可传 ≤15） |
+| 取消机制 | HTTP 断开（前端 AbortController）→ axum 丢弃 handler → 循环在下一个 await 中止 |
+| 超时 | 每次 LLM 调用受 `LLM_TIMEOUT_SECS`（默认 120s）约束；循环整体时间预算 180s → `reason=timeout` |
+| 费用上限 | 每轮调用前检查月度 token 限额（`LLM_MONTHLY_TOKEN_LIMIT`），超限 → `reason=budget`；每次用量即时记录进统计 |
+
+- **结束原因**：`final`（模型给出最终建议）/ `max_steps` / `timeout` / `budget` / `llm_error`；`max_steps`/`timeout`/`budget` 均回退到本地推理摘要兜底。
+- **分析集成**：`POST /api/analyze`（mode=answer & use_llm）内部自动运行 `run_analysis_agent`（`src/agent/loop_.rs`），无需单独按钮；教学/策略模式保持单轮转译（教学不得提前给结论）。Agent 对已证明必雷格的成功标旗会写回工作棋盘并重算 IR 展示。
+- **给玩家的最终回答规范**（模型 System Prompt 强制 + Rust 侧压缩兜底）：像资深玩家讲解——有确定性结论时输出**可验证的分步推理链**（`第 1 步/第 2 步…`，2-5 步，每步写出具体数字的"旗数/剩余需雷/候选格"并逐格排除，如"2 雷 5 格 → 两个 1 雷对 → 某格必安全"），末尾一行「最终结论: (x,y) 是雷/不是雷」；≤600 字。**严禁"联动排除/结合周边约束"等省略推导的黑话**，每步数字必须与 `explain_cell` 返回的局部约束表一致。超长触发"压缩重写"（只喂前 1500 字防回流）；Rust 侧再净化与截断（保留结论行）。
+- **结论分级（把已知条件当已知）**：已标旗且通过验证的雷只出现在摘要计数（"N 面旗已核实"），**不逐条列出、不再次取证**；只有"必雷未标旗 / 必安全未翻开 / 矛盾旗"才算新发现并逐条限量（≤5）输出；analyze_board 无新结论时明确写"本次无新增确定性结论"并转入策略模板（区域/概率 Top 格 → 决策建议）。
+- **Agent 防空转与去重**：`analyze_board` 只在棋盘变化（标旗/编辑）后可再次调用，重复调用被拒绝；同一指纹下对同格的 `verify_flag / get_constraints / check_safe` 重复查询被拒绝——循环步数全部花在有效推进上。
+- **用量与耗时回显**：每次 LLM 分析后对话区显示 `📊 消耗 N tokens (输入/输出) · ⏱️ 用时 Ns`；网关未返回 usage 时按消息长度估算（仅展示，不入统计库）。
+- **自主 ReAct 问答（`POST /api/chat`）**：对话区提问（非教学 + 调用 LLM）走 `/api/chat`——不再按坐标硬路由；LLM 自行决定查询哪些工具（细粒度只读工具：`get_cell_info(x,y)` / `get_probability(x,y)` / `get_local_board(x,y,radius)` / `explain_cell` / `analyze_board` / `list_regions` / `get_knowledge`…）、何时停止并直接回答；回答先答问题再给依据，单格判定以「最终结论」行收尾，≤400 字。问答不改棋盘（flag_cell 禁用），步数上限 `AGENT_QA_STEPS`（默认 6）。
+- **典型轨迹**：`analyze_board()` → 观察"必雷未标旗: (28,12)…" → `flag_cell(28,12)` 成功（剩余雷 -1）→ `get_knowledge("subset")` → `final`: "已标完可证雷格，建议点击 (29,13)…"
+
 ## 架构
 
 ```
@@ -295,6 +341,7 @@ PlayerView (棋盘) → Rust 推理引擎 → InferenceIR (JSON)
 | 棋盘编辑状态机（左键循环/插旗/清零） | `src/agent/core.rs` `apply_board_op` | `POST /api/board/op` |
 | 文本棋盘解析 + 剩余雷数推断 | `src/agent/core.rs` `parse_text_board` / `infer_mines_for_size` | `POST /api/board/parse` |
 | Markdown 报告构建 | `src/agent/core.rs` `render_markdown_report` | `POST /api/export` |
+| **ReAct Agent 循环（工具调用）** | `src/agent/loop_.rs` + `src/agent/tools.rs` | `POST /api/agent/run`、`GET /api/agent/status` |
 | LLM 配置/模型列表/用量统计编排 | `src/llm` + `src/server/routes.rs` | `/api/llm/*`、`/api/usage/*` |
 | OCR 识别编排 | OCR 微服务 + `routes.rs` 代理 | `POST /api/ocr` |
 

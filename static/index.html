@@ -737,6 +737,11 @@
                         </div>
                         <div class="llm-hint" id="llmModelHint" style="margin:-4px 0 0 80px;">模型名填网关可用的模型标识即可; 若使用中转/OpenRouter 网关, 需带厂商前缀 (如 openai/gpt-4o-mini)。</div>
                         <div class="llm-row">
+                            <label>视觉模型</label>
+                            <input type="text" id="llmVisionModel" placeholder="留空=同「模型名称」; 须支持图像 (glm-4v / gpt-4o 等)"
+                                title="仅「🤖 LLM 识别」截图识别使用, 须支持图像输入 (如 glm-4v / gpt-4o / qwen-vl); 主模型可保持纯文本 (如 glm-5)">
+                        </div>
+                        <div class="llm-row">
                             <label>API Key</label>
                             <input type="password" id="llmApiKey" placeholder="sk-... (仅保存在内存中)">
                             <button class="secondary small eye-btn" onclick="toggleKeyVisibility()" title="显示/隐藏">👁️</button>
@@ -769,6 +774,9 @@
                 </div>
                 <div class="controls-row">
                     <button class="secondary small" onclick="document.getElementById('imageInput').click()">📷 上传截图</button>
+                    <label style="display:flex;align-items:center;gap:4px;cursor:help" title="用多模态 LLM 识别截图 (自适应任意行列数, 不限 16×30)。需在 API 配置中把「视觉模型」设为支持图像的模型 (如 glm-4v / gpt-4o / qwen-vl), 主模型可保持纯文本。失败自动回退本地 OCR。">
+                        <input type="checkbox" id="useLLMOcr"> 🤖 LLM 识别
+                    </label>
                     <span class="ocr-status wait" id="ocrStatus"></span>
                     <input type="file" id="imageInput" accept="image/*">
                 </div>
@@ -796,6 +804,18 @@
                         </select>
                     </label>
                     <label><input type="checkbox" id="useLLM"> 调用 LLM</label>
+                </div>
+                <div class="controls-row" style="gap:6px;flex-wrap:wrap;">
+                    <span class="sub">🗑 删除行/列 (0 基, 点击格子自动带入其行列号):</span>
+                    <label style="display:flex;align-items:center;gap:2px;">行
+                        <input type="number" id="delRowInput" value="0" min="0" style="width:54px" title="要删除的行号 y (0 基)">
+                    </label>
+                    <button class="secondary small" onclick="deleteBoardLine('row')">删除该行</button>
+                    <label style="display:flex;align-items:center;gap:2px;margin-left:6px;">列
+                        <input type="number" id="delColInput" value="0" min="0" style="width:54px" title="要删除的列号 x (0 基)">
+                    </label>
+                    <button class="secondary small" onclick="deleteBoardLine('col')">删除该列</button>
+                    <span class="ocr-status wait" id="delStatus"></span>
                 </div>
                 <div class="board-wrap">
                     <canvas id="boardCanvas" width="450" height="450"></canvas>
@@ -842,6 +862,13 @@
                     <div class="card-title" style="font-size:14px;"><span>待定格雷概率（由低到高）</span></div>
                     <div class="prob-list" id="probList"></div>
                 </div>
+                <div id="reasonSection" class="hidden" style="margin-top:14px;">
+                    <div class="card-title" style="font-size:14px;">
+                        <span>🧠 推理链</span>
+                        <span class="sub">点击步骤 → 棋盘高亮对应坐标</span>
+                    </div>
+                    <ol id="reasonList" style="margin:4px 0 0;padding-left:22px;font-size:13px;line-height:1.9;"></ol>
+                </div>
                 <div id="analysisSection" class="hidden" style="margin-top:14px;">
                     <div class="card-title" style="font-size:14px;">
                         <span>解读</span>
@@ -861,13 +888,13 @@
             <div id="chatLog"></div>
             <div class="chat-input-row">
                 <textarea id="chatInput" rows="3"
-                    placeholder="在此粘贴截图（Ctrl+V / Cmd+V）或文本棋盘（? F 0-8），也可以输入提问..."></textarea>
+                    placeholder="在此粘贴截图 / 文本棋盘，或输入提问。指令: @why (28,12) 推导某格 · @check (28,12) 验证旗帜 · @region 分区分析 · @teach 苏格拉底教学"></textarea>
                 <button onclick="sendChat()">发送</button>
             </div>
             <div class="paste-badge">
                 <kbd>Enter</kbd> 发送 · <kbd>Shift+Enter</kbd> 换行 · 粘贴图像自动 OCR · 粘贴文本棋盘自动载入
             </div>
-            <div class="loading-tip" id="loadingTip"><span class="spinner"></span>正在分析局面，推理与蒙特卡洛模拟运行中...</div>
+            <div class="loading-tip" id="loadingTip"><span class="spinner"></span>正在分析局面：本地推理 + LLM Agent 循环运行中，通常需 10~60 秒，请稍候…</div>
         </div>
 
         <!-- ============ 操作栏 ============ -->
@@ -952,7 +979,9 @@
             <h3>🧠 使用帮助</h3>
             <h4>三种输入方式</h4>
             <ul>
+                <li><b>指令</b>：对话区输入 <code>@why (x,y)</code> 推导某格雷/安全、<code>@check (x,y)</code> 验证旗帜、<code>@region</code> 分区分析、<code>@teach</code> 苏格拉底教学、<code>@analyze</code> 全局分析（需勾选「调用 LLM」）</li>
                 <li><b>粘贴（推荐）</b>：在下方对话框按 <kbd>Ctrl+V</kbd> / <kbd>Cmd+V</kbd>，截图自动 OCR 识别，文本棋盘自动解析</li>
+                <li><b>LLM 识别</b>：勾选「🤖 LLM 识别」后粘贴/上传截图，由多模态 LLM 识别棋盘（自适应任意行列数，不限 16×30）。识别用模型在 API 配置的「视觉模型」中单独设置（如 glm-4v / gpt-4o / qwen-vl，主模型不受影响）；失败自动回退本地 OCR</li>
                 <li><b>手动编辑</b>：点击棋盘格修改状态；<b>上传截图</b>按钮选择图片文件识别</li>
                 <li><b>加载示例</b>：下拉菜单快速载入经典残局</li>
             </ul>
@@ -1033,6 +1062,7 @@
         function applyConfigToForm(p) {
             document.getElementById('llmBaseUrl').value = p.base_url || '';
             document.getElementById('llmModel').value = p.model || '';
+            document.getElementById('llmVisionModel').value = p.vision_model || '';
             document.getElementById('llmMaxTokens').value = p.max_tokens || 4096;
             document.getElementById('llmTemperature').value = p.temperature != null ? p.temperature : 0.3;
             document.getElementById('llmPrefix').value = p.prefix || '';
@@ -1080,6 +1110,7 @@
             }
             llmKey = cfg.api_key;  // 仅内存
             llmPersisted = { provider: cfg.provider, base_url: cfg.base_url, model: cfg.model,
+                             vision_model: cfg.vision_model || '',
                              max_tokens: cfg.max_tokens, temperature: cfg.temperature,
                              prefix: readPrefix() };
             localStorage.setItem('ms-llm-config', JSON.stringify(llmPersisted));
@@ -1110,6 +1141,7 @@
                 api_key: document.getElementById('llmApiKey').value.trim(),
                 base_url: document.getElementById('llmBaseUrl').value.trim(),
                 model: document.getElementById('llmModel').value.trim(),
+                vision_model: document.getElementById('llmVisionModel').value.trim(),
                 provider: detectProviderLabel(),
                 max_tokens: parseInt(document.getElementById('llmMaxTokens').value, 10) || 4096,
                 temperature: parseFloat(document.getElementById('llmTemperature').value),
@@ -1181,6 +1213,7 @@
                 api_key: llmKey || '',
                 base_url: base.base_url,
                 model: base.model,
+                vision_model: base.vision_model || null,
                 provider: base.provider,
                 max_tokens: base.max_tokens,
                 temperature: base.temperature,
@@ -1827,13 +1860,24 @@
            仅当后端不可达(离线)时回退到本地镜像, 保证 UI 可用。 */
         function localBoardOp(x, y, op) {
             const out = board.map(r => r.slice());
-            const cur = out[y][x];
+            const cur = out[y] ? out[y][x] : undefined;
+            if (op === 'del_row') {
+                if (y < 0 || y >= out.length) return out;
+                out.splice(y, 1);
+                return out;
+            }
+            if (op === 'del_col') {
+                if (!out.length || x < 0 || x >= out[0].length) return out;
+                for (const row of out) row.splice(x, 1);
+                return out;
+            }
             if (op === 'flag') {
                 out[y][x] = cur === -2 ? -1 : cur === -1 ? -2 : cur;
             } else if (op === 'clear') {
                 out[y][x] = 0;
             } else {
                 if (cur === -1 || cur === -2) out[y][x] = 1;
+                else if (cur === 0) out[y][x] = 1;          // 空白 → 数字 1
                 else if (cur >= 1 && cur < 8) out[y][x] = cur + 1;
                 else if (cur === 8) out[y][x] = -1;
             }
@@ -1848,7 +1892,12 @@
                     body: JSON.stringify({ board, x, y, op })
                 });
                 const data = await resp.json();
-                if (data.success && Array.isArray(data.board) && data.board.length === board.length) {
+                // 删除行列会改变行数/列数, 不能再用"行数相等"判定
+                const shapeOk = Array.isArray(data.board)
+                    && (op === 'del_row' || op === 'del_col'
+                        || (data.board.length === board.length
+                            && (!board.length || data.board[0].length === board[0].length)));
+                if (data.success && shapeOk) {
                     board = data.board;
                     return true;
                 }
@@ -1879,6 +1928,7 @@
 
         // 统一入口: 校验锁 → (Rust 裁决) 编辑 → 清除分析 → 重绘
         async function performBoardEdit(c, opLabel) {
+            setDelInputs(c);
             const allow = await requestEditUnlock();
             if (!allow) return;
             if (!(await serverBoardOp(c.x, c.y, opLabel))) {
@@ -1887,6 +1937,54 @@
             clearAnalysis();
             drawBoard();
             updateMeta();
+        }
+
+        /* ============ 删除行/列 ============ */
+        function setDelInputs(c) {
+            if (!c) return;
+            const rI = document.getElementById('delRowInput');
+            const cI = document.getElementById('delColInput');
+            if (rI && board.length) rI.value = Math.min(c.y, board.length - 1);
+            if (cI && board.length && board[0].length) cI.value = Math.min(c.x, board[0].length - 1);
+        }
+
+        function setDelStatus(cls, text) {
+            const el = document.getElementById('delStatus');
+            if (!el) return;
+            el.className = 'ocr-status ' + cls;
+            el.textContent = text;
+        }
+
+        // 删除整行/整列 (Rust 裁决; 离线镜像兜底)。坐标: 行=y, 列=x (0 基)
+        async function deleteBoardLine(kind) {
+            if (!board.length || !board[0].length) {
+                setDelStatus('err', '棋盘为空, 无可删除');
+                return;
+            }
+            const y = parseInt(document.getElementById('delRowInput').value, 10) || 0;
+            const x = parseInt(document.getElementById('delColInput').value, 10) || 0;
+            if (kind === 'row' && (y < 0 || y >= board.length)) {
+                setDelStatus('err', `行号越界 (0~${board.length - 1})`);
+                return;
+            }
+            if (kind === 'col' && (x < 0 || x >= board[0].length)) {
+                setDelStatus('err', `列号越界 (0~${board[0].length - 1})`);
+                return;
+            }
+            const op = kind === 'row' ? 'del_row' : 'del_col';
+            if (!(await serverBoardOp(x, y, op))) {
+                board = localBoardOp(x, y, op);             // 离线镜像
+            }
+            // 删除后修正输入框范围
+            const nr = board.length ? board.length : 0;
+            const nc = board.length && board[0].length ? board[0].length : 0;
+            document.getElementById('delRowInput').value = nr ? Math.min(y, nr - 1) : 0;
+            document.getElementById('delColInput').value = nc ? Math.min(x, nc - 1) : 0;
+            setDelStatus('ok', nr && nc ? `已删除${kind === 'row' ? '行' : '列'} → 当前 ${nr}×${nc}` : '已全部删除');
+            clearAnalysis();
+            drawBoard();
+            updateMeta();
+            if (!board.length) { resetResultPanel(); }
         }
 
         canvas.addEventListener('click', (e) => {
@@ -1951,6 +2049,21 @@
             ocrBusy = true;
             setOcrStatus('wait', '识别中...');
             addChat('system', `🖼️ 正在识别截图 ${file.name || '(剪贴板)'} ...`);
+            try {
+                // LLM 识别开启时优先走多模态 LLM, 失败自动回退本地 OCR
+                if (document.getElementById('useLLMOcr').checked) {
+                    const ok = await runLLMOcr(file);
+                    if (ok) return;
+                    addChat('system', '↩️ LLM 识别未成功, 自动回退本地 OCR...');
+                    setOcrStatus('wait', '本地 OCR 中...');
+                }
+                await runLocalOcr(file);
+            } finally {
+                ocrBusy = false;
+            }
+        }
+
+        async function runLocalOcr(file) {
             const b64 = await fileToBase64(file);
             try {
                 const resp = await fetch('/api/ocr', {
@@ -1970,9 +2083,66 @@
             } catch (e) {
                 setOcrStatus('err', 'OCR 不可用');
                 addChat('system', `❌ OCR 识别失败: ${e.message}\n请确认 OCR 微服务已启动（默认端口 5001），或改用手动编辑棋盘。`);
-            } finally {
-                ocrBusy = false;
             }
+        }
+
+        /* LLM 视觉识别: 前端压缩到最长边 1024px (省 token) → /api/llm/ocr → 校验后的棋盘 */
+        async function runLLMOcr(file) {
+            let b64;
+            try {
+                b64 = await downscaleToBase64(file, 1024);
+            } catch (e) {
+                addChat('system', `⚠️ 图片压缩失败 (${e.message}), 改用原图发送。`);
+                b64 = await fileToBase64(file);
+            }
+            const body = { image: b64 };
+            const cfg = getLLMConfigForRequest();
+            if (cfg) body.llm_config = cfg;
+            try {
+                const resp = await fetch('/api/llm/ocr', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body)
+                });
+                if (!resp.ok) throw new Error((await resp.text()) || resp.status);
+                const data = await resp.json();
+                if (data.success && data.board && data.board.length) {
+                    loadBoard(data.board, data.remaining_mines);
+                    setOcrStatus('ok', `🤖 LLM 已识别 ${data.board.length}×${data.board[0].length}`);
+                    addChat('system', `✅ LLM 已识别 ${data.board.length}×${data.board[0].length} 棋盘并载入，请核对后点击「分析局面」。`);
+                    return true;
+                }
+                addChat('system', `⚠️ ${data.error || 'LLM 识别失败 (未知错误)'}`);
+                return false;
+            } catch (e) {
+                addChat('system', `⚠️ LLM 识别请求异常: ${e.message}`);
+                return false;
+            }
+        }
+
+        // 图片等比压缩到最长边 maxEdge, 重编码为 PNG base64
+        function downscaleToBase64(file, maxEdge) {
+            return new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = () => {
+                    const img = new Image();
+                    img.onload = () => {
+                        try {
+                            const scale = Math.min(1, maxEdge / Math.max(img.width, img.height));
+                            const w = Math.max(1, Math.round(img.width * scale));
+                            const h = Math.max(1, Math.round(img.height * scale));
+                            const cv = document.createElement('canvas');
+                            cv.width = w; cv.height = h;
+                            cv.getContext('2d').drawImage(img, 0, 0, w, h);
+                            resolve(cv.toDataURL('image/png').split(',')[1]);
+                        } catch (e) { reject(e); }
+                    };
+                    img.onerror = () => reject(new Error('图片解码失败'));
+                    img.src = reader.result;
+                };
+                reader.onerror = () => reject(new Error('图片读取失败'));
+                reader.readAsDataURL(file);
+            });
         }
 
         function setOcrStatus(cls, text) {
@@ -2080,8 +2250,51 @@
             // 避免"没开教学却收到引导问题" (teachmod2.md)。
             let mode = document.getElementById('mode').value;
             if (teachingMode) mode = 'teaching';
+            // 非教学 + 勾选 LLM → 自主 ReAct 问答 (/api/chat): LLM 自行决定查哪些工具、直接回答问题
+            if (mode !== 'teaching' && document.getElementById('useLLM').checked) {
+                addChat('system', '🤖 Agent 正在结合局面自主查证并回答…');
+                await askLLMQuestion(text);
+                return;
+            }
             addChat('system', `🔎 结合当前局面（${mode === 'teaching' ? '教学' : mode === 'strategy' ? '策略' : '答案'}模式）分析你的问题…`);
             await runAnalyze({ silent: true, mode, question: text });
+        }
+
+        /* 自主 ReAct 问答: POST /api/chat */
+        async function askLLMQuestion(text) {
+            const cfg = getLLMConfigForRequest();
+            if (!cfg) {                                       // 无 LLM 配置 → 回落本地分析路径
+                addChat('system', '⚠️ 未配置 LLM, 改用本地分析回答该问题。');
+                await runAnalyze({ silent: true, mode: document.getElementById('mode').value, question: text });
+                return;
+            }
+            const t0 = performance.now();
+            setLoading(true);
+            try {
+                const resp = await fetch('/api/chat', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        board,
+                        remaining_mines: parseInt(document.getElementById('mineCount').value, 10) || 0,
+                        question: text,
+                        language: document.getElementById('lang') ? document.getElementById('lang').value : 'zh',
+                        llm_config: cfg
+                    })
+                });
+                const data = await resp.json();
+                if (!resp.ok || !data.success) throw new Error(data.error || (await resp.text()) || resp.status);
+                addChat('assistant', '【Agent 回答】\n' + data.answer, { copyText: data.answer });
+                if (data.usage && data.usage.total_tokens) {
+                    const dt = ((performance.now() - t0) / 1000).toFixed(1);
+                    addChat('system', `📊 本次问答消耗 ${data.usage.total_tokens} tokens (输入 ${data.usage.prompt_tokens} / 输出 ${data.usage.completion_tokens}) · ⏱️ 用时 ${dt}s · 共 ${data.steps || 0} 步工具交互`);
+                    loadUsageStats(true);
+                }
+            } catch (e) {
+                addChat('system', '❌ Agent 问答失败: ' + e.message + '\n(可改用「分析局面」走完整分析。)');
+            } finally {
+                setLoading(false);
+            }
         }
 
         /* ==================== 分析 ==================== */
@@ -2108,6 +2321,7 @@
             document.getElementById('stats').innerHTML = '<div class="empty-tip" id="resultEmpty">分析后此处将展示必雷 / 必安全格与推理链</div>';
             document.getElementById('proofSection').classList.add('hidden');
             document.getElementById('probSection').classList.add('hidden');
+            document.getElementById('reasonSection').classList.add('hidden');
             document.getElementById('analysisSection').classList.add('hidden');
             document.getElementById('flagSection').classList.add('hidden');
             const warnEl0 = document.getElementById('flagWarn');
@@ -2119,6 +2333,7 @@
                 addChat('system', '请先录入或粘贴一个棋盘。');
                 return;
             }
+            const t0 = performance.now();
             const silent = !!opts.silent;
             if (!silent) setLoading(true);
             const useLLM = document.getElementById('useLLM').checked;
@@ -2154,10 +2369,14 @@
                 if (silent) {
                     addChat('system', '【分析结果】\n' + data.analysis, { copyText: data.analysis });
                 }
-                // LLM 用量即时上报 (底部状态栏 / 统计面板)
-                if (data.usage && data.usage.total_tokens) {
-                    addChat('system', `📊 本次 LLM 调用消耗 ${data.usage.total_tokens} tokens (输入 ${data.usage.prompt_tokens} / 输出 ${data.usage.completion_tokens})。`);
+                // LLM 用量 + 耗时即时上报 (用量后端已保证返回: 网关缺失时按长度估算)
+                if (data.used_llm && data.usage && data.usage.total_tokens) {
+                    const dt = ((performance.now() - t0) / 1000).toFixed(1);
+                    addChat('system', `📊 本次 LLM 分析消耗 ${data.usage.total_tokens} tokens (输入 ${data.usage.prompt_tokens} / 输出 ${data.usage.completion_tokens}) · ⏱️ 用时 ${dt}s`);
                     loadUsageStats(true);
+                } else if (!useLLM) {
+                    const dt = ((performance.now() - t0) / 1000).toFixed(1);
+                    addChat('system', `⚡ 本地推理完成 · ⏱️ 用时 ${dt}s`);
                 }
             } catch (e) {
                 addChat('system', '❌ 分析失败: ' + e.message);
@@ -2239,6 +2458,28 @@
                 ? probs.map(p => `<span class="prob-chip ${p.mine_probability < 0.3 ? 'low' : ''}">(${p.coord.x},${p.coord.y}) <b>${(p.mine_probability * 100).toFixed(0)}%</b></span>`).join('')
                 : '<span class="sub">无待定格（全部已由确定性推理覆盖）</span>';
             document.getElementById('probSection').classList.remove('hidden');
+
+            // 推理链步骤 (来自 LLM 回答提取; 点击步骤 → 棋盘高亮对应坐标)
+            const rsSec = document.getElementById('reasonSection');
+            const rsList = document.getElementById('reasonList');
+            rsList.innerHTML = '';
+            const steps = data.reasoning_steps || [];
+            if (steps.length) {
+                steps.forEach(s => {
+                    const li = document.createElement('li');
+                    li.textContent = s.text;
+                    li.title = '点击高亮: ' + s.coords.map(c => `(${c.x},${c.y})`).join(' ');
+                    li.style.cursor = 'pointer';
+                    li.onclick = () => {
+                        highlightedStep = s.coords;
+                        drawBoard();
+                    };
+                    rsList.appendChild(li);
+                });
+                rsSec.classList.remove('hidden');
+            } else {
+                rsSec.classList.add('hidden');
+            }
 
             // 解读文本
             document.getElementById('analysisText').textContent = data.analysis;

@@ -11,12 +11,16 @@ const MIN_ROWS: usize = 2;
 /// 编辑操作 (前端棋盘点击语义的 Rust 唯一实现)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BoardOp {
-    /// 左键: 未知/旗帜 → 1; 数字 1..7 递增; 8 → 回到未知
+    /// 左键: 未知/旗帜 → 1; 空白0 → 1; 数字 1..7 递增; 8 → 回到未知
     LeftCycle,
     /// 右键: 旗帜 ↔ 未知
     ToggleFlag,
     /// Shift+左键: 清除为已翻开 0
     ClearToZero,
+    /// 删除第 y 行 (0 基); 越界返回原棋盘
+    DeleteRow,
+    /// 删除第 x 列 (0 基); 越界返回原棋盘
+    DeleteCol,
 }
 
 /// 文本棋盘解析错误
@@ -121,11 +125,28 @@ pub fn apply_board_op(board: &[Vec<i32>], x: usize, y: usize, op: BoardOp) -> Ve
             v => v, // 已翻开数字格不能插旗
         },
         BoardOp::ClearToZero => 0,
+        BoardOp::DeleteRow => {
+            if y >= out.len() {
+                return out; // 越界: 原样返回
+            }
+            out.remove(y);
+            return out;
+        }
+        BoardOp::DeleteCol => {
+            if out.is_empty() || x >= out[0].len() {
+                return out; // 越界: 原样返回
+            }
+            for row in out.iter_mut() {
+                row.remove(x);
+            }
+            return out;
+        }
         BoardOp::LeftCycle => match cur {
-            -1 | -2 => 1,      // 未知/旗帜 → 数字 1
+            -1 | -2 => 1,            // 未知/旗帜 → 数字 1
+            0 => 1,                  // 空白(已翻开0) → 数字 1 (可继续递增编辑)
             v if (1..=7).contains(&v) => v + 1,
-            8 => -1,           // 8 → 回到未知
-            v => v,            // 0 不变 (已翻开空格)
+            8 => -1,                 // 8 → 回到未知
+            v => v,                  // 兜底: 其他值保持不变
         },
     };
     out[y][x] = next;
@@ -289,8 +310,10 @@ mod tests {
         assert_eq!(b[0][2], 2);
         let b = apply_board_op(&b, 3, 0, BoardOp::LeftCycle); // 8→未知
         assert_eq!(b[0][3], -1);
-        let b = apply_board_op(&b, 4, 0, BoardOp::LeftCycle); // 0 不变
-        assert_eq!(b[0][4], 0);
+        let b = apply_board_op(&b, 4, 0, BoardOp::LeftCycle); // 空白 0 → 数字 1 (bug 修复)
+        assert_eq!(b[0][4], 1);
+        let b = apply_board_op(&b, 4, 0, BoardOp::LeftCycle); // 1→2
+        assert_eq!(b[0][4], 2);
         let b = apply_board_op(&b, 5, 0, BoardOp::LeftCycle); // 7→8
         assert_eq!(b[0][5], 8);
     }
@@ -308,6 +331,23 @@ mod tests {
         assert_eq!(b[0][2], 0);
         // 越界幂等
         assert_eq!(apply_board_op(&b, 99, 99, BoardOp::LeftCycle), b);
+    }
+
+    #[test]
+    fn test_delete_row_col_ops() {
+        let b = vec![vec![1, 2, 3], vec![4, 5, 6], vec![7, 8, 9]];
+        // 删除第 1 行 (y=1)
+        let r = apply_board_op(&b, 0, 1, BoardOp::DeleteRow);
+        assert_eq!(r, vec![vec![1, 2, 3], vec![7, 8, 9]]);
+        // 删除第 0 列 (x=0)
+        let c = apply_board_op(&b, 0, 0, BoardOp::DeleteCol);
+        assert_eq!(c, vec![vec![2, 3], vec![5, 6], vec![8, 9]]);
+        // 越界: 返回原棋盘
+        assert_eq!(apply_board_op(&b, 0, 5, BoardOp::DeleteRow), b);
+        assert_eq!(apply_board_op(&b, 5, 0, BoardOp::DeleteCol), b);
+        // 删除唯一一行 → 空 (不崩溃)
+        let single = vec![vec![1, 2]];
+        assert!(apply_board_op(&single, 0, 0, BoardOp::DeleteRow).is_empty());
     }
 
     #[test]
