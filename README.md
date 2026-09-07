@@ -22,6 +22,14 @@ docker compose up
 
 打开 http://localhost:8080 即可使用，无需安装 Rust / Python / OpenCV。
 
+> **自定义端口**：8080 被占用时可通过环境变量覆盖宿主机端口（容器内仍是 8080，无需改配置）：
+>
+> ```bash
+> PORT=8081 docker compose up -d
+> ```
+>
+> 不传 `PORT` 时默认 8080。
+
 <details>
 <summary>启用 LLM（可选，两种方式）</summary>
 

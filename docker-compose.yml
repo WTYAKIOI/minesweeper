@@ -8,7 +8,8 @@ services:
   app:
     build: .
     ports:
-      - "8080:8080"
+      # 宿主机端口可通过环境变量覆盖: PORT=8081 docker compose up -d (默认 8080)
+      - "${PORT:-8080}:8080"
     environment:
       - OCR_URL=http://ocr:5001
       # LLM HTTP 超时 (秒, 默认 120; 网关/思维链模型慢可调大, 如 300)
