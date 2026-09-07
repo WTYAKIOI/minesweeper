@@ -5,10 +5,10 @@ OCR 数字识别测试 — 验证各数字 (1-8) 的识别准确率。
 参考:
   - minesweeper_solver: 颜色匹配 + Tesseract 回退
   - Metasweeper/ms_toollib: OBR + 颜色 LUT
-  - AGENT4.md: 三层回退链 (颜色 → 模板 → Tesseract)
+  - TEST/AGENT4.md: 三层回退链 (颜色 → 模板 → Tesseract)
 
 用法:
-  python3 tests/test_ocr.py           # 测试 inuput/ 下所有图片
+  python3 tests/test_ocr.py           # 测试 TEST/inuput/ 下所有图片
   python3 tests/test_ocr.py 1.png     # 测试单张图片
 """
 import os
@@ -19,7 +19,7 @@ import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'ocr'))
 import app as ocr_app
 
-IN_DIR = os.path.join(os.path.dirname(__file__), '..', 'inuput')
+IN_DIR = os.path.join(os.path.dirname(__file__), '..', 'TEST', 'inuput')
 
 
 def load_image(path):
@@ -166,7 +166,7 @@ def _board_legality_violations(board):
 
 
 def test_all_input_boards_legal():
-    """trans-app-ocr.md P2: 规则后验校验。所有 inuput 截图识别出的棋盘
+    """trans-app-ocr.md P2: 规则后验校验。所有 TEST/inuput 截图识别出的棋盘
     必须满足扫雷基本约束 (无大量不合法旗帜/数字)。"""
     files = [f for f in sorted(os.listdir(IN_DIR))
              if f.lower().endswith(('.png', '.jpg', '.jpeg', '.webp'))]
@@ -253,7 +253,7 @@ def test_extra_boards_against_answer():
     """extra.png / extra2.png 网格与识别回归测试。
 
     answer.out 为人工/视觉模型转写, 在 红色3↔旗帜 等 ~77 处与截图像素不符
-    (详见 inuput/ 下 .out 说明), 故仅要求:
+    (详见 TEST/inuput/ 下 .out 说明), 故仅要求:
       1) 网格为 16×30 (expert)
       2) 与 answer.out 一致率 ≥ 85% (像素真值 > 90%)
     """
