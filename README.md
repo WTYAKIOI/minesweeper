@@ -160,3 +160,8 @@ cargo build --release # 构建
 ## License
 
 MIT
+
+## 致谢
+感谢 GPT 5.6 系列、GLM 5.3 系列、DeepSeek V4 系列模型对此项目的贡献。
+
+感谢清华大学计算机科学与技术系提供的平台支持。
