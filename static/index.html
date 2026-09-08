@@ -775,7 +775,7 @@
                 <div class="controls-row">
                     <button class="secondary small" onclick="document.getElementById('imageInput').click()">📷 上传截图</button>
                     <label style="display:flex;align-items:center;gap:4px;cursor:help" title="用多模态 LLM 识别截图 (自适应任意行列数, 不限 16×30)。需在 API 配置中把「视觉模型」设为支持图像的模型 (如 glm-4v / gpt-4o / qwen-vl), 主模型可保持纯文本。失败自动回退本地 OCR。">
-                        <input type="checkbox" id="useLLMOcr"> 🤖 LLM 识别
+                        <input type="checkbox" id="useLLMOcr"> 是否选择 LLM 识图
                     </label>
                     <span class="ocr-status wait" id="ocrStatus"></span>
                     <input type="file" id="imageInput" accept="image/*">
