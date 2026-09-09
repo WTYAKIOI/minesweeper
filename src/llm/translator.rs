@@ -479,6 +479,56 @@ Rules:
     .to_string()
 }
 
+/// 旗帜问题专项分析系统提示词: 棋盘存在误标旗时, 只解释"第一面问题旗为什么有问题",
+/// 禁止全盘分析 (routes 旗帜问题特判路径使用)
+pub fn build_flag_problem_system_prompt(english: bool) -> String {
+    if english {
+        r#"You are a minesweeper reasoning expert. The board contains PROBLEM FLAGS (flags that
+conflict with the digit constraints). This analysis handles exactly ONE of them — your ONLY job
+is to explain WHY this flag is a problem. NEVER run a whole-board analysis and never discuss
+other problem flags.
+
+The "engine material" below contains: the target flag's engine verdict, its judged reason,
+the related constraint table (each digit: flags / remaining mines / candidate cells), and a
+keep-flag vs remove-flag comparison when the flag is contradicted.
+
+Answer format:
+  Step 1 / Step 2 ... (2-4 steps; every step must cite the concrete digit@coord, flags,
+  remaining mines and candidate cells from the material — point out explicitly which digit
+  constraint becomes unsatisfiable if this flag is treated as a mine; no vague wording).
+  Last line (choose one):
+    Final verdict: flag (x,y) is misplaced — the cell is provably safe, remove it
+    or (if the material shows the flag is only unconfirmed): Final verdict: flag (x,y)
+    cannot be confirmed, mine probability N%, verify it manually
+
+Rules:
+1. Only discuss this flag and its directly related constraints; nothing about the rest of
+   the board, no global summaries, no other problem flags.
+2. Trust the engine material; where possible, briefly explain why this flag was likely
+   misplaced in the first place (misread digit, wrong neighborhood, etc.).
+3. ≤500 characters. No thinking aloud."#
+    } else {
+        r#"你是扫雷推理专家。用户棋盘上存在"问题旗帜"(与数字约束矛盾的误标旗), 本次分析只处理其中一面 —
+你的唯一任务是解释"这面旗为什么有问题", 禁止做全盘分析、禁止讨论其他问题旗。
+
+下方"引擎素材"包含: 目标旗的引擎判定、判定理由、相关数字约束表
+(每个数字: 旗数/剩余需雷数/候选格)、矛盾旗对照 (保留旗 vs 撤旗的约束变化, 若为矛盾旗)。
+
+【回答格式】
+第 1 步 / 第 2 步 … (2-4 步; 每步引用素材中的具体 数字@坐标、旗数、剩余雷、候选格;
+关键步骤必须点明"把该旗当作雷时哪个数字约束无法满足", 禁止"联动排除/综合分析"等黑话)
+最后一行 (二选一):
+  最终结论: 旗 (x,y) 是误标 — 该格必安全, 建议移除
+  (若素材显示该旗仅是无法确认/概率存疑): 最终结论: 旗 (x,y) 无法确认, 雷概率 N%, 建议人工核对
+
+【约束】
+1. 只分析该旗及其直接相关约束, 不涉及棋盘其余部分。
+2. 以引擎素材为准; 适当解释这面旗当初为什么容易被误标 (如数字看错/邻域混淆)。
+3. 全文 ≤500 字; 简体中文; 不要思考自白。"#
+    }
+    .to_string()
+}
+
 /// 推理 IR → 自然语言转译器
 ///
 /// 将 Rust 推理引擎的计算结果翻译为人类可理解的策略语言。
@@ -2132,6 +2182,19 @@ mod intent_tests {
         assert!(zh.contains("最终结论"));
         let en = build_explain_system_prompt(true);
         assert!(en.contains("ONE specific cell"));
+        assert!(en.contains("Final verdict"));
+    }
+
+    #[test]
+    fn test_flag_problem_prompt_binds_single_flag() {
+        let zh = build_flag_problem_system_prompt(false);
+        assert!(zh.contains("只处理其中一面"));
+        assert!(zh.contains("禁止做全盘分析"));
+        assert!(zh.contains("第 1 步"));
+        assert!(zh.contains("是误标"));
+        let en = build_flag_problem_system_prompt(true);
+        assert!(en.contains("exactly ONE of them"));
+        assert!(en.contains("misplaced"));
         assert!(en.contains("Final verdict"));
     }
 }

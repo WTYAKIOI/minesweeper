@@ -17,6 +17,8 @@ pub enum BoardOp {
     ToggleFlag,
     /// Shift+左键: 清除为已翻开 0
     ClearToZero,
+    /// Ctrl+左键: 变为未知 (-1)
+    SetUnknown,
     /// 删除第 y 行 (0 基); 越界返回原棋盘
     DeleteRow,
     /// 删除第 x 列 (0 基); 越界返回原棋盘
@@ -125,6 +127,7 @@ pub fn apply_board_op(board: &[Vec<i32>], x: usize, y: usize, op: BoardOp) -> Ve
             v => v, // 已翻开数字格不能插旗
         },
         BoardOp::ClearToZero => 0,
+        BoardOp::SetUnknown => -1,
         BoardOp::DeleteRow => {
             if y >= out.len() {
                 return out; // 越界: 原样返回
@@ -329,6 +332,13 @@ mod tests {
         assert_eq!(b[0][2], 3);
         let b = apply_board_op(&b, 2, 0, BoardOp::ClearToZero);
         assert_eq!(b[0][2], 0);
+        // Ctrl+左键: 任意状态 → 未知; 已是未知则幂等
+        let b = apply_board_op(&b, 0, 0, BoardOp::SetUnknown); // 旗 → 未知
+        assert_eq!(b[0][0], -1);
+        let b = apply_board_op(&b, 2, 0, BoardOp::SetUnknown); // 0 → 未知
+        assert_eq!(b[0][2], -1);
+        let b = apply_board_op(&b, 2, 0, BoardOp::SetUnknown); // 已是未知, 幂等
+        assert_eq!(b[0][2], -1);
         // 越界幂等
         assert_eq!(apply_board_op(&b, 99, 99, BoardOp::LeftCycle), b);
     }

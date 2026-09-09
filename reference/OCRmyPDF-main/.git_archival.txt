@@ -1,4 +1,0 @@
-node: 196072acef056aa11b63e60564d98762bd38f638
-node-date: 2026-09-01T22:33:05+01:00
-describe-name: v17.11.0-5-g196072ace
-ref-names: HEAD -> main

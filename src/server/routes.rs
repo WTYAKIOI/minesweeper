@@ -185,7 +185,7 @@ pub struct BoardOpRequest {
     pub board: Vec<Vec<i32>>,
     pub x: usize,
     pub y: usize,
-    /// "cycle" (左键循环) / "flag" (右键插旗) / "clear" (Shift+左键清零)
+    /// "cycle" (左键循环) / "flag" (右键插旗) / "clear" (Shift+左键清零) / "unknown" (Ctrl+左键变未知)
     pub op: String,
 }
 
@@ -261,6 +261,7 @@ async fn board_op(Json(req): Json<BoardOpRequest>) -> Json<BoardOpResponse> {
         "cycle" => crate::agent::BoardOp::LeftCycle,
         "flag" => crate::agent::BoardOp::ToggleFlag,
         "clear" => crate::agent::BoardOp::ClearToZero,
+        "unknown" => crate::agent::BoardOp::SetUnknown,
         "del_row" => crate::agent::BoardOp::DeleteRow,
         "del_col" => crate::agent::BoardOp::DeleteCol,
         other => {
@@ -268,7 +269,7 @@ async fn board_op(Json(req): Json<BoardOpRequest>) -> Json<BoardOpResponse> {
                 success: false,
                 board: req.board,
                 error: Some(format!(
-                    "未知操作: {} (支持 cycle/flag/clear/del_row/del_col)",
+                    "未知操作: {} (支持 cycle/flag/clear/unknown/del_row/del_col)",
                     other
                 )),
             })
@@ -487,6 +488,22 @@ async fn analyze(
             mode = LLMMode::Teaching;
         }
     }
+
+    // ---- 旗帜问题特判: 存在误标旗时, 本次分析只处理第一面问题旗 ----
+    // 答案模式: 交给 LLM 解释"这面旗为什么有问题"并返回推理链 (见 flag_problem_explain);
+    // 教学模式保持引导式 (不得提前给"该旗必安全"结论), 不做特判。
+    let flag_problem = if mode == LLMMode::Answer {
+        pick_flag_problem(&ir.flag_verification)
+    } else {
+        None
+    };
+    let flag_attention_count = ir
+        .flag_verification
+        .flags
+        .iter()
+        .filter(|f| f.needs_attention)
+        .count();
+
     let mut translator = Translator::new(mode.clone());
     translator.set_language(crate::llm::translator::Language::parse(req.language.as_deref()));
     let use_llm = req.use_llm.unwrap_or(false);
@@ -547,6 +564,20 @@ async fn analyze(
                         &state.usage_store,
                         req.question.as_deref().unwrap_or(""),
                         target,
+                        &req.board,
+                        req.remaining_mines,
+                        english,
+                    )
+                    .await;
+                    usage = usg;
+                    (txt, ok)
+                } else if let Some(flag) = &flag_problem {
+                    // ---- 旗帜问题特判: 只分析第一面问题旗的成因 (单次小调用), 不做全盘推理 ----
+                    let (txt, ok, usg) = flag_problem_explain(
+                        client,
+                        &state.usage_store,
+                        flag,
+                        flag_attention_count,
                         &req.board,
                         req.remaining_mines,
                         english,
@@ -619,14 +650,34 @@ async fn analyze(
             }
         } else if let Some(msg) = llm_blocked_msg {
             usage = None;
-            ("⚠️ ".to_string() + &msg + "\n\n" + &translator.local_translate(&ir), false)
+            let base = if let Some(flag) = &flag_problem {
+                // 旗帜问题特判同样适用于本地回退: 聚焦第一面问题旗
+                flag_problem_local_text(flag, flag_attention_count, &req.board, req.remaining_mines)
+            } else {
+                translator.local_translate(&ir)
+            };
+            ("⚠️ ".to_string() + &msg + "\n\n" + &base, false)
         } else {
             usage = None;
-            ("⚠️ 未配置 LLM API Key, 回退到本地分析\n\n".to_string() + &translator.local_translate(&ir), false)
+            let base = if let Some(flag) = &flag_problem {
+                // 旗帜问题特判同样适用于本地回退: 聚焦第一面问题旗
+                flag_problem_local_text(flag, flag_attention_count, &req.board, req.remaining_mines)
+            } else {
+                translator.local_translate(&ir)
+            };
+            ("⚠️ 未配置 LLM API Key, 回退到本地分析\n\n".to_string() + &base, false)
         }
     } else {
         usage = None;
-        (translator.local_translate(&ir), false)
+        if let Some(flag) = &flag_problem {
+            // 旗帜问题特判 (本地路径): 只呈现第一面问题旗的判定与成因素材
+            (
+                flag_problem_local_text(flag, flag_attention_count, &req.board, req.remaining_mines),
+                false,
+            )
+        } else {
+            (translator.local_translate(&ir), false)
+        }
     };
 
     // 最终净化: 回答过长/含机器味 → 截断并保留末尾"最终结论"行 (目标 ≤800 字左右)
@@ -715,6 +766,135 @@ async fn point_explain(
                 None,
             )
         }
+    }
+}
+
+/* ============ 旗帜问题特判 (存在误标旗时只分析第一面) ============ */
+
+/// 选取本次要处理的问题旗: 矛盾旗 (与数字约束硬冲突) 优先, 其次概率佐证极可能误标的未确认旗
+fn pick_flag_problem(
+    fv: &crate::model::FlagVerificationResult,
+) -> Option<crate::model::FlagStatus> {
+    fv.flags
+        .iter()
+        .find(|f| f.status == crate::model::FlagVerifyStatus::Contradicted)
+        .or_else(|| fv.flags.iter().find(|f| f.needs_attention))
+        .cloned()
+}
+
+/// 问题旗状态文案 (呈现给 LLM / 本地回退)
+fn flag_problem_status_line(status: crate::model::FlagVerifyStatus) -> &'static str {
+    match status {
+        crate::model::FlagVerifyStatus::Contradicted => "❌ 矛盾旗 (与数字约束矛盾, 引擎判定该格必安全)",
+        crate::model::FlagVerifyStatus::Suspected => "❔ 无法确认 (概率佐证极可能误标)",
+        crate::model::FlagVerifyStatus::Verified => "✅ 确认正确",
+    }
+}
+
+/// 引擎素材: explain_cell 已为矛盾旗生成"保留旗 vs 撤旗"对照表 (见 agent/tools.rs)
+fn flag_problem_material(
+    flag: &crate::model::FlagStatus,
+    board: &[Vec<i32>],
+    remaining_mines: u32,
+) -> String {
+    let mut agent_board = crate::agent::AgentBoard::new(board.to_vec(), remaining_mines);
+    crate::agent::tools::execute_tool(
+        &mut agent_board,
+        "explain_cell",
+        &serde_json::json!({ "x": flag.coord.x, "y": flag.coord.y }),
+    )
+    .unwrap_or_else(|e| format!("该旗无法解释: {}", e))
+}
+
+/// 特判文案正文 (本地路径与 LLM 失败回退共用)
+fn flag_problem_local_body(
+    flag: &crate::model::FlagStatus,
+    attention_count: usize,
+    material: &str,
+) -> String {
+    format!(
+        "🚩 检测到 {} 面问题旗, 本次分析只处理第一面 ({},{}), 其余问题旗待该旗处理后再分析。\n\n判定: {}\n理由: {}\n\n【引擎素材】\n{}",
+        attention_count,
+        flag.coord.x,
+        flag.coord.y,
+        flag_problem_status_line(flag.status),
+        flag.reason,
+        material
+    )
+}
+
+/// 旗帜问题特判本地文案 (LLM 未启用/限额拦截时): 聚焦第一面问题旗的判定与成因素材
+fn flag_problem_local_text(
+    flag: &crate::model::FlagStatus,
+    attention_count: usize,
+    board: &[Vec<i32>],
+    remaining_mines: u32,
+) -> String {
+    let material = flag_problem_material(flag, board, remaining_mines);
+    flag_problem_local_body(flag, attention_count, &material)
+}
+
+/// 旗帜问题特判: 只处理一面问题旗 (矛盾旗优先), 交给 LLM 分析"为什么会出现这面问题旗"。
+/// 单次小调用 (引擎素材含矛盾旗对照); LLM 失败时回退本地素材文案。返回 (analysis, used_llm, usage)
+async fn flag_problem_explain(
+    client: &LLMClient,
+    usage_store: &Arc<UsageStore>,
+    flag: &crate::model::FlagStatus,
+    attention_count: usize,
+    board: &[Vec<i32>],
+    remaining_mines: u32,
+    english: bool,
+) -> (String, bool, Option<TokenUsage>) {
+    let material = flag_problem_material(flag, board, remaining_mines);
+    let system_prompt = crate::llm::translator::build_flag_problem_system_prompt(english);
+    let user_msg = format!(
+        "棋盘存在 {} 面问题旗, 本次只分析第一面。\n目标旗 ({},{}): {}\n判定理由: {}\n\n【引擎素材】\n{}",
+        attention_count,
+        flag.coord.x,
+        flag.coord.y,
+        flag_problem_status_line(flag.status),
+        flag.reason,
+        material
+    );
+
+    match client.chat(&system_prompt, &user_msg).await {
+        Ok(result) => {
+            let mut usage: Option<TokenUsage> = None;
+            if let Some(u) = &result.usage {
+                usage_store.record(
+                    client.config().model.as_str(),
+                    &client.config().provider_label(),
+                    u,
+                );
+                usage = Some(u.clone());
+            }
+            usage = usage.or_else(|| {
+                Some(crate::agent::estimate_token_usage(
+                    user_msg.chars().count(),
+                    result.content.chars().count(),
+                ))
+            });
+            let (cleaned, _) = crate::llm::translator::clean_llm_output(&result.content);
+            let body = if cleaned.trim().is_empty() {
+                result.content
+            } else {
+                crate::llm::translator::truncate_llm_output(&cleaned, 1200)
+            };
+            let header = format!(
+                "🚩 旗帜问题专项分析: 检测到 {} 面问题旗, 本次只分析第一面 ({},{}):\n\n",
+                attention_count, flag.coord.x, flag.coord.y
+            );
+            (header + &body, true, usage)
+        }
+        Err(e) => (
+            format!(
+                "⚠️ LLM 调用失败 ({})。以下为引擎对该旗的直接判定与相关约束:\n\n{}",
+                e,
+                flag_problem_local_body(flag, attention_count, &material)
+            ),
+            false,
+            None,
+        ),
     }
 }
 
@@ -1190,4 +1370,86 @@ async fn chat_question(
         usage,
         error: None,
     })
+}
+
+#[cfg(test)]
+mod flag_problem_tests {
+    use super::*;
+    use crate::model::{Coord, FlagStatus, FlagVerificationResult, FlagVerifyStatus};
+
+    fn fv(flags: Vec<FlagStatus>) -> FlagVerificationResult {
+        let has_contradiction = flags
+            .iter()
+            .any(|f| f.status == FlagVerifyStatus::Contradicted);
+        FlagVerificationResult {
+            flags,
+            summary: "test".into(),
+            has_contradiction,
+        }
+    }
+
+    fn flag(x: u32, y: u32, status: FlagVerifyStatus, attention: bool) -> FlagStatus {
+        FlagStatus {
+            coord: Coord::new(x, y),
+            status,
+            reason: "r".into(),
+            needs_attention: attention,
+        }
+    }
+
+    #[test]
+    fn test_pick_prefers_contradicted_over_suspected() {
+        // Suspected(注意) 在前, Contradicted 在后 → 仍优先选矛盾旗
+        let f = fv(vec![
+            flag(1, 0, FlagVerifyStatus::Suspected, true),
+            flag(5, 2, FlagVerifyStatus::Contradicted, true),
+        ]);
+        let pick = pick_flag_problem(&f).unwrap();
+        assert_eq!(pick.coord, Coord::new(5, 2));
+    }
+
+    #[test]
+    fn test_pick_falls_back_to_attention_suspected() {
+        let f = fv(vec![
+            flag(0, 0, FlagVerifyStatus::Verified, false),
+            flag(2, 3, FlagVerifyStatus::Suspected, true),
+        ]);
+        let pick = pick_flag_problem(&f).unwrap();
+        assert_eq!(pick.coord, Coord::new(2, 3));
+    }
+
+    #[test]
+    fn test_pick_none_when_all_fine() {
+        let f = fv(vec![
+            flag(0, 0, FlagVerifyStatus::Verified, false),
+            flag(1, 1, FlagVerifyStatus::Suspected, false),
+        ]);
+        assert!(pick_flag_problem(&f).is_none());
+    }
+
+    #[test]
+    fn test_flag_problem_local_text_focuses_single_flag() {
+        // 0 的邻居被标旗 → 矛盾旗 (0 周围不可能有雷)
+        let board = vec![vec![0, -2, 0], vec![0, 0, 0], vec![0, 0, 0]];
+        let f = flag(1, 0, FlagVerifyStatus::Contradicted, true);
+        let text = flag_problem_local_text(&f, 1, &board, 0);
+        assert!(text.contains("只处理第一面 (1,0)"));
+        assert!(text.contains("矛盾旗"));
+        assert!(text.contains("引擎素材"));
+    }
+
+    #[test]
+    fn test_pipeline_triggers_flag_problem_special_case() {
+        // 端到端: 真实管道输出 → 特判能从 ir.flag_verification 选中矛盾旗
+        let board = vec![vec![0, -2, 0], vec![0, 0, 0], vec![0, 0, 0]];
+        let (_, ir) = crate::engine::run_local_pipeline(&board, 0).unwrap();
+        assert!(ir.flag_verification.has_contradiction);
+        let pick = pick_flag_problem(&ir.flag_verification).unwrap();
+        assert_eq!(pick.coord, Coord::new(1, 0));
+        assert_eq!(pick.status, FlagVerifyStatus::Contradicted);
+        // 无矛盾旗的常规局面 → 不触发特判
+        let normal = vec![vec![1, -1, -1], vec![0, 0, -1], vec![0, 0, -1]];
+        let (_, ir2) = crate::engine::run_local_pipeline(&normal, 1).unwrap();
+        assert!(pick_flag_problem(&ir2.flag_verification).is_none());
+    }
 }
